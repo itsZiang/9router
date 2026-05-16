@@ -137,8 +137,12 @@ console.log("3️⃣  Copying Next.js standalone build to app/cli/app...");
 const standaloneRoot = path.join(appDir, ".next", "standalone");
 const standaloneRootResolved = path.join(buildDistDir, "standalone");
 const standaloneRootToUse = fs.existsSync(standaloneRootResolved) ? standaloneRootResolved : standaloneRoot;
+// Workspace tracing root places app under standalone/<appDirName>/server.js
+const appDirName = path.basename(appDir);
 const standaloneApp = fs.existsSync(path.join(standaloneRootToUse, "server.js"))
   ? standaloneRootToUse
+  : fs.existsSync(path.join(standaloneRootToUse, appDirName, "server.js"))
+  ? path.join(standaloneRootToUse, appDirName)
   : path.join(standaloneRootToUse, "app");
 if (!fs.existsSync(standaloneApp)) {
   console.error("❌ Next.js standalone build not found under .next/standalone");
