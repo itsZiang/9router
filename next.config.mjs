@@ -33,6 +33,14 @@ const nextConfig = {
         path: false,
       };
     }
+    // better-sqlite3 is optional (optionalDependencies) — treat as external so webpack
+    // doesn't fail when the native addon is not installed. Runtime fallback: sql.js.
+    const prev = config.externals;
+    const betterSqliteExternal = ({ request }, cb) =>
+      request === "better-sqlite3" ? cb(null, "commonjs better-sqlite3") : cb();
+    config.externals = prev
+      ? [...(Array.isArray(prev) ? prev : [prev]), betterSqliteExternal]
+      : [betterSqliteExternal];
     // Exclude logs, .next, gitbook subapp from watcher
     config.watchOptions = { ...config.watchOptions, ignored: /[\\/](logs|\.next|gitbook|cli)[\\/]/ };
     return config;
