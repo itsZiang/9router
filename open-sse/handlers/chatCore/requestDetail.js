@@ -43,12 +43,21 @@ export function extractUsageFromResponse(responseBody) {
     };
   }
 
-  // Gemini format
-  if (responseBody.usageMetadata) {
+  // Gemini / Vertex format (also Antigravity wraps under responseBody.response)
+  const usageMeta = responseBody.usageMetadata || responseBody.response?.usageMetadata;
+  if (usageMeta) {
     return {
-      prompt_tokens: responseBody.usageMetadata.promptTokenCount || 0,
-      completion_tokens: responseBody.usageMetadata.candidatesTokenCount || 0,
-      reasoning_tokens: responseBody.usageMetadata.thoughtsTokenCount
+      prompt_tokens: usageMeta.promptTokenCount || 0,
+      completion_tokens: usageMeta.candidatesTokenCount || 0,
+      reasoning_tokens: usageMeta.thoughtsTokenCount
+    };
+  }
+
+  // Ollama format (raw provider response before translation)
+  if (responseBody.done === true && typeof responseBody.prompt_eval_count === "number") {
+    return {
+      prompt_tokens: responseBody.prompt_eval_count || 0,
+      completion_tokens: responseBody.eval_count || 0
     };
   }
 
