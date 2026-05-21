@@ -1,8 +1,6 @@
 import { Readable } from "stream";
-import { MEMORY_CONFIG } from "../config/runtimeConfig.js";
 
 const originalFetch = globalThis.fetch;
-const proxyDispatchers = new Map();
 
 // DNS cache — use Map to avoid prototype pollution via malformed hostnames
 const DNS_CACHE = new Map();
@@ -121,22 +119,16 @@ function resolveConnectionProxyUrl(targetUrl, proxyOptions) {
 }
 
 /**
- * Create proxy dispatcher lazily (undici-compatible)
+ * Create proxy dispatcher (undici-compatible)
+ * No caching — rotating proxies require a fresh connection per request
+ * so the proxy service can assign a new exit IP each time.
  */
 async function getDispatcher(proxyUrl) {
   const normalized = normalizeProxyUrl(proxyUrl);
   if (!normalized) return null;
 
-  if (!proxyDispatchers.has(normalized)) {
-    // Evict oldest entry if max size reached
-    if (proxyDispatchers.size >= MEMORY_CONFIG.proxyDispatchersMaxSize) {
-      proxyDispatchers.delete(proxyDispatchers.keys().next().value);
-    }
-    const { ProxyAgent } = await import("undici");
-    proxyDispatchers.set(normalized, new ProxyAgent({ uri: normalized }));
-  }
-
-  return proxyDispatchers.get(normalized);
+  const { ProxyAgent } = await import("undici");
+  return new ProxyAgent({ uri: normalized });
 }
 
 /**
