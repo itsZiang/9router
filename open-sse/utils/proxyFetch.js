@@ -36,7 +36,7 @@ async function resolveRealIP(hostname) {
     resolver.setServers(GOOGLE_DNS_SERVERS);
     const resolve4 = promisify(resolver.resolve4.bind(resolver));
     const addresses = await resolve4(hostname);
-    DNS_CACHE.set(hostname, { ip: addresses[0], expiry: Date.now() + MEMORY_CONFIG.dnsCacheTtlMs });
+    DNS_CACHE.set(hostname, { ip: addresses[0], expiry: Date.now() + 5 * 60 * 1000 });
     return addresses[0];
   } catch (error) {
     console.warn(`[ProxyFetch] DNS resolve failed for ${hostname}:`, error.message);
@@ -119,16 +119,18 @@ function resolveConnectionProxyUrl(targetUrl, proxyOptions) {
 }
 
 /**
- * Create proxy dispatcher (undici-compatible)
- * No caching — rotating proxies require a fresh connection per request
- * so the proxy service can assign a new exit IP each time.
+ * Create a fresh ProxyAgent per request.
+ * connections=1 + pipelining=0 prevents undici from pooling multiple
+ * connections. Combined with Connection: close header, the proxy server
+ * closes the TCP connection after each response (including full SSE stream),
+ * so the next request opens a new connection and gets a fresh rotated IP.
  */
 async function getDispatcher(proxyUrl) {
   const normalized = normalizeProxyUrl(proxyUrl);
   if (!normalized) return null;
 
   const { ProxyAgent } = await import("undici");
-  return new ProxyAgent({ uri: normalized });
+  return new ProxyAgent({ uri: normalized, connections: 1, pipelining: 0 });
 }
 
 /**
@@ -213,9 +215,9 @@ export async function proxyAwareFetch(url, options = {}, proxyOptions = null) {
   if (shouldBypassMitmDns(targetUrl)) {
     if (proxyUrl) {
       // Proxy resolves DNS externally (not affected by /etc/hosts) — use proxy directly
+      const dispatcher = await getDispatcher(proxyUrl);
       try {
-        const dispatcher = await getDispatcher(proxyUrl);
-        return await originalFetch(url, { ...options, dispatcher });
+        return await originalFetch(url, { ...options, dispatcher, headers: { ...options.headers, connection: "close" } });
       } catch (proxyError) {
         if (proxyOptions?.strictProxy === true) {
           throw new Error(`[ProxyFetch] Proxy required but failed (strictProxy=true): ${proxyError.message}`);
@@ -234,9 +236,9 @@ export async function proxyAwareFetch(url, options = {}, proxyOptions = null) {
   }
 
   if (proxyUrl) {
+    const dispatcher = await getDispatcher(proxyUrl);
     try {
-      const dispatcher = await getDispatcher(proxyUrl);
-      return await originalFetch(url, { ...options, dispatcher });
+      return await originalFetch(url, { ...options, dispatcher, headers: { ...options.headers, connection: "close" } });
     } catch (proxyError) {
       // If strictProxy is enabled, fail hard instead of falling back to direct
       if (proxyOptions?.strictProxy === true) {
