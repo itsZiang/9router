@@ -106,8 +106,23 @@ export default function CombosPage() {
     });
   };
 
-  const handleToggleRoundRobin = async (comboName, enabled) => {
+  const handleSwapCombo = async (index1, index2) => {
+    const newCombos = [...combos];
+    [newCombos[index1], newCombos[index2]] = [newCombos[index2], newCombos[index1]];
+    setCombos(newCombos);
     try {
+      await fetch("/api/combos/reorder", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ ids: newCombos.map((c) => c.id) }),
+      });
+    } catch (error) {
+      console.log("Error reordering combos:", error);
+      await fetchData();
+    }
+  };
+
+  const handleToggleRoundRobin = async (comboName, enabled) => {    try {
       const updated = { ...comboStrategies };
       if (enabled) {
         updated[comboName] = { fallbackStrategy: "round-robin" };
@@ -167,7 +182,7 @@ export default function CombosPage() {
         </Card>
       ) : (
         <div className="flex flex-col gap-4">
-          {combos.map((combo) => (
+          {combos.map((combo, index) => (
             <ComboCard
               key={combo.id}
               combo={combo}
@@ -177,6 +192,10 @@ export default function CombosPage() {
               onDelete={() => handleDelete(combo.id)}
               roundRobinEnabled={comboStrategies[combo.name]?.fallbackStrategy === "round-robin"}
               onToggleRoundRobin={(enabled) => handleToggleRoundRobin(combo.name, enabled)}
+              isFirst={index === 0}
+              isLast={index === combos.length - 1}
+              onMoveUp={() => handleSwapCombo(index, index - 1)}
+              onMoveDown={() => handleSwapCombo(index, index + 1)}
             />
           ))}
         </div>
@@ -214,11 +233,27 @@ export default function CombosPage() {
   );
 }
 
-function ComboCard({ combo, copied, onCopy, onEdit, onDelete, roundRobinEnabled, onToggleRoundRobin }) {
+function ComboCard({ combo, copied, onCopy, onEdit, onDelete, roundRobinEnabled, onToggleRoundRobin, isFirst, isLast, onMoveUp, onMoveDown }) {
   return (
     <Card padding="sm" className="group">
       <div className="flex min-w-0 flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
         <div className="flex min-w-0 flex-1 items-start gap-3 sm:items-center">
+          <div className="flex shrink-0 flex-col">
+            <button
+              onClick={onMoveUp}
+              disabled={isFirst}
+              className={`p-0.5 rounded ${isFirst ? "text-text-muted/30 cursor-not-allowed" : "hover:bg-sidebar text-text-muted hover:text-primary"}`}
+            >
+              <span className="material-symbols-outlined text-sm">keyboard_arrow_up</span>
+            </button>
+            <button
+              onClick={onMoveDown}
+              disabled={isLast}
+              className={`p-0.5 rounded ${isLast ? "text-text-muted/30 cursor-not-allowed" : "hover:bg-sidebar text-text-muted hover:text-primary"}`}
+            >
+              <span className="material-symbols-outlined text-sm">keyboard_arrow_down</span>
+            </button>
+          </div>
           <div className="size-8 rounded-lg bg-primary/10 flex items-center justify-center shrink-0">
             <span className="material-symbols-outlined text-primary text-[18px]">layers</span>
           </div>

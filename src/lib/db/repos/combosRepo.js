@@ -9,6 +9,7 @@ function rowToCombo(row) {
     name: row.name,
     kind: row.kind,
     models: parseJson(row.models, []),
+    sortOrder: row.sortOrder ?? 0,
     createdAt: row.createdAt,
     updatedAt: row.updatedAt,
   };
@@ -16,7 +17,7 @@ function rowToCombo(row) {
 
 export async function getCombos() {
   const db = await getAdapter();
-  const rows = db.all(`SELECT * FROM combos ORDER BY createdAt ASC`);
+  const rows = db.all(`SELECT * FROM combos ORDER BY sortOrder ASC, createdAt ASC`);
   return rows.map(rowToCombo);
 }
 
@@ -35,17 +36,20 @@ export async function getComboByName(name) {
 export async function createCombo(data) {
   const db = await getAdapter();
   const now = new Date().toISOString();
+  const maxRow = db.get(`SELECT MAX(sortOrder) as maxOrder FROM combos`);
+  const sortOrder = (maxRow?.maxOrder ?? -1) + 1;
   const combo = {
     id: uuidv4(),
     name: data.name,
     kind: data.kind || null,
     models: data.models || [],
+    sortOrder,
     createdAt: now,
     updatedAt: now,
   };
   db.run(
-    `INSERT INTO combos(id, name, kind, models, createdAt, updatedAt) VALUES(?, ?, ?, ?, ?, ?)`,
-    [combo.id, combo.name, combo.kind, stringifyJson(combo.models), combo.createdAt, combo.updatedAt]
+    `INSERT INTO combos(id, name, kind, models, sortOrder, createdAt, updatedAt) VALUES(?, ?, ?, ?, ?, ?, ?)`,
+    [combo.id, combo.name, combo.kind, stringifyJson(combo.models), combo.sortOrder, combo.createdAt, combo.updatedAt]
   );
   return combo;
 }
@@ -70,4 +74,14 @@ export async function deleteCombo(id) {
   const db = await getAdapter();
   const res = db.run(`DELETE FROM combos WHERE id = ?`, [id]);
   return (res?.changes ?? 0) > 0;
+}
+
+export async function reorderCombos(orderedIds) {
+  if (!Array.isArray(orderedIds)) return;
+  const db = await getAdapter();
+  db.transaction(() => {
+    orderedIds.forEach((id, index) => {
+      db.run(`UPDATE combos SET sortOrder = ? WHERE id = ?`, [index, id]);
+    });
+  });
 }

@@ -35,7 +35,7 @@ export {
 // Combos
 export {
   getCombos, getComboById, getComboByName,
-  createCombo, updateCombo, deleteCombo,
+  createCombo, updateCombo, deleteCombo, reorderCombos,
 } from "./repos/combosRepo.js";
 
 // Aliases (model + custom + mitm)
@@ -54,6 +54,9 @@ export {
 export {
   getDisabledModels, getDisabledByProvider, disableModels, enableModels,
 } from "./repos/disabledModelsRepo.js";
+
+// Model order (kv-backed)
+export { getModelOrder, setModelOrder } from "./repos/modelOrderRepo.js";
 
 // Usage
 export {

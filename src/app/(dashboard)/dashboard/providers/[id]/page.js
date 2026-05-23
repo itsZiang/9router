@@ -54,6 +54,7 @@ export default function ProviderDetailPage() {
   const [suggestedModels, setSuggestedModels] = useState([]);
   const [kiloFreeModels, setKiloFreeModels] = useState([]);
   const [disabledModelIds, setDisabledModelIds] = useState([]);
+  const [modelOrder, setModelOrder] = useState(null);
   const [confirmState, setConfirmState] = useState(null);
   const [showAgRiskModal, setShowAgRiskModal] = useState(false);
   const [oneByOneRunning, setOneByOneRunning] = useState(false);
@@ -152,6 +153,16 @@ export default function ProviderDetailPage() {
     }
   }, [providerStorageAlias]);
 
+  const fetchModelOrder = useCallback(async () => {
+    try {
+      const res = await fetch(`/api/models/order?providerAlias=${encodeURIComponent(providerStorageAlias)}`, { cache: "no-store" });
+      const data = await res.json();
+      if (res.ok) setModelOrder(data.order || null);
+    } catch (error) {
+      console.log("Error fetching model order:", error);
+    }
+  }, [providerStorageAlias]);
+
   const handleDisableModel = async (modelId) => {
     try {
       const res = await fetch("/api/models/disabled", {
@@ -201,6 +212,43 @@ export default function ProviderDetailPage() {
       if (res.ok) await fetchDisabledModels();
     } catch (error) {
       console.log("Error enabling all models:", error);
+    }
+  };
+
+  const handleMoveModel = async (modelId, direction) => {
+    const allModels = [
+      ...models,
+      ...kiloFreeModels.filter((fm) => !models.some((m) => m.id === fm.id)),
+    ].filter((m) => !m.type || m.type === "llm");
+    const disabledSet = new Set(disabledModelIds);
+    const displayModels = allModels.filter((m) => !disabledSet.has(m.id));
+
+    const baseIds = displayModels.map((m) => m.id);
+    let orderedIds = modelOrder
+      ? [
+          ...modelOrder.filter((id) => baseIds.includes(id)),
+          ...baseIds.filter((id) => !modelOrder.includes(id)),
+        ]
+      : baseIds;
+
+    const index = orderedIds.indexOf(modelId);
+    if (index === -1) return;
+    const targetIndex = direction === "up" ? index - 1 : index + 1;
+    if (targetIndex < 0 || targetIndex >= orderedIds.length) return;
+
+    const newOrder = [...orderedIds];
+    [newOrder[index], newOrder[targetIndex]] = [newOrder[targetIndex], newOrder[index]];
+    setModelOrder(newOrder);
+
+    try {
+      await fetch("/api/models/order", {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ providerAlias: providerStorageAlias, order: newOrder }),
+      });
+    } catch (error) {
+      console.log("Error saving model order:", error);
+      await fetchModelOrder();
     }
   };
 
@@ -368,7 +416,8 @@ export default function ProviderDetailPage() {
     fetchConnections();
     fetchAliases();
     fetchDisabledModels();
-  }, [fetchConnections, fetchAliases, fetchDisabledModels]);
+    fetchModelOrder();
+  }, [fetchConnections, fetchAliases, fetchDisabledModels, fetchModelOrder]);
 
   // Fetch suggested models from provider's public API (if configured)
   useEffect(() => {
@@ -589,6 +638,25 @@ export default function ProviderDetailPage() {
     }
   };
 
+  const handleToggleAllConnections = async (targetActive) => {
+    const prev = connections;
+    setConnections(c => c.map(conn => ({ ...conn, isActive: targetActive })));
+    try {
+      await Promise.all(
+        prev.map(conn =>
+          fetch(`/api/providers/${conn.id}`, {
+            method: "PUT",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ isActive: targetActive }),
+          })
+        )
+      );
+    } catch (error) {
+      console.log("Error toggling all connections:", error);
+      await fetchConnections();
+    }
+  };
+
   const handleSwapPriority = async (index1, index2) => {
     // Optimistic update state
     const newConnections = [...connections];
@@ -616,6 +684,7 @@ export default function ProviderDetailPage() {
 
   const selectedConnections = connections.filter((conn) => selectedConnectionIds.includes(conn.id));
   const allSelected = connections.length > 0 && selectedConnectionIds.length === connections.length;
+  const anyActive = connections.some(c => c.isActive !== false);
 
   const toggleSelectConnection = (connectionId) => {
     setSelectedConnectionIds((prev) => (
@@ -854,6 +923,16 @@ export default function ProviderDetailPage() {
     const disabledSet = new Set(disabledModelIds);
     const displayModels = allModels.filter((m) => !disabledSet.has(m.id));
     const disabledDisplayModels = allModels.filter((m) => disabledSet.has(m.id));
+
+    const displayModelIds = displayModels.map((m) => m.id);
+    const orderedDisplayModels = modelOrder
+      ? [
+          ...modelOrder
+            .filter((id) => displayModelIds.includes(id))
+            .map((id) => displayModels.find((m) => m.id === id)),
+          ...displayModels.filter((m) => !modelOrder.includes(m.id)),
+        ]
+      : displayModels;
     // Custom models added by user (stored as aliases: modelId → providerAlias/modelId)
     const customModels = Object.entries(modelAliases)
       .filter(([alias, fullModel]) => {
@@ -892,7 +971,7 @@ export default function ProviderDetailPage() {
           />
         ))}
 
-        {displayModels.map((model) => {
+        {orderedDisplayModels.map((model, index) => {
           const fullModel = `${providerStorageAlias}/${model.id}`;
           const oldFormatModel = `${providerId}/${model.id}`;
           const existingAlias = Object.entries(modelAliases).find(
@@ -913,6 +992,10 @@ export default function ProviderDetailPage() {
               isTesting={testingModelId === model.id}
               isFree={model.isFree}
               onDisable={() => handleDisableModel(model.id)}
+              isFirst={index === 0}
+              isLast={index === orderedDisplayModels.length - 1}
+              onMoveUp={() => handleMoveModel(model.id, "up")}
+              onMoveDown={() => handleMoveModel(model.id, "down")}
             />
           );
         })}
@@ -1158,6 +1241,16 @@ export default function ProviderDetailPage() {
           <div className="mb-4 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
             <h2 className="text-lg font-semibold">Connections</h2>
             <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:gap-4">
+              {connections.length > 1 && (
+                <Button
+                  size="sm"
+                  variant="secondary"
+                  icon={anyActive ? "toggle_off" : "toggle_on"}
+                  onClick={() => handleToggleAllConnections(!anyActive)}
+                >
+                  {anyActive ? "Disable All" : "Enable All"}
+                </Button>
+              )}
               {connections.length > 0 && proxyPools.length > 0 && (
                 <Button
                   size="sm"
