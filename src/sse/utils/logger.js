@@ -10,7 +10,11 @@ const LOG_LEVELS = {
 const LEVEL = LOG_LEVELS.DEBUG;
 
 function formatTime() {
-  return new Date().toLocaleTimeString("en-US", { hour12: false });
+  const utc7 = new Date(Date.now() + 7 * 60 * 60 * 1000);
+  const h = String(utc7.getUTCHours()).padStart(2, "0");
+  const m = String(utc7.getUTCMinutes()).padStart(2, "0");
+  const s = String(utc7.getUTCSeconds()).padStart(2, "0");
+  return `${h}:${m}:${s}`;
 }
 
 function formatData(data) {

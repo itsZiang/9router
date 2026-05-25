@@ -5,7 +5,11 @@ const { DATA_DIR } = require("./paths");
 const { LOG_BLACKLIST_URL_PARTS } = require("./config");
 
 function time() {
-  return new Date().toLocaleTimeString("en-US", { hour12: false });
+  const utc7 = new Date(Date.now() + 7 * 60 * 60 * 1000);
+  const h = String(utc7.getUTCHours()).padStart(2, "0");
+  const m = String(utc7.getUTCMinutes()).padStart(2, "0");
+  const s = String(utc7.getUTCSeconds()).padStart(2, "0");
+  return `${h}:${m}:${s}`;
 }
 
 const log = (msg) => console.log(`[${time()}] [MITM] ${msg}`);
