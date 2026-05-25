@@ -120,8 +120,10 @@ export async function handleChat(request, clientRawRequest = null) {
 async function handleSingleModelChat(body, modelStr, clientRawRequest = null, request = null, apiKey = null) {
   const modelInfo = await getModelInfo(modelStr);
 
-  // If provider is null, this might be a combo name - check and handle
-  if (!modelInfo.provider) {
+  // Check for combo when provider is null OR when model has no explicit provider prefix.
+  // The second condition catches models like "claude-sonnet-4-6[1m]" where inferProviderFromModelName
+  // returns "anthropic" (due to the "claude-" prefix) even though a combo with that exact name exists.
+  if (!modelInfo.provider || !modelStr.includes("/")) {
     const comboModels = await getComboModels(modelStr);
     if (comboModels) {
       const chatSettings = await getSettings();
@@ -129,7 +131,7 @@ async function handleSingleModelChat(body, modelStr, clientRawRequest = null, re
       const comboStrategies = chatSettings.comboStrategies || {};
       const comboSpecificStrategy = comboStrategies[modelStr]?.fallbackStrategy;
       const comboStrategy = comboSpecificStrategy || chatSettings.comboStrategy || "fallback";
-      
+
       const comboStickyLimit = chatSettings.comboStickyRoundRobinLimit;
       log.info("CHAT", `Combo "${modelStr}" with ${comboModels.length} models (strategy: ${comboStrategy}, sticky: ${comboStickyLimit})`);
       return handleComboChat({
@@ -142,8 +144,10 @@ async function handleSingleModelChat(body, modelStr, clientRawRequest = null, re
         comboStickyLimit
       });
     }
-    log.warn("CHAT", "Invalid model format", { model: modelStr });
-    return errorResponse(HTTP_STATUS.BAD_REQUEST, "Invalid model format");
+    if (!modelInfo.provider) {
+      log.warn("CHAT", "Invalid model format", { model: modelStr });
+      return errorResponse(HTTP_STATUS.BAD_REQUEST, "Invalid model format");
+    }
   }
 
   const { provider, model } = modelInfo;
