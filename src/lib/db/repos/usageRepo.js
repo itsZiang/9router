@@ -190,7 +190,8 @@ export function trackPendingRequest(model, provider, connectionId, started, erro
     lastErrorProvider.ts = Date.now();
   }
 
-  const t = new Date().toLocaleTimeString("en-US", { hour12: false, hour: "2-digit", minute: "2-digit", second: "2-digit" });
+  const _u7 = new Date(Date.now() + 7 * 60 * 60 * 1000);
+  const t = `${String(_u7.getUTCHours()).padStart(2, "0")}:${String(_u7.getUTCMinutes()).padStart(2, "0")}:${String(_u7.getUTCSeconds()).padStart(2, "0")}`;
   console.log(`[${t}] [PENDING] ${started ? "START" : "END"}${error ? " (ERROR)" : ""} | provider=${provider} | model=${model}`);
   statsEmitter.emit("pending");
 }
