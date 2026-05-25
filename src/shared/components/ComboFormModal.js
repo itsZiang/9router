@@ -6,7 +6,7 @@ import Input from "./Input";
 import Button from "./Button";
 import ModelSelectModal from "./ModelSelectModal";
 
-const VALID_NAME_REGEX = /^[a-zA-Z0-9_.\-]+$/;
+const VALID_NAME_REGEX = /^[a-zA-Z0-9_.\-\[\]]+$/;
 
 // Inline editable model item
 function ModelItem({ index, model, isFirst, isLast, onEdit, onMoveUp, onMoveDown, onRemove }) {
@@ -70,7 +70,7 @@ export default function ComboFormModal({ isOpen, combo, onClose, onSave, activeP
   const validateName = (value) => {
     if (!value.trim()) { setNameError("Name is required"); return false; }
     const full = forcePrefix + value;
-    if (!VALID_NAME_REGEX.test(full)) { setNameError("Only letters, numbers, -, _ and . allowed"); return false; }
+    if (!VALID_NAME_REGEX.test(full)) { setNameError("Only letters, numbers, -, _, . and [] allowed"); return false; }
     setNameError("");
     return true;
   };

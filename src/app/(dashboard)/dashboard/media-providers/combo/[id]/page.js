@@ -15,7 +15,7 @@ function parseModelEntry(entry) {
   return { providerId: entry.slice(0, idx), model: entry.slice(idx + 1) };
 }
 
-const VALID_NAME_REGEX = /^[a-zA-Z0-9_.\-]+$/;
+const VALID_NAME_REGEX = /^[a-zA-Z0-9_.\-\[\]]+$/;
 
 const KIND_LABELS = {
   webSearch: "Web Search",
@@ -96,7 +96,7 @@ export default function ComboDetailPage() {
 
   const validateName = (v) => {
     if (!v.trim()) { setNameError("Name is required"); return false; }
-    if (!VALID_NAME_REGEX.test(v)) { setNameError("Only letters, numbers, -, _ and ."); return false; }
+    if (!VALID_NAME_REGEX.test(v)) { setNameError("Only letters, numbers, -, _, . and []"); return false; }
     setNameError("");
     return true;
   };

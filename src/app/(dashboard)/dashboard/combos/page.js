@@ -9,8 +9,8 @@ import { Card, Button, Modal, Input, CardSkeleton, ModelSelectModal, Toggle, Con
 import { useCopyToClipboard } from "@/shared/hooks/useCopyToClipboard";
 import { isOpenAICompatibleProvider, isAnthropicCompatibleProvider } from "@/shared/constants/providers";
 
-// Validate combo name: only a-z, A-Z, 0-9, -, _
-const VALID_NAME_REGEX = /^[a-zA-Z0-9_.\-]+$/;
+// Validate combo name: only a-z, A-Z, 0-9, -, _, . and []
+const VALID_NAME_REGEX = /^[a-zA-Z0-9_.\-\[\]]+$/;
 
 export default function CombosPage() {
   const [combos, setCombos] = useState([]);
@@ -469,7 +469,7 @@ function ComboFormModal({ isOpen, combo, onClose, onSave, activeProviders, kindF
       return false;
     }
     if (!VALID_NAME_REGEX.test(value)) {
-      setNameError("Only letters, numbers, -, _ and . allowed");
+      setNameError("Only letters, numbers, -, _, . and [] allowed");
       return false;
     }
     setNameError("");
