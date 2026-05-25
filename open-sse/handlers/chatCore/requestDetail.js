@@ -89,7 +89,8 @@ export function saveUsageStats({ provider, model, tokens, connectionId, apiKey, 
 
   if (inTokens === 0 && outTokens === 0) return;
 
-  const time = new Date().toLocaleTimeString("en-US", { hour12: false, hour: "2-digit", minute: "2-digit", second: "2-digit" });
+  const _u = new Date(Date.now() + 7 * 60 * 60 * 1000);
+  const time = `${String(_u.getUTCHours()).padStart(2,"0")}:${String(_u.getUTCMinutes()).padStart(2,"0")}:${String(_u.getUTCSeconds()).padStart(2,"0")}`;
   const accountSuffix = connectionId ? ` | account=${connectionId.slice(0, 8)}...` : "";
   console.log(`${COLORS.green}[${time}] 📊 [${label}] ${provider.toUpperCase()} | in=${inTokens} | out=${outTokens}${accountSuffix}${COLORS.reset}`);
 

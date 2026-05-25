@@ -3,7 +3,8 @@ import { STREAM_STALL_TIMEOUT_MS } from "../config/runtimeConfig.js";
 
 // Get HH:MM:SS timestamp
 function getTimeString() {
-  return new Date().toLocaleTimeString("en-US", { hour12: false, hour: "2-digit", minute: "2-digit", second: "2-digit" });
+  const u = new Date(Date.now() + 7 * 60 * 60 * 1000);
+  return `${String(u.getUTCHours()).padStart(2,"0")}:${String(u.getUTCMinutes()).padStart(2,"0")}:${String(u.getUTCSeconds()).padStart(2,"0")}`;
 }
 
 /**
