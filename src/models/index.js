@@ -35,6 +35,6 @@ export {
   deleteApiKey,
   validateApiKey,
   isCloudEnabled,
-  addKeysToPool, getPoolKeys, getPoolCount, removeKeyFromPool, pullKeysFromPool,
+  addKeysToPool, getPoolKeys, getPoolKeysPaged, getPoolCount, removeKeyFromPool, pullKeysFromPool,
   getPoolSize, setPoolSize, getAutoReplace, setAutoReplace,
 } from "@/lib/localDb";

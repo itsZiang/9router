@@ -142,6 +142,7 @@ export const TABLES = {
     },
     indexes: [
       "CREATE INDEX IF NOT EXISTS idx_kp_provider ON keyPool(provider)",
+      "CREATE UNIQUE INDEX IF NOT EXISTS idx_kp_provider_key ON keyPool(provider, key)",
     ],
   },
   requestDetails: {

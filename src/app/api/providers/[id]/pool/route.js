@@ -1,28 +1,43 @@
 import { NextResponse } from "next/server";
 import {
-  addKeysToPool, getPoolKeys, getPoolCount, removeKeyFromPool,
+  addKeysToPool, getPoolKeysPaged, getPoolCount, removeKeyFromPool,
   getPoolSize, setPoolSize, getAutoReplace, setAutoReplace,
 } from "@/models";
 
 export const dynamic = "force-dynamic";
 
-// GET /api/providers/[id]/pool
+// GET /api/providers/[id]/pool?page=1&limit=50
 export async function GET(req, { params }) {
   try {
     const provider = params.id;
-    const [keys, poolSize, autoReplace] = await Promise.all([
-      getPoolKeys(provider),
+    const { searchParams } = new URL(req.url);
+    const page = Math.max(1, parseInt(searchParams.get("page") || "1", 10));
+    const limit = Math.min(Math.max(1, parseInt(searchParams.get("limit") || "50", 10)), 200);
+    const offset = (page - 1) * limit;
+
+    const [count, keys, poolSize, autoReplace] = await Promise.all([
+      getPoolCount(provider),
+      getPoolKeysPaged(provider, limit, offset),
       getPoolSize(provider),
       getAutoReplace(provider),
     ]);
-    // Mask keys in response
+
     const masked = keys.map((k) => ({
       id: k.id,
       name: k.name,
       key: maskKey(k.key),
       createdAt: k.createdAt,
     }));
-    return NextResponse.json({ keys: masked, count: keys.length, poolSize, autoReplace });
+
+    return NextResponse.json({
+      keys: masked,
+      count,
+      page,
+      totalPages: Math.max(1, Math.ceil(count / limit)),
+      limit,
+      poolSize,
+      autoReplace,
+    });
   } catch (err) {
     return NextResponse.json({ error: err.message }, { status: 500 });
   }

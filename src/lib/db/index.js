@@ -72,7 +72,7 @@ export {
 
 // Key pool
 export {
-  addKeysToPool, getPoolKeys, getPoolCount, removeKeyFromPool, pullKeysFromPool,
+  addKeysToPool, getPoolKeys, getPoolKeysPaged, getPoolCount, removeKeyFromPool, pullKeysFromPool,
   getPoolSize, setPoolSize, getAutoReplace, setAutoReplace,
 } from "./repos/keyPoolRepo.js";
 

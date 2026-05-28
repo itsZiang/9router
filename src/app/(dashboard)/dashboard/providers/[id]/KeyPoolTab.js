@@ -5,27 +5,28 @@ import { Button, Toggle } from "@/shared/components";
 import AddToPoolModal from "./AddToPoolModal";
 
 export default function KeyPoolTab({ provider, onPullDone }) {
-  const [poolData, setPoolData] = useState({ keys: [], count: 0, poolSize: 30, autoReplace: true });
+  const [poolData, setPoolData] = useState({ keys: [], count: 0, page: 1, totalPages: 1, poolSize: 30, autoReplace: true });
   const [loading, setLoading] = useState(true);
   const [pullCount, setPullCount] = useState("");
   const [pulling, setPulling] = useState(false);
   const [pullResult, setPullResult] = useState(null);
   const [showAddModal, setShowAddModal] = useState(false);
   const [deletingKey, setDeletingKey] = useState(null);
+  const [page, setPage] = useState(1);
 
-  const fetchPool = useCallback(async () => {
+  const fetchPool = useCallback(async (p = page) => {
     try {
-      const res = await fetch(`/api/providers/${provider}/pool`, { cache: "no-store" });
+      const res = await fetch(`/api/providers/${provider}/pool?page=${p}&limit=50`, { cache: "no-store" });
       if (res.ok) {
         const data = await res.json();
         setPoolData(data);
-        setPullCount(String(data.poolSize));
+        if (!pullCount) setPullCount(String(data.poolSize));
       }
     } catch {}
     setLoading(false);
-  }, [provider]);
+  }, [provider, page, pullCount]);
 
-  useEffect(() => { fetchPool(); }, [fetchPool]);
+  useEffect(() => { fetchPool(page); }, [provider, page]); // eslint-disable-line
 
   async function handlePull() {
     setPulling(true);
@@ -40,7 +41,8 @@ export default function KeyPoolTab({ provider, onPullDone }) {
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || "Pull failed");
       setPullResult(data);
-      await fetchPool();
+      setPage(1);
+      await fetchPool(1);
       onPullDone?.();
     } catch (err) {
       setPullResult({ error: err.message });
@@ -53,7 +55,7 @@ export default function KeyPoolTab({ provider, onPullDone }) {
     setDeletingKey(id);
     try {
       await fetch(`/api/providers/${provider}/pool?keyId=${id}`, { method: "DELETE" });
-      await fetchPool();
+      await fetchPool(page);
     } finally {
       setDeletingKey(null);
     }
@@ -133,42 +135,73 @@ export default function KeyPoolTab({ provider, onPullDone }) {
           <Button size="sm" icon="add" onClick={() => setShowAddModal(true)}>Add Keys to Pool</Button>
         </div>
       ) : (
-        <div className="overflow-x-auto rounded-lg border border-border">
-          <table className="w-full text-sm">
-            <thead>
-              <tr className="border-b border-border bg-black/[0.02] dark:bg-white/[0.02] text-xs text-text-muted">
-                <th className="px-4 py-2 text-left font-medium uppercase tracking-wide">Name</th>
-                <th className="px-4 py-2 text-left font-medium uppercase tracking-wide">Key</th>
-                <th className="px-4 py-2 text-right font-medium uppercase tracking-wide">Action</th>
-              </tr>
-            </thead>
-            <tbody>
-              {poolData.keys.map((k, i) => (
-                <tr key={k.id} className={`border-b border-border last:border-0 ${i % 2 === 0 ? "" : "bg-black/[0.01] dark:bg-white/[0.01]"}`}>
-                  <td className="px-4 py-2 text-text-muted">{k.name || <span className="text-text-muted/50 italic">—</span>}</td>
-                  <td className="px-4 py-2 font-mono text-xs text-text-muted">{k.key}</td>
-                  <td className="px-4 py-2 text-right">
-                    <button
-                      className="text-red-500 hover:text-red-400 transition-colors disabled:opacity-40"
-                      onClick={() => handleDeleteKey(k.id)}
-                      disabled={deletingKey === k.id}
-                      title="Remove from pool"
-                    >
-                      <span className="material-symbols-outlined text-base">close</span>
-                    </button>
-                  </td>
+        <>
+          <div className="overflow-x-auto rounded-lg border border-border">
+            <table className="w-full text-sm">
+              <thead>
+                <tr className="border-b border-border bg-black/[0.02] dark:bg-white/[0.02] text-xs text-text-muted">
+                  <th className="px-4 py-2 text-left font-medium uppercase tracking-wide">Name</th>
+                  <th className="px-4 py-2 text-left font-medium uppercase tracking-wide">Key</th>
+                  <th className="px-4 py-2 text-right font-medium uppercase tracking-wide">Action</th>
                 </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
+              </thead>
+              <tbody>
+                {poolData.keys.map((k, i) => (
+                  <tr key={k.id} className={`border-b border-border last:border-0 ${i % 2 === 0 ? "" : "bg-black/[0.01] dark:bg-white/[0.01]"}`}>
+                    <td className="px-4 py-2 text-text-muted">{k.name || <span className="text-text-muted/50 italic">—</span>}</td>
+                    <td className="px-4 py-2 font-mono text-xs text-text-muted">{k.key}</td>
+                    <td className="px-4 py-2 text-right">
+                      <button
+                        className="text-red-500 hover:text-red-400 transition-colors disabled:opacity-40"
+                        onClick={() => handleDeleteKey(k.id)}
+                        disabled={deletingKey === k.id}
+                        title="Remove from pool"
+                      >
+                        <span className="material-symbols-outlined text-base">close</span>
+                      </button>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+
+          {/* Pagination */}
+          {poolData.totalPages > 1 && (
+            <div className="flex items-center justify-between text-sm">
+              <span className="text-text-muted text-xs">
+                Page {poolData.page} of {poolData.totalPages} ({poolData.count} total)
+              </span>
+              <div className="flex gap-2">
+                <Button
+                  size="sm"
+                  variant="ghost"
+                  icon="chevron_left"
+                  disabled={page <= 1}
+                  onClick={() => setPage((p) => p - 1)}
+                >
+                  Prev
+                </Button>
+                <Button
+                  size="sm"
+                  variant="ghost"
+                  icon="chevron_right"
+                  disabled={page >= poolData.totalPages}
+                  onClick={() => setPage((p) => p + 1)}
+                >
+                  Next
+                </Button>
+              </div>
+            </div>
+          )}
+        </>
       )}
 
       <AddToPoolModal
         isOpen={showAddModal}
         provider={provider}
         onClose={() => setShowAddModal(false)}
-        onDone={() => { setShowAddModal(false); fetchPool(); }}
+        onDone={() => { setShowAddModal(false); setPage(1); fetchPool(1); }}
       />
     </div>
   );
