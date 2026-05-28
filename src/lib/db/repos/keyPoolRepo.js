@@ -12,21 +12,25 @@ const CACHE_TTL_MS = 60_000; // 1 minute
 
 export async function addKeysToPool(provider, keys) {
   // keys: [{ name, key }]
-  // Uses INSERT OR IGNORE via UNIQUE(provider, key) — no need to SELECT all first
   const db = await getAdapter();
   const now = new Date().toISOString();
   let added = 0;
   let skipped = 0;
 
   db.transaction(() => {
+    // Load existing keys once for reliable JS-side dedup (don't rely on result.changes)
+    const existing = new Set(
+      db.all(`SELECT key FROM keyPool WHERE provider = ?`, [provider]).map((r) => r.key)
+    );
+
     for (const k of keys) {
-      if (!k.key) { skipped++; continue; }
-      const result = db.run(
+      if (!k.key || existing.has(k.key)) { skipped++; continue; }
+      db.run(
         `INSERT OR IGNORE INTO keyPool(id, provider, name, key, createdAt) VALUES(?, ?, ?, ?, ?)`,
         [uuidv4(), provider, k.name || null, k.key, now]
       );
-      if ((result.changes ?? 0) > 0) added++;
-      else skipped++;
+      existing.add(k.key);
+      added++;
     }
   });
 

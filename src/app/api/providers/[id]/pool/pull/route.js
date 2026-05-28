@@ -6,10 +6,9 @@ import {
 export const dynamic = "force-dynamic";
 
 // POST /api/providers/[id]/pool/pull
-// Body: { count?: number }
 export async function POST(req, { params }) {
   try {
-    const provider = params.id;
+    const { id: provider } = await params;
     const body = await req.json().catch(() => ({}));
 
     const [poolSize, existing] = await Promise.all([
@@ -29,7 +28,6 @@ export async function POST(req, { params }) {
       return NextResponse.json({ pulled: 0, skipped: 0, message: "Pool is empty or all keys already in use" });
     }
 
-    // Pass existingKeys so batchCreatePoolConnections skips its internal SELECT
     const created = await batchCreatePoolConnections(provider, pulled, existingKeys);
 
     return NextResponse.json({ pulled: created, skipped: pulled.length - created });

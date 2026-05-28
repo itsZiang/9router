@@ -9,7 +9,7 @@ export const dynamic = "force-dynamic";
 // GET /api/providers/[id]/pool?page=1&limit=50
 export async function GET(req, { params }) {
   try {
-    const provider = params.id;
+    const { id: provider } = await params;
     const { searchParams } = new URL(req.url);
     const page = Math.max(1, parseInt(searchParams.get("page") || "1", 10));
     const limit = Math.min(Math.max(1, parseInt(searchParams.get("limit") || "50", 10)), 200);
@@ -44,14 +44,11 @@ export async function GET(req, { params }) {
 }
 
 // POST /api/providers/[id]/pool
-// Body: { lines: "name|key\nkey2\n..." } — bulk add
-// OR: { poolSize: number } / { autoReplace: boolean } — update settings
 export async function POST(req, { params }) {
   try {
-    const provider = params.id;
+    const { id: provider } = await params;
     const body = await req.json();
 
-    // Settings update
     if (body.poolSize !== undefined) {
       const n = parseInt(body.poolSize, 10);
       if (!Number.isFinite(n) || n < 1) return NextResponse.json({ error: "Invalid poolSize" }, { status: 400 });
@@ -63,7 +60,6 @@ export async function POST(req, { params }) {
       return NextResponse.json({ ok: true });
     }
 
-    // Bulk add keys
     const lines = (body.lines || "").split("\n").map((l) => l.trim()).filter(Boolean);
     const keys = lines.map((line) => {
       const sep = line.indexOf("|");
@@ -83,6 +79,7 @@ export async function POST(req, { params }) {
 // DELETE /api/providers/[id]/pool?keyId=<id>
 export async function DELETE(req, { params }) {
   try {
+    await params; // ensure params is resolved (unused here since keyId comes from query)
     const { searchParams } = new URL(req.url);
     const keyId = searchParams.get("keyId");
     if (!keyId) return NextResponse.json({ error: "keyId required" }, { status: 400 });
