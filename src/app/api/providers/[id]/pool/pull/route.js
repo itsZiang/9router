@@ -12,7 +12,6 @@ export async function POST(req, { params }) {
     const provider = params.id;
     const body = await req.json().catch(() => ({}));
 
-    // Determine how many keys to pull
     const [poolSize, existing] = await Promise.all([
       getPoolSize(provider),
       getProviderConnections({ provider }),
@@ -30,8 +29,8 @@ export async function POST(req, { params }) {
       return NextResponse.json({ pulled: 0, skipped: 0, message: "Pool is empty or all keys already in use" });
     }
 
-    // Batch-insert all pulled keys in one transaction (avoids N+1)
-    const created = await batchCreatePoolConnections(provider, pulled);
+    // Pass existingKeys so batchCreatePoolConnections skips its internal SELECT
+    const created = await batchCreatePoolConnections(provider, pulled, existingKeys);
 
     return NextResponse.json({ pulled: created, skipped: pulled.length - created });
   } catch (err) {

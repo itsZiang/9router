@@ -1,4 +1,4 @@
-import { getProviderConnections, validateApiKey, updateProviderConnection, getSettings, createProviderConnection, pullKeysFromPool, getAutoReplace } from "@/lib/localDb";
+import { getProviderConnections, validateApiKey, updateProviderConnection, getSettings, pullKeysFromPool, getAutoReplace, batchCreatePoolConnections } from "@/lib/localDb";
 import { resolveConnectionProxyConfig } from "@/lib/network/connectionProxy";
 import { formatRetryAfter, checkFallbackError, isModelLockActive, buildModelLockUpdate, getEarliestModelLockUntil } from "open-sse/services/accountFallback.js";
 import { MAX_RATE_LIMIT_COOLDOWN_MS, QUOTA_POOL_PATTERNS } from "open-sse/config/errorConfig.js";
@@ -214,15 +214,9 @@ async function autoReplaceFromPool(provider, failingConnectionId) {
       return;
     }
 
-    const k = pulled[0];
-    await createProviderConnection({
-      provider,
-      authType: "apikey",
-      name: k.name || `pool-auto-${Date.now()}`,
-      apiKey: k.key,
-      isActive: 1,
-    });
-
+    // batchCreatePoolConnections avoids reorderInTx (no N×UPDATE on every auto-replace)
+    // Pass existingKeys to skip the internal SELECT inside batchCreatePoolConnections
+    await batchCreatePoolConnections(provider, pulled, existingKeys);
     await updateProviderConnection(failingConnectionId, { isActive: 0 });
     log.info("AUTH", `[POOL] auto-replaced key for ${provider}`);
   } catch (err) {

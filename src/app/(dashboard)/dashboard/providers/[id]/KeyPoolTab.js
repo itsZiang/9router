@@ -73,6 +73,7 @@ export default function KeyPoolTab({ provider, onPullDone }) {
   async function handlePoolSizeSave() {
     const n = parseInt(pullCount, 10);
     if (!Number.isFinite(n) || n < 1) return;
+    if (n === poolData.poolSize) return; // no change — skip unnecessary write
     setPoolData((d) => ({ ...d, poolSize: n }));
     await fetch(`/api/providers/${provider}/pool`, {
       method: "POST",

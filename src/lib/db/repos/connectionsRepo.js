@@ -155,7 +155,8 @@ export async function createProviderConnection(data) {
 
 // Batch-insert multiple apikey connections from pool — loads connections ONCE, inserts all, reorders ONCE.
 // Much faster than calling createProviderConnection() N times.
-export async function batchCreatePoolConnections(provider, keys) {
+// Pass existingApiKeys to skip the internal SELECT (avoids double-load when caller already has connections).
+export async function batchCreatePoolConnections(provider, keys, knownExistingKeys = null) {
   // keys: [{ name, key }]
   if (!keys || keys.length === 0) return 0;
   const db = await getAdapter();
@@ -163,9 +164,20 @@ export async function batchCreatePoolConnections(provider, keys) {
   let created = 0;
 
   db.transaction(() => {
-    const all = db.all(`SELECT * FROM providerConnections WHERE provider = ?`, [provider]).map(rowToConn);
-    const existingApiKeys = new Set(all.map((c) => c.apiKey).filter(Boolean));
-    let nextPriority = all.reduce((m, c) => Math.max(m, c.priority || 0), 0) + 1;
+    let existingApiKeys;
+    let nextPriority;
+
+    if (knownExistingKeys !== null) {
+      // Caller already has the connections list — skip the SELECT
+      existingApiKeys = new Set(knownExistingKeys);
+      // Still need max priority — get it with a lightweight query
+      const row = db.get(`SELECT MAX(priority) as maxP FROM providerConnections WHERE provider = ?`, [provider]);
+      nextPriority = (row?.maxP ?? 0) + 1;
+    } else {
+      const all = db.all(`SELECT * FROM providerConnections WHERE provider = ?`, [provider]).map(rowToConn);
+      existingApiKeys = new Set(all.map((c) => c.apiKey).filter(Boolean));
+      nextPriority = all.reduce((m, c) => Math.max(m, c.priority || 0), 0) + 1;
+    }
 
     for (const k of keys) {
       if (!k.key || existingApiKeys.has(k.key)) continue;
