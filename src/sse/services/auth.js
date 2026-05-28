@@ -1,7 +1,7 @@
-import { getProviderConnections, validateApiKey, updateProviderConnection, getSettings } from "@/lib/localDb";
+import { getProviderConnections, validateApiKey, updateProviderConnection, getSettings, createProviderConnection, pullKeysFromPool, getAutoReplace } from "@/lib/localDb";
 import { resolveConnectionProxyConfig } from "@/lib/network/connectionProxy";
 import { formatRetryAfter, checkFallbackError, isModelLockActive, buildModelLockUpdate, getEarliestModelLockUntil } from "open-sse/services/accountFallback.js";
-import { MAX_RATE_LIMIT_COOLDOWN_MS } from "open-sse/config/errorConfig.js";
+import { MAX_RATE_LIMIT_COOLDOWN_MS, QUOTA_POOL_PATTERNS } from "open-sse/config/errorConfig.js";
 import { resolveProviderId, FREE_PROVIDERS } from "@/shared/constants/providers.js";
 import * as log from "../utils/logger.js";
 
@@ -187,6 +187,39 @@ export async function getProviderCredentials(provider, excludeConnectionIds = nu
 }
 
 /**
+ * Auto-replace a quota-exhausted connection with a fresh key from the pool.
+ */
+async function autoReplaceFromPool(provider, failingConnectionId) {
+  try {
+    const enabled = await getAutoReplace(provider);
+    if (!enabled) return;
+
+    const existing = await getProviderConnections({ provider, isActive: true });
+    const existingKeys = existing.map((c) => c.apiKey).filter(Boolean);
+
+    const pulled = await pullKeysFromPool(provider, 1, existingKeys);
+    if (!pulled.length) {
+      log.warn("AUTH", `[POOL] pool empty for ${provider}, cannot auto-replace`);
+      return;
+    }
+
+    const k = pulled[0];
+    await createProviderConnection({
+      provider,
+      authType: "apikey",
+      name: k.name || `pool-auto-${Date.now()}`,
+      apiKey: k.key,
+      isActive: 1,
+    });
+
+    await updateProviderConnection(failingConnectionId, { isActive: 0 });
+    log.info("AUTH", `[POOL] auto-replaced key for ${provider}`);
+  } catch (err) {
+    log.warn("AUTH", `[POOL] auto-replace failed: ${err.message}`);
+  }
+}
+
+/**
  * Mark account+model as unavailable — locks modelLock_${model} in DB.
  * All errors (429, 401, 5xx, etc.) lock per model, not per account.
  * @param {string} connectionId
@@ -231,6 +264,11 @@ export async function markAccountUnavailable(connectionId, status, errorText, pr
 
   if (provider && status && reason) {
     console.error(`❌ ${provider} [${status}]: ${reason}`);
+  }
+
+  // Auto-replace from pool on quota exhaustion
+  if (status === 403 && provider && QUOTA_POOL_PATTERNS.some(p => reason.toLowerCase().includes(p))) {
+    autoReplaceFromPool(provider, connectionId).catch(() => {});
   }
 
   return { shouldFallback: true, cooldownMs };

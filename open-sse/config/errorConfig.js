@@ -83,3 +83,14 @@ export const COOLDOWN_MS = {
   transient: TRANSIENT_COOLDOWN_MS,
   requestNotAllowed: COOLDOWN.short,
 };
+
+// Error text patterns that indicate quota exhaustion → trigger auto-replace from pool
+export const QUOTA_POOL_PATTERNS = [
+  "quota failed",
+  "insufficient_quota",
+  "exceeded quota",
+  "quota exceeded",
+  "out of quota",
+  "quota limit",
+  "credits exhausted",
+];

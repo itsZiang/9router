@@ -18,4 +18,6 @@ export {
   getMitmAlias, setMitmAliasAll,
   getPricing, getPricingForModel, updatePricing, resetPricing, resetAllPricing,
   exportDb, importDb,
+  addKeysToPool, getPoolKeys, getPoolCount, removeKeyFromPool, pullKeysFromPool,
+  getPoolSize, setPoolSize, getAutoReplace, setAutoReplace,
 } from "@/lib/db/index.js";

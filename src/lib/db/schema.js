@@ -132,6 +132,18 @@ export const TABLES = {
       data: "TEXT NOT NULL",
     },
   },
+  keyPool: {
+    columns: {
+      id: "TEXT PRIMARY KEY",
+      provider: "TEXT NOT NULL",
+      name: "TEXT",
+      key: "TEXT NOT NULL",
+      createdAt: "TEXT NOT NULL",
+    },
+    indexes: [
+      "CREATE INDEX IF NOT EXISTS idx_kp_provider ON keyPool(provider)",
+    ],
+  },
   requestDetails: {
     columns: {
       id: "TEXT PRIMARY KEY",

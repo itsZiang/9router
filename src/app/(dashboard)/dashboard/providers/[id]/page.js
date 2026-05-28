@@ -16,6 +16,7 @@ import ConnectionRow from "./ConnectionRow";
 import AddApiKeyModal from "./AddApiKeyModal";
 import EditCompatibleNodeModal from "./EditCompatibleNodeModal";
 import AddCustomModelModal from "./AddCustomModelModal";
+import KeyPoolTab from "./KeyPoolTab";
 
 const ONE_BY_ONE_DELAY_MS = 1000;
 
@@ -57,6 +58,8 @@ export default function ProviderDetailPage() {
   const [modelOrder, setModelOrder] = useState(null);
   const [confirmState, setConfirmState] = useState(null);
   const [showAgRiskModal, setShowAgRiskModal] = useState(false);
+  const [activeConnectionsTab, setActiveConnectionsTab] = useState("connections");
+  const [deletingDisabled, setDeletingDisabled] = useState(false);
   const [oneByOneRunning, setOneByOneRunning] = useState(false);
   const [oneByOneStopping, setOneByOneStopping] = useState(false);
   const [oneByOneCurrentConnectionId, setOneByOneCurrentConnectionId] = useState(null);
@@ -1239,8 +1242,42 @@ export default function ProviderDetailPage() {
       ) : (
         <Card>
           <div className="mb-4 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
-            <h2 className="text-lg font-semibold">Connections</h2>
+            {/* Tab switcher */}
+            <div className="flex items-center gap-1">
+              <button
+                className={`px-3 py-1.5 rounded-md text-sm font-medium transition-colors ${activeConnectionsTab === "connections" ? "bg-primary text-white" : "text-text-muted hover:text-foreground"}`}
+                onClick={() => setActiveConnectionsTab("connections")}
+              >
+                Connections ({connections.length})
+              </button>
+              <button
+                className={`px-3 py-1.5 rounded-md text-sm font-medium transition-colors ${activeConnectionsTab === "pool" ? "bg-primary text-white" : "text-text-muted hover:text-foreground"}`}
+                onClick={() => setActiveConnectionsTab("pool")}
+              >
+                🔑 Key Pool
+              </button>
+            </div>
+            {activeConnectionsTab === "connections" && (
             <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:gap-4">
+              {connections.some((c) => !c.isActive) && (
+                <Button
+                  size="sm"
+                  variant="ghost"
+                  icon="delete_sweep"
+                  disabled={deletingDisabled}
+                  onClick={async () => {
+                    setDeletingDisabled(true);
+                    try {
+                      await fetch(`/api/providers/${providerId}/connections/disabled`, { method: "DELETE" });
+                      await fetchConnections();
+                    } finally {
+                      setDeletingDisabled(false);
+                    }
+                  }}
+                >
+                  {deletingDisabled ? "Deleting..." : `Delete Disabled (${connections.filter((c) => !c.isActive).length})`}
+                </Button>
+              )}
               {connections.length > 1 && (
                 <Button
                   size="sm"
@@ -1322,9 +1359,12 @@ export default function ProviderDetailPage() {
                 )}
               </div>
             </div>
+            )}
           </div>
 
-          {connections.length === 0 ? (
+          {activeConnectionsTab === "pool" ? (
+            <KeyPoolTab provider={providerId} onPullDone={fetchConnections} />
+          ) : connections.length === 0 ? (
             <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
               <div className="flex items-center gap-3">
                 <div className="inline-flex items-center justify-center w-9 h-9 rounded-full bg-primary/10 text-primary shrink-0">
@@ -1436,8 +1476,6 @@ export default function ProviderDetailPage() {
           )}
         </Card>
       )}
-
-      {/* Models */}
       <Card>
         <div className="mb-4 flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
           <h2 className="text-lg font-semibold">

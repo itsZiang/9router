@@ -70,6 +70,12 @@ export {
   saveRequestDetail, getRequestDetails, getRequestDetailById,
 } from "./repos/requestDetailsRepo.js";
 
+// Key pool
+export {
+  addKeysToPool, getPoolKeys, getPoolCount, removeKeyFromPool, pullKeysFromPool,
+  getPoolSize, setPoolSize, getAutoReplace, setAutoReplace,
+} from "./repos/keyPoolRepo.js";
+
 // Export/import full DB
 export async function exportDb() {
   const db = await getAdapter();
