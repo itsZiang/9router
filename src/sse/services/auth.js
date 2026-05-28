@@ -216,7 +216,12 @@ async function autoReplaceFromPool(provider, failingConnectionId) {
 
     // batchCreatePoolConnections avoids reorderInTx (no N×UPDATE on every auto-replace)
     // Pass existingKeys to skip the internal SELECT inside batchCreatePoolConnections
-    await batchCreatePoolConnections(provider, pulled, existingKeys);
+    const created = await batchCreatePoolConnections(provider, pulled, existingKeys);
+    if (created === 0) {
+      // Replacement key already existed in connections — don't disable the failing one
+      log.warn("AUTH", `[POOL] replacement key already in connections for ${provider}, skipping disable`);
+      return;
+    }
     await updateProviderConnection(failingConnectionId, { isActive: 0 });
     log.info("AUTH", `[POOL] auto-replaced key for ${provider}`);
   } catch (err) {

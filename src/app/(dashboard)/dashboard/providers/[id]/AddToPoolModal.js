@@ -30,7 +30,7 @@ export default function AddToPoolModal({ isOpen, provider, onClose, onDone }) {
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || "Failed");
       setResult(data);
-      onDone?.();
+      onDone?.(); // notify parent to refresh pool count (does NOT close modal)
     } catch (err) {
       setError(err.message);
     } finally {

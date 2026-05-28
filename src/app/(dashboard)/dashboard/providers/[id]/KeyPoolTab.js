@@ -202,7 +202,7 @@ export default function KeyPoolTab({ provider, onPullDone }) {
         isOpen={showAddModal}
         provider={provider}
         onClose={() => setShowAddModal(false)}
-        onDone={() => { setShowAddModal(false); setPage(1); fetchPool(1); }}
+        onDone={() => { setPage(1); fetchPool(1); }} // refresh only — modal stays open so user sees result
       />
     </div>
   );
