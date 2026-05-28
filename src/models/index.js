@@ -4,6 +4,7 @@ export {
   getProviderConnectionById,
   createProviderConnection,
   updateProviderConnection,
+  batchCreatePoolConnections,
   deleteProviderConnection,
   getProviderNodes,
   getProviderNodeById,
