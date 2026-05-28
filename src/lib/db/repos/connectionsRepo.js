@@ -185,7 +185,7 @@ export async function batchCreatePoolConnections(provider, keys, knownExistingKe
         id: uuidv4(),
         provider,
         authType: "apikey",
-        name: k.name || null,
+        name: k.name || `pool-···${k.key.slice(-8)}`,
         priority: nextPriority++,
         isActive: 1,
         apiKey: k.key,

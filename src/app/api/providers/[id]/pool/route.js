@@ -91,6 +91,8 @@ export async function DELETE(req, { params }) {
 }
 
 function maskKey(key) {
-  if (!key || key.length <= 8) return "••••••••";
-  return key.slice(0, 8) + "••••" + key.slice(-4);
+  if (!key) return "••••••••";
+  if (key.length <= 16) return key.slice(0, 4) + "···" + key.slice(-4);
+  // Show enough prefix to identify the key type + enough suffix to distinguish keys
+  return key.slice(0, 20) + "···" + key.slice(-8);
 }
