@@ -1,0 +1,57 @@
+<h2>Key Pool Tab — Layout</h2>
+<p class="subtitle">Mockup của tab "Key Pool" trên Provider Detail page</p>
+
+<div class="mockup">
+  <div class="mockup-header">Provider Detail — Anthropic &nbsp;|&nbsp; <span style="color:#888">Connections (12)</span> &nbsp;|&nbsp; <span style="color:#c084fc; border-bottom:2px solid #7c3aed; padding-bottom:2px">🔑 Key Pool (488)</span></div>
+  <div class="mockup-body">
+
+    <!-- Pool stats + actions bar -->
+    <div style="display:flex; justify-content:space-between; align-items:center; padding:12px 16px; background:#0f0f1a; border-bottom:1px solid #2a2a3a; border-radius:6px 6px 0 0">
+      <div style="display:flex; align-items:center; gap:16px">
+        <span style="color:#c084fc; font-weight:600; font-size:14px">488 keys trong pool</span>
+        <span style="color:#888; font-size:12px">Auto-replace: <span style="color:#4ade80">ON</span></span>
+      </div>
+      <div style="display:flex; align-items:center; gap:8px">
+        <span style="color:#888; font-size:12px">Pull</span>
+        <input type="number" value="30" style="width:50px; background:#1a1a2e; border:1px solid #444; color:#fff; padding:4px 6px; border-radius:4px; font-size:12px; text-align:center">
+        <span style="color:#888; font-size:12px">keys</span>
+        <button style="background:#7c3aed; color:white; border:none; padding:6px 14px; border-radius:5px; font-size:12px; cursor:pointer; font-weight:500">Pull từ pool ↓</button>
+        <button style="background:#1a1a2e; color:#c084fc; border:1px solid #7c3aed; padding:6px 14px; border-radius:5px; font-size:12px; cursor:pointer">+ Add to pool</button>
+      </div>
+    </div>
+
+    <!-- Table header -->
+    <div style="display:grid; grid-template-columns:1fr 2fr auto; gap:8px; padding:8px 16px; background:#111; border-bottom:1px solid #222; font-size:11px; color:#666; text-transform:uppercase; letter-spacing:0.05em">
+      <span>Name</span>
+      <span>Key</span>
+      <span>Action</span>
+    </div>
+
+    <!-- Rows -->
+    <div style="font-size:12px; font-family:monospace">
+      <div style="display:grid; grid-template-columns:1fr 2fr auto; gap:8px; padding:9px 16px; border-bottom:1px solid #1a1a2e; color:#ccc; align-items:center">
+        <span>pool-key-001</span>
+        <span style="color:#888">sk-ant-api03-••••••••••••••••••XYZ1</span>
+        <span style="color:#ef4444; cursor:pointer; font-size:11px">✕</span>
+      </div>
+      <div style="display:grid; grid-template-columns:1fr 2fr auto; gap:8px; padding:9px 16px; border-bottom:1px solid #1a1a2e; color:#ccc; align-items:center">
+        <span>pool-key-002</span>
+        <span style="color:#888">sk-ant-api03-••••••••••••••••••XYZ2</span>
+        <span style="color:#ef4444; cursor:pointer; font-size:11px">✕</span>
+      </div>
+      <div style="display:grid; grid-template-columns:1fr 2fr auto; gap:8px; padding:9px 16px; border-bottom:1px solid #1a1a2e; color:#ccc; align-items:center">
+        <span>pool-key-003</span>
+        <span style="color:#888">sk-ant-api03-••••••••••••••••••XYZ3</span>
+        <span style="color:#ef4444; cursor:pointer; font-size:11px">✕</span>
+      </div>
+      <div style="padding:9px 16px; color:#555; font-size:11px; text-align:center">... 485 keys more</div>
+    </div>
+
+    <!-- Footer: delete disabled -->
+    <div style="padding:12px 16px; background:#1a0f0f; border-top:1px solid #3a1a1a; border-radius:0 0 6px 6px; display:flex; justify-content:space-between; align-items:center">
+      <span style="color:#888; font-size:12px">Connections tab: <span style="color:#ef4444">3 disabled keys</span> đang chờ xóa</span>
+      <button style="background:#7f1d1d; color:#fca5a5; border:1px solid #ef4444; padding:5px 12px; border-radius:4px; font-size:11px; cursor:pointer">🗑 Xóa tất cả disabled</button>
+    </div>
+
+  </div>
+</div>
