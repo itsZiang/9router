@@ -8,6 +8,10 @@ import * as log from "../utils/logger.js";
 // Mutex to prevent race conditions during account selection
 let selectionMutex = Promise.resolve();
 
+// Per-connection guard: prevents duplicate auto-replace when multiple concurrent
+// requests hit 403 for the same connection at the same time.
+const replacingConnections = new Set();
+
 /**
  * Get provider credentials from localDb
  * Filters out unavailable accounts and returns the selected account based on strategy
@@ -190,11 +194,18 @@ export async function getProviderCredentials(provider, excludeConnectionIds = nu
  * Auto-replace a quota-exhausted connection with a fresh key from the pool.
  */
 async function autoReplaceFromPool(provider, failingConnectionId) {
+  // Guard: only one replace per failing connection at a time
+  if (replacingConnections.has(failingConnectionId)) return;
+  replacingConnections.add(failingConnectionId);
+
   try {
-    const enabled = await getAutoReplace(provider);
+    // Run independent fetches in parallel
+    const [enabled, existing] = await Promise.all([
+      getAutoReplace(provider),
+      getProviderConnections({ provider, isActive: true }),
+    ]);
     if (!enabled) return;
 
-    const existing = await getProviderConnections({ provider, isActive: true });
     const existingKeys = existing.map((c) => c.apiKey).filter(Boolean);
 
     const pulled = await pullKeysFromPool(provider, 1, existingKeys);
@@ -216,6 +227,8 @@ async function autoReplaceFromPool(provider, failingConnectionId) {
     log.info("AUTH", `[POOL] auto-replaced key for ${provider}`);
   } catch (err) {
     log.warn("AUTH", `[POOL] auto-replace failed: ${err.message}`);
+  } finally {
+    replacingConnections.delete(failingConnectionId);
   }
 }
 

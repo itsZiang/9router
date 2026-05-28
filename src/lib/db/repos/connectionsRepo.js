@@ -153,6 +153,42 @@ export async function createProviderConnection(data) {
   return result;
 }
 
+// Batch-insert multiple apikey connections from pool — loads connections ONCE, inserts all, reorders ONCE.
+// Much faster than calling createProviderConnection() N times.
+export async function batchCreatePoolConnections(provider, keys) {
+  // keys: [{ name, key }]
+  if (!keys || keys.length === 0) return 0;
+  const db = await getAdapter();
+  const now = new Date().toISOString();
+  let created = 0;
+
+  db.transaction(() => {
+    const all = db.all(`SELECT * FROM providerConnections WHERE provider = ?`, [provider]).map(rowToConn);
+    const existingApiKeys = new Set(all.map((c) => c.apiKey).filter(Boolean));
+    let nextPriority = all.reduce((m, c) => Math.max(m, c.priority || 0), 0) + 1;
+
+    for (const k of keys) {
+      if (!k.key || existingApiKeys.has(k.key)) continue;
+      const conn = {
+        id: uuidv4(),
+        provider,
+        authType: "apikey",
+        name: k.name || null,
+        priority: nextPriority++,
+        isActive: 1,
+        apiKey: k.key,
+        createdAt: now,
+        updatedAt: now,
+      };
+      upsert(db, conn);
+      existingApiKeys.add(k.key);
+      created++;
+    }
+  });
+
+  return created;
+}
+
 // Critical: OAuth refresh token race — atomic merge inside transaction
 export async function updateProviderConnection(id, data) {
   const db = await getAdapter();
