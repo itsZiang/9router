@@ -36,7 +36,7 @@ function connToRow(c) {
     name: name ?? null,
     email: email ?? null,
     priority: priority ?? null,
-    isActive: isActive === false ? 0 : 1,
+    isActive: (isActive === false || isActive === 0) ? 0 : 1,
     data: stringifyJson(rest),
     createdAt,
     updatedAt,
@@ -156,7 +156,9 @@ export async function createProviderConnection(data) {
 // Batch-insert multiple apikey connections from pool — loads connections ONCE, inserts all, reorders ONCE.
 // Much faster than calling createProviderConnection() N times.
 // Pass existingApiKeys to skip the internal SELECT (avoids double-load when caller already has connections).
-export async function batchCreatePoolConnections(provider, keys, knownExistingKeys = null) {
+// Pass inheritProviderSpecificData to carry over baseUrl/prefix/etc from existing connections (required for
+// openai-compatible-* and anthropic-compatible-* so requests go to the right endpoint, not OpenAI/Anthropic).
+export async function batchCreatePoolConnections(provider, keys, knownExistingKeys = null, inheritProviderSpecificData = null) {
   // keys: [{ name, key }]
   if (!keys || keys.length === 0) return 0;
   const db = await getAdapter();
@@ -166,6 +168,7 @@ export async function batchCreatePoolConnections(provider, keys, knownExistingKe
   db.transaction(() => {
     let existingApiKeys;
     let nextPriority;
+    let resolvedProviderSpecificData = inheritProviderSpecificData;
 
     if (knownExistingKeys !== null) {
       // Caller already has the connections list — skip the SELECT
@@ -177,6 +180,10 @@ export async function batchCreatePoolConnections(provider, keys, knownExistingKe
       const all = db.all(`SELECT * FROM providerConnections WHERE provider = ?`, [provider]).map(rowToConn);
       existingApiKeys = new Set(all.map((c) => c.apiKey).filter(Boolean));
       nextPriority = all.reduce((m, c) => Math.max(m, c.priority || 0), 0) + 1;
+      // Inherit providerSpecificData from first existing connection if not provided
+      if (!resolvedProviderSpecificData && all.length > 0) {
+        resolvedProviderSpecificData = all[0].providerSpecificData || null;
+      }
     }
 
     for (const k of keys) {
@@ -189,6 +196,7 @@ export async function batchCreatePoolConnections(provider, keys, knownExistingKe
         priority: nextPriority++,
         isActive: 1,
         apiKey: k.key,
+        ...(resolvedProviderSpecificData ? { providerSpecificData: resolvedProviderSpecificData } : {}),
         createdAt: now,
         updatedAt: now,
       };

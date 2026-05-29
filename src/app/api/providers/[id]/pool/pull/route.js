@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 import {
   pullKeysFromPool, getPoolSize, getProviderConnections, batchCreatePoolConnections,
+  getProviderNodeById, updateProviderConnection,
 } from "@/models";
 
 export const dynamic = "force-dynamic";
@@ -28,7 +29,24 @@ export async function POST(req, { params }) {
       return NextResponse.json({ pulled: 0, skipped: 0, message: "Pool is empty or all keys already in use" });
     }
 
-    const created = await batchCreatePoolConnections(provider, pulled, existingKeys);
+    // Inherit providerSpecificData so custom providers (openai-compatible-*, anthropic-compatible-*)
+    // carry their baseUrl to pool connections — otherwise requests fall back to api.openai.com / api.anthropic.com.
+    // Prefer existing connection's PSD; fall back to node config when no connections exist yet.
+    let inheritPsd = existing.find((c) => c.providerSpecificData?.baseUrl)?.providerSpecificData || null;
+    if (!inheritPsd) {
+      const node = await getProviderNodeById(provider);
+      if (node) {
+        inheritPsd = { baseUrl: node.baseUrl, prefix: node.prefix, apiType: node.apiType, nodeName: node.name };
+      }
+    }
+
+    // Repair existing connections that are missing providerSpecificData (pulled before this fix)
+    if (inheritPsd) {
+      const broken = existing.filter((c) => !c.providerSpecificData?.baseUrl);
+      await Promise.all(broken.map((c) => updateProviderConnection(c.id, { providerSpecificData: inheritPsd })));
+    }
+
+    const created = await batchCreatePoolConnections(provider, pulled, existingKeys, inheritPsd);
 
     return NextResponse.json({ pulled: created, skipped: pulled.length - created });
   } catch (err) {

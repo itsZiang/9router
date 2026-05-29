@@ -216,14 +216,16 @@ async function autoReplaceFromPool(provider, failingConnectionId) {
 
     // batchCreatePoolConnections avoids reorderInTx (no N×UPDATE on every auto-replace)
     // Pass existingKeys to skip the internal SELECT inside batchCreatePoolConnections
-    const created = await batchCreatePoolConnections(provider, pulled, existingKeys);
+    // Pass providerSpecificData so custom providers (openai-compatible-*, anthropic-compatible-*)
+    // inherit baseUrl — without this, pool connections fall back to api.openai.com / api.anthropic.com
+    const inheritPsd = existing.find((c) => c.providerSpecificData?.baseUrl)?.providerSpecificData || null;
+    const created = await batchCreatePoolConnections(provider, pulled, existingKeys, inheritPsd);
     if (created === 0) {
-      // Replacement key already existed in connections — don't disable the failing one
-      log.warn("AUTH", `[POOL] replacement key already in connections for ${provider}, skipping disable`);
-      return;
+      log.warn("AUTH", `[POOL] replacement key already in connections for ${provider}`);
+      // Fall through to disable the failing key — replacement already available, failing key should still be removed
     }
-    await updateProviderConnection(failingConnectionId, { isActive: 0 });
-    log.info("AUTH", `[POOL] auto-replaced key for ${provider}`);
+    await updateProviderConnection(failingConnectionId, { isActive: false });
+    log.info("AUTH", `[POOL] auto-replaced key for ${provider} (created=${created})`);
   } catch (err) {
     log.warn("AUTH", `[POOL] auto-replace failed: ${err.message}`);
   } finally {
@@ -279,8 +281,13 @@ export async function markAccountUnavailable(connectionId, status, errorText, pr
   }
 
   // Auto-replace from pool on quota exhaustion
-  if (status === 403 && provider && QUOTA_POOL_PATTERNS.some(p => reason.toLowerCase().includes(p))) {
-    autoReplaceFromPool(provider, connectionId).catch(() => {});
+  if (status === 403 && provider) {
+    const isQuotaExhausted = QUOTA_POOL_PATTERNS.some(p => reason.toLowerCase().includes(p));
+    if (isQuotaExhausted) {
+      autoReplaceFromPool(provider, connectionId).catch(() => {});
+    } else {
+      log.warn("AUTH", `[POOL] 403 received but no quota pattern matched — reason: "${reason.slice(0, 80)}"`);
+    }
   }
 
   return { shouldFallback: true, cooldownMs };
