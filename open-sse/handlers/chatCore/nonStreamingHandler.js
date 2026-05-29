@@ -186,7 +186,7 @@ export async function handleNonStreamingResponse({ providerResponse, provider, m
   }
 
   if (translatedResponse?.usage) {
-    translatedResponse.usage = filterUsageForFormat(addBufferToUsage(translatedResponse.usage), sourceFormat);
+    translatedResponse.usage = filterUsageForFormat(addBufferToUsage(translatedResponse.usage, provider), sourceFormat);
   }
 
   // Strip reasoning_content — some clients (e.g. Firecrawl AI SDK) have JSON parsers that

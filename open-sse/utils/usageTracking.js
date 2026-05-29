@@ -15,8 +15,19 @@ export const COLORS = {
   cyan: "\x1b[36m"
 };
 
-// Buffer tokens to prevent context errors
+// Buffer tokens to prevent context errors when proxy injects hidden content.
+// Only applied for the native "claude" provider which injects decoy tools + system prompt
+// (~1000+ tokens with OAuth). All other providers pass through cleanly → buffer = 0.
 const BUFFER_TOKENS = 2000;
+
+/**
+ * Returns the buffer token count for a given provider.
+ * Only native "claude" provider needs a buffer (hidden injections: decoy tools, system prompt).
+ * @param {string|null} provider
+ */
+export function getBufferTokens(provider) {
+  return (!provider || provider === "claude") ? BUFFER_TOKENS : 0;
+}
 
 // Get HH:MM:SS timestamp
 function getTimeString() {
@@ -25,12 +36,17 @@ function getTimeString() {
 }
 
 /**
- * Add buffer tokens to usage to prevent context errors
+ * Add buffer tokens to usage to prevent context errors.
+ * Pass provider so buffer is only applied where proxy actually injects hidden content.
  * @param {object} usage - Usage object (any format)
+ * @param {string|null} provider - Provider name
  * @returns {object} Usage with buffer added
  */
-export function addBufferToUsage(usage) {
+export function addBufferToUsage(usage, provider = null) {
   if (!usage || typeof usage !== "object") return usage;
+
+  const buffer = getBufferTokens(provider);
+  if (buffer === 0) return usage;
 
   const result = { ...usage };
 
@@ -267,15 +283,16 @@ export function estimateOutputTokens(contentLength) {
  * @param {number} inputTokens - Input/prompt tokens
  * @param {number} outputTokens - Output/completion tokens
  * @param {string} targetFormat - Target format from FORMATS
+ * @param {string|null} provider - Provider name (determines buffer size)
  */
-export function formatUsage(inputTokens, outputTokens, targetFormat) {
+export function formatUsage(inputTokens, outputTokens, targetFormat, provider = null) {
   // Claude format uses input_tokens/output_tokens
   if (targetFormat === FORMATS.CLAUDE) {
-    return addBufferToUsage({ 
-      input_tokens: inputTokens, 
-      output_tokens: outputTokens, 
-      estimated: true 
-    });
+    return addBufferToUsage({
+      input_tokens: inputTokens,
+      output_tokens: outputTokens,
+      estimated: true
+    }, provider);
   }
 
   // Default: OpenAI format (works for openai, gemini, responses, etc.)
@@ -284,7 +301,7 @@ export function formatUsage(inputTokens, outputTokens, targetFormat) {
     completion_tokens: outputTokens,
     total_tokens: inputTokens + outputTokens,
     estimated: true
-  });
+  }, provider);
 }
 
 /**
@@ -292,12 +309,14 @@ export function formatUsage(inputTokens, outputTokens, targetFormat) {
  * @param {object} body - Request body for input token estimation
  * @param {number} contentLength - Content length for output token estimation
  * @param {string} targetFormat - Target format from FORMATS constant
+ * @param {string|null} provider - Provider name (determines buffer size)
  */
-export function estimateUsage(body, contentLength, targetFormat = FORMATS.OPENAI) {
+export function estimateUsage(body, contentLength, targetFormat = FORMATS.OPENAI, provider = null) {
   return formatUsage(
     estimateInputTokens(body),
     estimateOutputTokens(contentLength),
-    targetFormat
+    targetFormat,
+    provider
   );
 }
 

@@ -8,7 +8,7 @@ import { adjustMaxTokens } from "../helpers/maxTokensHelper.js";
 const CLAUDE_OAUTH_TOOL_PREFIX = "";
 
 // Convert OpenAI request to Claude format
-export function openaiToClaudeRequest(model, body, stream) {
+export function openaiToClaudeRequest(model, body, stream, credentials, provider) {
   // Tool name mapping for Claude OAuth (capitalizedName → originalName)
   const toolNameMap = new Map();
   const result = {
@@ -120,17 +120,31 @@ Respond ONLY with the JSON object, no other text.`);
     }
   }
 
-  // System with Claude Code prompt and cache_control
-  const claudeCodePrompt = { type: "text", text: CLAUDE_SYSTEM_PROMPT };
+  // System prompt assembly
+  // Only inject the Claude Code cloaking prompt for the native "claude" provider
+  // (real Anthropic API fingerprinting). anthropic-compatible-* providers are third-party
+  // APIs using the Anthropic format — injecting this prompt is meaningless and wastes tokens.
+  const isNativeClaude = !provider || provider === "claude";
 
   if (systemParts.length > 0) {
     const systemText = systemParts.join("\n");
-    result.system = [
-      claudeCodePrompt,
-      { type: "text", text: systemText, cache_control: { type: "ephemeral", ttl: "1h" } }
-    ];
+    if (isNativeClaude) {
+      const claudeCodePrompt = { type: "text", text: CLAUDE_SYSTEM_PROMPT };
+      result.system = [
+        claudeCodePrompt,
+        { type: "text", text: systemText, cache_control: { type: "ephemeral", ttl: "1h" } }
+      ];
+    } else {
+      result.system = [
+        { type: "text", text: systemText, cache_control: { type: "ephemeral", ttl: "1h" } }
+      ];
+    }
   } else {
-    result.system = [claudeCodePrompt];
+    if (isNativeClaude) {
+      const claudeCodePrompt = { type: "text", text: CLAUDE_SYSTEM_PROMPT };
+      result.system = [claudeCodePrompt];
+    }
+    // anthropic-compatible-* with no system prompt: omit system entirely (let provider use its default)
   }
 
   // Tools - convert from OpenAI format to Claude format with prefix for OAuth
