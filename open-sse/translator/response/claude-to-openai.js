@@ -164,9 +164,9 @@ export function claudeToOpenAIResponse(chunk, state) {
         const finishReason = state.finishReason || (state.toolCalls?.size > 0 ? "tool_calls" : "stop");
         const usageObj = (state.usage && typeof state.usage === 'object') ? {
           usage: {
-            prompt_tokens: state.usage.input_tokens || 0,
-            completion_tokens: state.usage.output_tokens || 0,
-            total_tokens: (state.usage.input_tokens || 0) + (state.usage.output_tokens || 0)
+            prompt_tokens: state.usage.prompt_tokens || state.usage.input_tokens || 0,
+            completion_tokens: state.usage.completion_tokens || state.usage.output_tokens || 0,
+            total_tokens: (state.usage.prompt_tokens || state.usage.input_tokens || 0) + (state.usage.completion_tokens || state.usage.output_tokens || 0)
           }
         } : {};
         results.push({

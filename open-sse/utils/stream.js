@@ -270,7 +270,7 @@ export function createSSEStream(options = {}) {
           }
 
           if (!hasValidUsage(usage) && totalContentLength > 0) {
-            usage = estimateUsage(body, totalContentLength, FORMATS.OPENAI);
+            usage = estimateUsage(body, totalContentLength, FORMATS.OPENAI, provider);
           }
 
           if (hasValidUsage(usage)) {
@@ -340,7 +340,7 @@ export function createSSEStream(options = {}) {
         controller.enqueue(sharedEncoder.encode(doneOutput));
 
         if (!hasValidUsage(state?.usage) && totalContentLength > 0) {
-          state.usage = estimateUsage(body, totalContentLength, sourceFormat);
+          state.usage = estimateUsage(body, totalContentLength, sourceFormat, provider);
         }
 
         if (hasValidUsage(state?.usage)) {

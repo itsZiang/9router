@@ -52,17 +52,17 @@ export function addBufferToUsage(usage, provider = null) {
 
   // Claude format
   if (result.input_tokens !== undefined) {
-    result.input_tokens += BUFFER_TOKENS;
+    result.input_tokens += buffer;
   }
 
   // OpenAI format
   if (result.prompt_tokens !== undefined) {
-    result.prompt_tokens += BUFFER_TOKENS;
+    result.prompt_tokens += buffer;
   }
 
   // Calculate or update total_tokens
   if (result.total_tokens !== undefined) {
-    result.total_tokens += BUFFER_TOKENS;
+    result.total_tokens += buffer;
   } else if (result.prompt_tokens !== undefined && result.completion_tokens !== undefined) {
     // Calculate total_tokens if not exists
     result.total_tokens = result.prompt_tokens + result.completion_tokens;

@@ -108,10 +108,16 @@ export function translateNonStreamingResponse(responseBody, targetFormat, source
     };
 
     if (responseBody.usage) {
+      const inputTokens = responseBody.usage.input_tokens || 0;
+      const outputTokens = responseBody.usage.output_tokens || 0;
       result.usage = {
-        prompt_tokens: responseBody.usage.input_tokens || 0,
-        completion_tokens: responseBody.usage.output_tokens || 0,
-        total_tokens: (responseBody.usage.input_tokens || 0) + (responseBody.usage.output_tokens || 0)
+        prompt_tokens: inputTokens,
+        completion_tokens: outputTokens,
+        total_tokens: inputTokens + outputTokens,
+        // Also include Claude-format field names so filterUsageForFormat
+        // can pick the right fields for any sourceFormat
+        input_tokens: inputTokens,
+        output_tokens: outputTokens
       };
     }
     return result;
