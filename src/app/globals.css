@@ -153,6 +153,9 @@ select {
   /* Semantic */
   --color-bg: var(--color-bg);
   --color-bg-alt: var(--color-bg-alt);
+  --color-bg-base: var(--color-surface);
+  --color-bg-subtle: var(--color-surface-2);
+  --color-bg-hover: var(--color-surface-3);
   --color-surface: var(--color-surface);
   --color-surface-2: var(--color-surface-2);
   --color-surface-3: var(--color-surface-3);

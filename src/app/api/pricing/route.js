@@ -36,8 +36,9 @@ export async function PATCH(request) {
       );
     }
 
-    // Validate pricing structure
+    // Validate pricing structure (skip metadata keys prefixed with _)
     for (const [provider, models] of Object.entries(body)) {
+      if (provider.startsWith("_")) continue;
       if (typeof models !== "object" || models === null) {
         return NextResponse.json(
           { error: `Invalid pricing for provider: ${provider}` },

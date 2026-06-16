@@ -192,6 +192,32 @@ async function createBypassRequest(parsedUrl, realIP, options) {
   });
 }
 
+/**
+ * Attempt a fetch through the proxy with up to `maxAttempts` retries.
+ * Each attempt uses a fresh ProxyAgent (new TCP connection).
+ * Returns the response on the first success, or throws the last error.
+ */
+async function fetchViaProxyWithRetry(url, options, proxyUrl, maxAttempts) {
+  let lastError;
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    const dispatcher = await getDispatcher(proxyUrl);
+    try {
+      return await originalFetch(url, { ...options, dispatcher, headers: { ...options.headers, connection: "close" } });
+    } catch (err) {
+      lastError = err;
+      if (attempt < maxAttempts) {
+        const delayMs = attempt * 500; // 500ms, 1000ms, 1500ms …
+        console.warn(`[ProxyFetch] Attempt ${attempt}/${maxAttempts} failed (${err.message}), retrying in ${delayMs}ms…`);
+        await new Promise(resolve => setTimeout(resolve, delayMs));
+      }
+    }
+  }
+  throw lastError;
+}
+
+// Number of times to attempt a proxy connection before giving up (or falling back).
+const PROXY_RETRY_ATTEMPTS = 3;
+
 export async function proxyAwareFetch(url, options = {}, proxyOptions = null) {
   const targetUrl = typeof url === "string" ? url : url.toString();
 
@@ -211,13 +237,16 @@ export async function proxyAwareFetch(url, options = {}, proxyOptions = null) {
   const envProxyUrl = connectionProxyUrl ? null : normalizeProxyUrl(getEnvProxyUrl(targetUrl));
   const proxyUrl = connectionProxyUrl || envProxyUrl;
 
+  // Retry count only applies to explicitly configured connection proxies;
+  // env-var proxies use a single attempt (existing behavior).
+  const retryAttempts = connectionProxyUrl ? PROXY_RETRY_ATTEMPTS : 1;
+
   // MITM DNS bypass: for known MITM-intercepted hosts, resolve real IP to avoid DNS spoof
   if (shouldBypassMitmDns(targetUrl)) {
     if (proxyUrl) {
       // Proxy resolves DNS externally (not affected by /etc/hosts) — use proxy directly
-      const dispatcher = await getDispatcher(proxyUrl);
       try {
-        return await originalFetch(url, { ...options, dispatcher, headers: { ...options.headers, connection: "close" } });
+        return await fetchViaProxyWithRetry(url, options, proxyUrl, retryAttempts);
       } catch (proxyError) {
         if (proxyOptions?.strictProxy === true) {
           throw new Error(`[ProxyFetch] Proxy required but failed (strictProxy=true): ${proxyError.message}`);
@@ -236,9 +265,8 @@ export async function proxyAwareFetch(url, options = {}, proxyOptions = null) {
   }
 
   if (proxyUrl) {
-    const dispatcher = await getDispatcher(proxyUrl);
     try {
-      return await originalFetch(url, { ...options, dispatcher, headers: { ...options.headers, connection: "close" } });
+      return await fetchViaProxyWithRetry(url, options, proxyUrl, retryAttempts);
     } catch (proxyError) {
       // If strictProxy is enabled, fail hard instead of falling back to direct
       if (proxyOptions?.strictProxy === true) {

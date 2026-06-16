@@ -101,4 +101,5 @@ export const QUOTA_POOL_PATTERNS = [
   "no balance",
   "out of balance",
   "out of credits",
+  "account balance is insufficient",
 ];

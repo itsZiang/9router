@@ -39,15 +39,16 @@ export default function PricingSettingsPage() {
     if (!currentPricing) return 0;
     let count = 0;
     for (const provider in currentPricing) {
+      if (provider.startsWith("_")) continue;
       count += Object.keys(currentPricing[provider]).length;
     }
     return count;
   };
 
-  // Get providers list
+  // Get providers list — separate "*" (model defaults) from real providers
   const getProviders = () => {
     if (!currentPricing) return [];
-    return Object.keys(currentPricing).sort();
+    return Object.keys(currentPricing).filter(p => p !== "*" && !p.startsWith("_")).sort();
   };
 
   return (

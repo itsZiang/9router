@@ -52,6 +52,7 @@ export async function getProviderCredentials(provider, excludeConnectionIds = nu
           connectionNoProxy: resolvedProxy.connectionNoProxy,
           connectionProxyPoolId: resolvedProxy.proxyPoolId || null,
           vercelRelayUrl: resolvedProxy.vercelRelayUrl || "",
+          strictProxy: resolvedProxy.strictProxy === true,
         },
       };
     }
@@ -177,6 +178,7 @@ export async function getProviderCredentials(provider, excludeConnectionIds = nu
         connectionNoProxy: resolvedProxy.connectionNoProxy,
         connectionProxyPoolId: resolvedProxy.proxyPoolId || null,
         vercelRelayUrl: resolvedProxy.vercelRelayUrl || "",
+        strictProxy: resolvedProxy.strictProxy === true,
       },
       connectionId: connection.id,
       // Include current status for optimization check
@@ -280,12 +282,13 @@ export async function markAccountUnavailable(connectionId, status, errorText, pr
     console.error(`❌ ${provider} [${status}]: ${reason}`);
   }
 
-  // Auto-replace from pool on quota exhaustion
-  if (status === 403 && provider) {
+  // Auto-replace from pool on quota exhaustion (billing error codes)
+  const isBillingError = status === 400 || status === 402 || status === 403;
+  if (isBillingError && provider) {
     const isQuotaExhausted = QUOTA_POOL_PATTERNS.some(p => reason.toLowerCase().includes(p));
     if (isQuotaExhausted) {
       autoReplaceFromPool(provider, connectionId).catch(() => {});
-    } else {
+    } else if (status === 403) {
       log.warn("AUTH", `[POOL] 403 received but no quota pattern matched — reason: "${reason.slice(0, 80)}"`);
     }
   }
