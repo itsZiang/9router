@@ -17,8 +17,15 @@ async function getUserPricing() {
 
 /**
  * Collect which providers have active connections and which model IDs they expose.
- * Returns { modelIds: Set|null, providerIds: Set }
- *   modelIds = null means "show all models" (unknown/passthrough provider detected)
+ *
+ * Two sources of model IDs:
+ *   1. Known providers (in PROVIDER_MODELS) → fixed model list
+ *   2. Custom openai/anthropic-compatible providers (passthrough) → usage history
+ *
+ * Fallback:
+ *   modelIds = null  → show ALL models (no connections at all, or only truly
+ *                      unknown providers → can't determine what to filter)
+ *   modelIds = Set   → only show models derived from the two sources above
  */
 async function getEnabledProviderInfo() {
   try {
@@ -27,31 +34,57 @@ async function getEnabledProviderInfo() {
     if (!conns.length) return { modelIds: null, providerIds: new Set() };
 
     const { PROVIDER_MODELS } = await import("@/open-sse/config/providerModels.js");
+    const { isOpenAICompatibleProvider, isAnthropicCompatibleProvider } =
+      await import("@/shared/constants/providers.js");
 
     const providerIds = new Set();
     const modelIds = new Set();
-    let hasPassthrough = false;
+    const providerModelsMap = {};
+    const passthroughIds = [];
 
     for (const c of conns) {
       providerIds.add(c.provider);
       const models = PROVIDER_MODELS[c.provider];
       if (models) {
+        // Known provider → fixed model list from PROVIDER_MODELS
         for (const m of models) modelIds.add(m.id);
-      } else {
-        hasPassthrough = true;
+        providerModelsMap[c.provider] = models.map(m => m.id);
+      } else if (isOpenAICompatibleProvider(c.provider) || isAnthropicCompatibleProvider(c.provider)) {
+        // Custom openai/anthropic-compatible → passthrough, find models from usage
+        passthroughIds.push(c.provider);
+      }
+      // Truly unknown providers → silently ignored
+    }
+
+    // For custom passthrough providers, pull actually-used models from usage history.
+    // Only count successful requests (status='ok') — failed/garbage model names
+    // that never completed a request should not appear in pricing.
+    if (passthroughIds.length) {
+      try {
+        const db = await getAdapter();
+        const placeholders = passthroughIds.map(() => "?").join(",");
+        const rows = db.all(
+          `SELECT DISTINCT model, provider FROM usageHistory
+           WHERE provider IN (${placeholders}) AND status = 'ok'
+           ORDER BY timestamp DESC LIMIT 200`,
+          passthroughIds
+        );
+        for (const r of rows) {
+          modelIds.add(r.model);
+          if (!providerModelsMap[r.provider]) providerModelsMap[r.provider] = [];
+          if (!providerModelsMap[r.provider].includes(r.model)) {
+            providerModelsMap[r.provider].push(r.model);
+          }
+        }
+      } catch {
+        // usageHistory table may not exist yet (first boot) — ignore
       }
     }
 
     return {
-      modelIds: hasPassthrough ? null : (modelIds.size ? modelIds : null),
+      modelIds: modelIds.size ? modelIds : null,
       providerIds,
-      // Always return PROVIDER_MODELS entries for known enabled providers so
-      // the UI filter dropdown works even when a passthrough provider is active.
-      providerModelsMap: providerIds.size
-        ? Object.fromEntries(
-            Object.entries(PROVIDER_MODELS).filter(([p]) => providerIds.has(p)).map(([p, models]) => [p, models.map(m => m.id)])
-          )
-        : {},
+      providerModelsMap,
     };
   } catch {
     return { modelIds: null, providerIds: new Set(), providerModelsMap: {} };
