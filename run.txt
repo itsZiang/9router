@@ -1,2 +1,3 @@
 npm run build
 npm run start
+git remote set-url origin https://ghp_@github.com/itsZiang/9router.git
