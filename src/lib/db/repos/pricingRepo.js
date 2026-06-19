@@ -217,13 +217,25 @@ export async function getPricing() {
 export async function getPricingForModel(provider, model) {
   if (!model) return null;
   const userPricing = await getUserPricing();
-  // 1. Provider-specific user override (e.g. openai/gpt-4o)
+
+  // Resolve alias for known OAuth providers (claude→cc, codex→cx, github→gh, ...)
+  // because the pricing UI stores overrides under the ALIAS key (matching
+  // providerModelsMap), but the cost calculator receives the provider ID.
+  let alias = provider;
+  try {
+    const { PROVIDER_ID_TO_ALIAS } = await import("open-sse/config/providerModels.js");
+    alias = PROVIDER_ID_TO_ALIAS[provider] || provider;
+  } catch { /* open-sse unavailable */ }
+
+  // 1. Provider-specific user override — check both id and alias keys
   if (provider && userPricing[provider]?.[model]) return userPricing[provider][model];
+  if (alias !== provider && userPricing[alias]?.[model]) return userPricing[alias][model];
   // 2. Generic model override from "*" provider (applies to all providers)
   if (userPricing["*"]?.[model]) return userPricing["*"][model];
   // 3. Built-in constants chain: PROVIDER_PRICING → MODEL_PRICING → PATTERN_PRICING
+  //    Pass alias (not id) since PROVIDER_PRICING is keyed by alias (e.g. "gh").
   const { getPricingForModel: resolveConst } = await import("@/shared/constants/pricing.js");
-  return resolveConst(provider, model);
+  return resolveConst(alias, model);
 }
 
 // Atomic merge inside transaction (per-provider read-modify-write)
