@@ -1,0 +1,3 @@
+npm set //registry.npmjs.org/:_authToken=npm
+npm version 0.4.xx
+npm publish --access public

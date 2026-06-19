@@ -100,6 +100,7 @@ export default function PricingModal({ isOpen, onClose, onSave }) {
   if (!isOpen) return null;
 
   const providerModels = pricingData._providerModels || {};
+  const providerNames = pricingData._providerNames || {};
   const providerList = Object.keys(providerModels).sort();
   const pricingFields = ["input", "output", "cached", "reasoning", "cache_creation"];
 
@@ -200,7 +201,7 @@ export default function PricingModal({ isOpen, onClose, onSave }) {
           >
             <option value="">All providers</option>
             {providerList.map(p => (
-              <option key={p} value={p}>{p}</option>
+              <option key={p} value={p}>{providerNames[p] || p}</option>
             ))}
           </select>
           {(searchQuery || filterProvider) && (
@@ -235,7 +236,7 @@ export default function PricingModal({ isOpen, onClose, onSave }) {
 
                 // For "*" section: apply provider filter
                 if (isDefault) {
-                  return renderProviderSection(provider, "Default Pricing (all providers)", models);
+                  return renderProviderSection(provider, "Global Pricing Overrides", models);
                 }
 
                 // For provider-specific sections: only show if matches filter
@@ -251,7 +252,7 @@ export default function PricingModal({ isOpen, onClose, onSave }) {
                 return (
                   <div key={provider} className="border border-border rounded-lg overflow-hidden">
                     <div className="bg-bg-subtle px-4 py-2 font-semibold text-sm flex items-center justify-between">
-                      <span>{provider.toUpperCase()} Override</span>
+                      <span>{providerNames[provider] || provider.toUpperCase()}</span>
                       <span className="text-text-subtle text-xs font-normal">{filteredModels.length} models</span>
                     </div>
                     <div className="overflow-x-auto">

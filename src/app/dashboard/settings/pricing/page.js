@@ -142,17 +142,19 @@ export default function PricingSettingsPage() {
           <div className="text-center py-4 text-text-muted">Loading pricing data...</div>
         ) : currentPricing ? (
           <div className="space-y-3">
-            {Object.keys(currentPricing).slice(0, 5).map(provider => (
+            {Object.keys(currentPricing).filter(p => !p.startsWith("_")).slice(0, 5).map(provider => (
               <div key={provider} className="text-sm">
-                <span className="font-semibold">{provider.toUpperCase()}:</span>{" "}
+                <span className="font-semibold">
+                  {provider === "*" ? "Global Overrides" : (currentPricing._providerNames?.[provider] || provider.toUpperCase())}:
+                </span>{" "}
                 <span className="text-text-muted">
                   {Object.keys(currentPricing[provider]).length} models
                 </span>
               </div>
             ))}
-            {Object.keys(currentPricing).length > 5 && (
+            {Object.keys(currentPricing).filter(p => !p.startsWith("_")).length > 5 && (
               <div className="text-sm text-text-muted">
-                + {Object.keys(currentPricing).length - 5} more providers
+                + {Object.keys(currentPricing).filter(p => !p.startsWith("_")).length - 5} more providers
               </div>
             )}
           </div>

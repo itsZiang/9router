@@ -18,47 +18,119 @@ async function getUserPricing() {
 /**
  * Collect which providers have active connections and which model IDs they expose.
  *
- * Two sources of model IDs:
- *   1. Known providers (in PROVIDER_MODELS) → fixed model list
- *   2. Custom openai/anthropic-compatible providers (passthrough) → usage history
+ * Three sources of model IDs:
+ *   1. Known providers (in PROVIDER_MODELS) → static catalog (or enabledModels
+ *      when present) ∪ customModels (user-added) ∪ modelAliases (alias-mapped).
+ *      This matches /v1/models so newly added models on known providers (e.g.
+ *      a Gemini release not yet in the catalog) appear on the pricing page.
+ *   2. Custom openai/anthropic-compatible providers (passthrough) →
+ *      conn.providerSpecificData.enabledModels (user-curated) ∪ usageHistory
  *
- * Fallback:
- *   modelIds = null  → show ALL models (no connections at all, or only truly
- *                      unknown providers → can't determine what to filter)
- *   modelIds = Set   → only show models derived from the two sources above
+ * IMPORTANT: providerIds uses ALIASES (cc, cx, gh, ...) for known OAuth providers
+ * because PROVIDER_PRICING is keyed by alias. conn.provider stores the provider ID
+ * (claude, codex, github, ...), so we resolve via PROVIDER_ID_TO_ALIAS.
+ * Custom-compatible provider IDs are used verbatim (they are their own keys).
+ *
+ * Returns:
+ *   providerIds: Set     — aliases (known) + ids (custom)
+ *   providerModelsMap    — {alias|id: [modelId, ...]} for UI sections + filter dropdown
+ *   providerNames        — {alias|id: displayName} for UI labels (dropdown + headers)
  */
 async function getEnabledProviderInfo() {
   try {
     const { getProviderConnections } = await import("./connectionsRepo.js");
     const conns = await getProviderConnections({ isActive: true });
-    if (!conns.length) return { modelIds: null, providerIds: new Set() };
+    if (!conns.length) {
+      return { providerIds: new Set(), providerModelsMap: {}, providerNames: {} };
+    }
 
-    const { PROVIDER_MODELS } = await import("@/open-sse/config/providerModels.js");
-    const { isOpenAICompatibleProvider, isAnthropicCompatibleProvider } =
+    const { PROVIDER_MODELS, PROVIDER_ID_TO_ALIAS } = await import("open-sse/config/providerModels.js");
+    const { AI_PROVIDERS, isOpenAICompatibleProvider, isAnthropicCompatibleProvider } =
       await import("@/shared/constants/providers.js");
+    // Pull user-added custom models + alias mappings so newly added models on
+    // known providers (e.g. a new Gemini release not yet in PROVIDER_MODELS)
+    // also appear on the pricing page — matches /v1/models behaviour.
+    const { getCustomModels, getModelAliases } = await import("./aliasRepo.js");
+    let customModels = [];
+    let modelAliases = {};
+    try {
+      customModels = await getCustomModels();
+    } catch { /* table may not exist yet */ }
+    try {
+      modelAliases = await getModelAliases();
+    } catch { /* table may not exist yet */ }
 
     const providerIds = new Set();
-    const modelIds = new Set();
     const providerModelsMap = {};
+    const providerNames = {};
     const passthroughIds = [];
 
     for (const c of conns) {
-      providerIds.add(c.provider);
-      const models = PROVIDER_MODELS[c.provider];
+      // Resolve provider id → alias for known OAuth providers (claude→cc, codex→cx, ...)
+      // Custom-compatible & API-key providers use their id as alias.
+      const alias = PROVIDER_ID_TO_ALIAS[c.provider] || c.provider;
+      const models = PROVIDER_MODELS[alias];
+
       if (models) {
-        // Known provider → fixed model list from PROVIDER_MODELS
-        for (const m of models) modelIds.add(m.id);
-        providerModelsMap[c.provider] = models.map(m => m.id);
+        // Known provider → start from fixed model list (or user-curated
+        // enabledModels when present), then augment with custom models and
+        // alias-mapped models — mirrors /v1/models so the pricing page shows
+        // every model the user can actually route to.
+        providerIds.add(alias);
+        providerNames[alias] = AI_PROVIDERS[c.provider]?.name || alias;
+
+        const enabled = c.providerSpecificData?.enabledModels;
+        const baseIds = (Array.isArray(enabled) && enabled.length)
+          ? enabled.filter(id => typeof id === "string" && id.trim())
+          : models.map(m => m.id);
+
+        const modelSet = new Set(baseIds);
+
+        // User-added custom models for this provider
+        for (const cm of customModels) {
+          if (!cm?.id || (cm.type && cm.type !== "llm")) continue;
+          if (cm.providerAlias === alias || cm.providerAlias === c.provider) {
+            modelSet.add(String(cm.id).trim());
+          }
+        }
+
+        // Alias-mapped models for this provider
+        for (const fullModel of Object.values(modelAliases)) {
+          if (typeof fullModel !== "string" || !fullModel.includes("/")) continue;
+          if (fullModel.startsWith(`${alias}/`) || fullModel.startsWith(`${c.provider}/`)) {
+            const modelId = fullModel.slice(fullModel.indexOf("/") + 1);
+            if (modelId) modelSet.add(modelId);
+          }
+        }
+
+        providerModelsMap[alias] = [...modelSet];
       } else if (isOpenAICompatibleProvider(c.provider) || isAnthropicCompatibleProvider(c.provider)) {
-        // Custom openai/anthropic-compatible → passthrough, find models from usage
+        // Custom openai/anthropic-compatible → passthrough
         passthroughIds.push(c.provider);
+        // Display name: prefer the node name carried on the connection (set at
+        // connection creation in /api/providers POST), then the connection name,
+        // then the raw provider id.
+        providerNames[c.provider] =
+          c.providerSpecificData?.nodeName || c.name || c.provider;
+        // Prefer the user-curated enabledModels list (saved at providers/[id]/page.new.js)
+        const enabled = c.providerSpecificData?.enabledModels;
+        if (Array.isArray(enabled) && enabled.length) {
+          providerModelsMap[c.provider] = [];
+          for (const modelId of enabled) {
+            if (typeof modelId !== "string" || !modelId.trim()) continue;
+            if (!providerModelsMap[c.provider].includes(modelId)) {
+              providerModelsMap[c.provider].push(modelId);
+            }
+          }
+        }
       }
       // Truly unknown providers → silently ignored
     }
 
-    // For custom passthrough providers, pull actually-used models from usage history.
-    // Only count successful requests (status='ok') — failed/garbage model names
-    // that never completed a request should not appear in pricing.
+    // For custom passthrough providers without an enabledModels list (or to augment it),
+    // pull actually-used models from usage history. Only count successful requests
+    // (status='ok') — failed/garbage model names that never completed a request
+    // should not appear in pricing.
     if (passthroughIds.length) {
       try {
         const db = await getAdapter();
@@ -70,7 +142,6 @@ async function getEnabledProviderInfo() {
           passthroughIds
         );
         for (const r of rows) {
-          modelIds.add(r.model);
           if (!providerModelsMap[r.provider]) providerModelsMap[r.provider] = [];
           if (!providerModelsMap[r.provider].includes(r.model)) {
             providerModelsMap[r.provider].push(r.model);
@@ -82,12 +153,12 @@ async function getEnabledProviderInfo() {
     }
 
     return {
-      modelIds: modelIds.size ? modelIds : null,
       providerIds,
       providerModelsMap,
+      providerNames,
     };
   } catch {
-    return { modelIds: null, providerIds: new Set(), providerModelsMap: {} };
+    return { providerIds: new Set(), providerModelsMap: {}, providerNames: {} };
   }
 }
 
@@ -96,26 +167,32 @@ export async function getPricing() {
   if (cache.value && cache.expiresAt > now) return cache.value;
 
   const userPricing = await getUserPricing();
-  const { PROVIDER_PRICING, MODEL_PRICING } = await import("@/shared/constants/pricing.js");
-  const { modelIds, providerIds, providerModelsMap } = await getEnabledProviderInfo();
+  const { getPricingForModel: resolveBasePrice } = await import("@/shared/constants/pricing.js");
+  const { providerModelsMap, providerNames } = await getEnabledProviderInfo();
   const merged = {};
 
-  // Seed model defaults under "*" — filtered to models from enabled providers
-  merged["*"] = {};
-  for (const [model, pricing] of Object.entries(MODEL_PRICING)) {
-    if (!modelIds || modelIds.has(model)) {
-      merged["*"][model] = pricing;
+  // "*" holds ONLY user-set global overrides (applies to all providers via
+  // getPricingForModel). Deliberately NOT seeded from the catalog so each enabled
+  // provider gets its own clearly-labeled section instead of being lumped into
+  // one giant "Default Pricing" bucket. Renders only when non-empty.
+  if (userPricing["*"]) {
+    merged["*"] = { ...userPricing["*"] };
+  }
+
+  // One section per enabled provider (known alias OR custom id). Seed each model
+  // with its effective baseline price from the constants chain
+  // (PROVIDER_PRICING → MODEL_PRICING → PATTERN), falling back to zero stubs for
+  // models not in the catalog (typical for custom-compatible providers).
+  for (const [providerKey, modelIdList] of Object.entries(providerModelsMap)) {
+    if (!merged[providerKey]) merged[providerKey] = {};
+    for (const modelId of modelIdList) {
+      const base = resolveBasePrice(providerKey, modelId)
+        || { input: 0, output: 0, cached: 0, reasoning: 0, cache_creation: 0 };
+      merged[providerKey][modelId] = { ...base };
     }
   }
 
-  // Provider-specific overrides — only for enabled providers
-  for (const [provider, models] of Object.entries(PROVIDER_PRICING)) {
-    if (providerIds.has(provider)) {
-      merged[provider] = { ...models };
-    }
-  }
-
-  // Apply user overrides on top
+  // Apply user overrides on top (provider-specific + global "*")
   for (const [provider, models] of Object.entries(userPricing)) {
     if (!merged[provider]) {
       merged[provider] = { ...models };
@@ -128,8 +205,10 @@ export async function getPricing() {
     }
   }
 
-  // Attach provider→model mapping for UI filtering
+  // Attach provider→model mapping for UI filtering (keys match rendered section keys)
   merged._providerModels = providerModelsMap;
+  // Attach provider→display name map for UI labels (dropdown + section headers)
+  merged._providerNames = providerNames;
 
   cache = { value: merged, expiresAt: now + CACHE_TTL_MS };
   return merged;
