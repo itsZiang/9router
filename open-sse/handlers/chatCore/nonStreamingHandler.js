@@ -15,6 +15,50 @@ import { decloakToolNames } from "../../utils/claudeCloaking.js";
 export function translateNonStreamingResponse(responseBody, targetFormat, sourceFormat) {
   if (targetFormat === sourceFormat || targetFormat === FORMATS.OPENAI) return responseBody;
 
+  // OpenAI Responses API → OpenAI Chat Completions
+  if (targetFormat === FORMATS.OPENAI_RESPONSES) {
+    // Responses API non-streaming JSON: { output: [...], usage: { input_tokens, output_tokens } }
+    const output = responseBody.output || [];
+    const msgItem = output.find(item => item?.type === "message" && Array.isArray(item.content));
+    const textContent = msgItem?.content?.find(c => c.type === "output_text")?.text || "";
+    const usage = responseBody.usage || {};
+
+    // Extract tool calls from function_call items
+    const funcCallItems = output.filter(item => item?.type === "function_call");
+    const toolCalls = funcCallItems.map((item, idx) => ({
+      id: item.call_id || `call_${item.name}_${Date.now()}_${idx}`,
+      type: "function",
+      function: {
+        name: item.name,
+        arguments: typeof item.arguments === "string" ? item.arguments : JSON.stringify(item.arguments || {})
+      }
+    }));
+
+    const message = { role: "assistant", content: textContent || (toolCalls.length > 0 ? null : "") };
+    if (toolCalls.length > 0) message.tool_calls = toolCalls;
+
+    const result = {
+      id: responseBody.id || `chatcmpl-${Date.now()}`,
+      object: "chat.completion",
+      created: responseBody.created_at || Math.floor(Date.now() / 1000),
+      model: responseBody.model || "unknown",
+      choices: [{
+        index: 0,
+        message,
+        finish_reason: toolCalls.length > 0 ? "tool_calls" : "stop"
+      }]
+    };
+
+    if (usage.input_tokens !== undefined || usage.output_tokens !== undefined) {
+      result.usage = {
+        prompt_tokens: usage.input_tokens || 0,
+        completion_tokens: usage.output_tokens || 0,
+        total_tokens: usage.total_tokens || 0
+      };
+    }
+    return result;
+  }
+
   // Gemini / Antigravity
   if (targetFormat === FORMATS.GEMINI || targetFormat === FORMATS.ANTIGRAVITY || targetFormat === FORMATS.GEMINI_CLI || targetFormat === FORMATS.VERTEX) {
     const response = responseBody.response || responseBody;
@@ -156,12 +200,47 @@ export async function handleNonStreamingResponse({ providerResponse, provider, m
 
   if (contentType.includes("text/event-stream")) {
     const sseText = await providerResponse.text();
-    const parsed = parseSSEToOpenAIResponse(sseText, model);
-    if (!parsed) {
-      appendLog({ status: `FAILED ${HTTP_STATUS.BAD_GATEWAY}` });
-      return createErrorResult(HTTP_STATUS.BAD_GATEWAY, "Invalid SSE response for non-streaming request");
+    // Try to detect Responses API SSE format (starts with event: response.created)
+    const isResponsesApiSSE = sseText.trim().startsWith("event: response.") || sseText.includes('"type":"response.created"');
+    if (isResponsesApiSSE) {
+      // Parse Responses API SSE using the existing converter
+      const { convertResponsesStreamToJson } = await import("../../transformer/streamToJsonConverter.js");
+      try {
+        const jsonResponse = await convertResponsesStreamToJson(new Response(sseText).body);
+        // Convert Responses API JSON to OpenAI Chat Completions format
+        const output = jsonResponse.output || [];
+        const msgItem = output.find(item => item?.type === "message" && Array.isArray(item.content));
+        const textContent = msgItem?.content?.find(c => c.type === "output_text")?.text || "";
+        const usage = jsonResponse.usage || {};
+        responseBody = {
+          id: jsonResponse.id || `chatcmpl-${Date.now()}`,
+          object: "chat.completion",
+          created: jsonResponse.created_at || Math.floor(Date.now() / 1000),
+          model: jsonResponse.model || model,
+          choices: [{
+            index: 0,
+            message: { role: "assistant", content: textContent },
+            finish_reason: jsonResponse.status === "completed" ? "stop" : (jsonResponse.status || "stop")
+          }],
+          usage: {
+            prompt_tokens: usage.input_tokens || 0,
+            completion_tokens: usage.output_tokens || 0,
+            total_tokens: usage.total_tokens || 0
+          }
+        };
+      } catch (err) {
+        console.error("[ChatCore] Failed to parse Responses API SSE:", err);
+        appendLog({ status: `FAILED ${HTTP_STATUS.BAD_GATEWAY}` });
+        return createErrorResult(HTTP_STATUS.BAD_GATEWAY, "Invalid Responses API SSE response");
+      }
+    } else {
+      const parsed = parseSSEToOpenAIResponse(sseText, model);
+      if (!parsed) {
+        appendLog({ status: `FAILED ${HTTP_STATUS.BAD_GATEWAY}` });
+        return createErrorResult(HTTP_STATUS.BAD_GATEWAY, "Invalid SSE response for non-streaming request");
+      }
+      responseBody = parsed;
     }
-    responseBody = parsed;
   } else {
     try {
       responseBody = await providerResponse.json();

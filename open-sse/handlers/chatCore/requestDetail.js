@@ -23,17 +23,20 @@ export function extractRequestConfig(body, stream) {
 export function extractUsageFromResponse(responseBody) {
   if (!responseBody || typeof responseBody !== "object") return null;
 
-  // Claude format
+  // Claude format (also covers OpenAI Responses API: input_tokens / output_tokens)
   if (responseBody.usage?.input_tokens !== undefined) {
     return {
       prompt_tokens: responseBody.usage.input_tokens || 0,
       completion_tokens: responseBody.usage.output_tokens || 0,
+      total_tokens: responseBody.usage.total_tokens,
+      cached_tokens: responseBody.usage.input_tokens_details?.cached_tokens,
+      reasoning_tokens: responseBody.usage.output_tokens_details?.reasoning_tokens,
       cache_read_input_tokens: responseBody.usage.cache_read_input_tokens,
       cache_creation_input_tokens: responseBody.usage.cache_creation_input_tokens
     };
   }
 
-  // OpenAI format
+  // OpenAI Chat Completions format
   if (responseBody.usage?.prompt_tokens !== undefined) {
     return {
       prompt_tokens: responseBody.usage.prompt_tokens || 0,
@@ -82,17 +85,23 @@ export function buildRequestDetail(base, overrides = {}) {
 }
 
 export function saveUsageStats({ provider, model, tokens, connectionId, apiKey, endpoint, label = "USAGE" }) {
-  if (!tokens || typeof tokens !== "object") return;
+  if (!tokens || typeof tokens !== "object") {
+    console.log(`[${label}] SKIP: tokens is null or not an object`);
+    return;
+  }
 
   const inTokens = tokens.input_tokens ?? tokens.prompt_tokens ?? 0;
   const outTokens = tokens.output_tokens ?? tokens.completion_tokens ?? 0;
 
-  if (inTokens === 0 && outTokens === 0) return;
+  if (inTokens === 0 && outTokens === 0) {
+    console.log(`[${label}] SKIP: both input and output tokens are 0`, tokens);
+    return;
+  }
 
   const _u = new Date(Date.now() + 7 * 60 * 60 * 1000);
   const time = `${String(_u.getUTCHours()).padStart(2,"0")}:${String(_u.getUTCMinutes()).padStart(2,"0")}:${String(_u.getUTCSeconds()).padStart(2,"0")}`;
   const accountSuffix = connectionId ? ` | account=${connectionId.slice(0, 8)}...` : "";
-  console.log(`${COLORS.green}[${time}] 📊 [${label}] ${provider.toUpperCase()} | in=${inTokens} | out=${outTokens}${accountSuffix}${COLORS.reset}`);
+  console.log(`${COLORS.green}[${time}] 📊 [${label}] ${provider?.toUpperCase() || "UNKNOWN"} | in=${inTokens} | out=${outTokens}${accountSuffix}${COLORS.reset}`);
 
   // Normalize to OpenAI token shape for storage
   const normalized = {
@@ -108,5 +117,7 @@ export function saveUsageStats({ provider, model, tokens, connectionId, apiKey, 
     connectionId: connectionId || undefined,
     apiKey: apiKey || undefined,
     endpoint: endpoint || null
-  }).catch(() => {});
+  }).catch((e) => {
+    console.error(`[${label}] saveRequestUsage failed:`, e?.message || e);
+  });
 }
