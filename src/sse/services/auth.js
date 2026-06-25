@@ -217,6 +217,7 @@ async function autoReplaceFromPool(provider, failingConnectionId) {
     const pulled = await pullKeysFromPool(provider, 1, existingKeys);
     if (!pulled.length) {
       log.warn("AUTH", `[POOL] pool empty for ${provider}, cannot auto-replace`);
+      await updateProviderConnection(failingConnectionId, { isActive: false });
       return;
     }
 
