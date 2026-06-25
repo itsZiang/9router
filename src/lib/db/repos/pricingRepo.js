@@ -167,7 +167,7 @@ export async function getPricing() {
   if (cache.value && cache.expiresAt > now) return cache.value;
 
   const userPricing = await getUserPricing();
-  const { getPricingForModel: resolveBasePrice } = await import("@/shared/constants/pricing.js");
+  const { getPricingForModel: resolveBasePrice } = await import("open-sse/providers/pricing.js");
   const { providerModelsMap, providerNames } = await getEnabledProviderInfo();
   const merged = {};
 
@@ -234,7 +234,7 @@ export async function getPricingForModel(provider, model) {
   if (userPricing["*"]?.[model]) return userPricing["*"][model];
   // 3. Built-in constants chain: PROVIDER_PRICING → MODEL_PRICING → PATTERN_PRICING
   //    Pass alias (not id) since PROVIDER_PRICING is keyed by alias (e.g. "gh").
-  const { getPricingForModel: resolveConst } = await import("@/shared/constants/pricing.js");
+  const { getPricingForModel: resolveConst } = await import("open-sse/providers/pricing.js");
   return resolveConst(alias, model);
 }
 

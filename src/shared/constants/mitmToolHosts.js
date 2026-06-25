@@ -5,8 +5,9 @@
 const TOOL_HOSTS = {
   antigravity: ["daily-cloudcode-pa.googleapis.com", "cloudcode-pa.googleapis.com"],
   copilot: ["api.individual.githubcopilot.com"],
-  kiro: ["q.us-east-1.amazonaws.com", "codewhisperer.us-east-1.amazonaws.com"],
+  kiro: ["runtime.us-east-1.kiro.dev", "q.us-east-1.amazonaws.com", "codewhisperer.us-east-1.amazonaws.com"],
   cursor: ["api2.cursor.sh"],
+  qoder: ["openapi.qoder.sh", "api2.qoder.sh", "center.qoder.sh"],
 };
 
 module.exports = { TOOL_HOSTS };

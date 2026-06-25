@@ -10,14 +10,6 @@ export default function PricingModal({ isOpen, onClose, onSave }) {
   const [searchQuery, setSearchQuery] = useState("");
   const [filterProvider, setFilterProvider] = useState("");
 
-  useEffect(() => {
-    if (isOpen) {
-      setSearchQuery("");
-      setFilterProvider("");
-      loadPricing();
-    }
-  }, [isOpen]);
-
   const loadPricing = async () => {
     setLoading(true);
     try {
@@ -37,6 +29,14 @@ export default function PricingModal({ isOpen, onClose, onSave }) {
       setLoading(false);
     }
   };
+
+  useEffect(() => {
+    if (isOpen) {
+      loadPricing();
+      setSearchQuery("");
+      setFilterProvider("");
+    }
+  }, [isOpen]);
 
   const handlePricingChange = (provider, model, field, value) => {
     const numValue = parseFloat(value);
@@ -60,7 +60,6 @@ export default function PricingModal({ isOpen, onClose, onSave }) {
         if (provider.startsWith("_")) continue;
         saveData[provider] = models;
       }
-
       const response = await fetch("/api/pricing", {
         method: "PATCH",
         headers: { "Content-Type": "application/json" },
@@ -182,38 +181,6 @@ export default function PricingModal({ isOpen, onClose, onSave }) {
           </button>
         </div>
 
-        {/* Filter Bar */}
-        <div className="px-4 py-3 border-b border-border flex items-center gap-3">
-          <div className="relative flex-1">
-            <span className="absolute left-3 top-1/2 -translate-y-1/2 text-text-subtle text-sm material-symbols-outlined">search</span>
-            <input
-              type="text"
-              placeholder="Filter models..."
-              value={searchQuery}
-              onChange={(e) => setSearchQuery(e.target.value)}
-              className="w-full pl-9 pr-3 py-1.5 text-sm bg-bg-base border border-border rounded focus:outline-none focus:border-primary"
-            />
-          </div>
-          <select
-            value={filterProvider}
-            onChange={(e) => setFilterProvider(e.target.value)}
-            className="px-3 py-1.5 text-sm bg-bg-base border border-border rounded focus:outline-none focus:border-primary max-w-[200px]"
-          >
-            <option value="">All providers</option>
-            {providerList.map(p => (
-              <option key={p} value={p}>{providerNames[p] || p}</option>
-            ))}
-          </select>
-          {(searchQuery || filterProvider) && (
-            <button
-              onClick={() => { setSearchQuery(""); setFilterProvider(""); }}
-              className="text-xs text-primary hover:underline whitespace-nowrap"
-            >
-              Clear
-            </button>
-          )}
-        </div>
-
         {/* Content */}
         <div className="flex-1 overflow-auto p-4">
           {loading ? (
@@ -229,67 +196,50 @@ export default function PricingModal({ isOpen, onClose, onSave }) {
                 </p>
               </div>
 
+              {/* Filter Bar */}
+              <div className="px-4 py-3 border-b border-border flex items-center gap-3">
+                <div className="relative flex-1">
+                  <span className="absolute left-3 top-1/2 -translate-y-1/2 text-text-subtle text-sm material-symbols-outlined">search</span>
+                  <input
+                    type="text"
+                    placeholder="Filter models..."
+                    value={searchQuery}
+                    onChange={(e) => setSearchQuery(e.target.value)}
+                    className="w-full pl-9 pr-3 py-1.5 text-sm bg-bg-base border border-border rounded focus:outline-none focus:border-primary"
+                  />
+                </div>
+                <select
+                  value={filterProvider}
+                  onChange={(e) => setFilterProvider(e.target.value)}
+                  className="px-3 py-1.5 text-sm bg-bg-base border border-border rounded focus:outline-none focus:border-primary max-w-[200px]"
+                >
+                  <option value="">All providers</option>
+                  {providerList.map(p => (
+                    <option key={p} value={p}>{providerNames[p] || p}</option>
+                  ))}
+                </select>
+                {(searchQuery || filterProvider) && (
+                  <button
+                    onClick={() => { setSearchQuery(""); setFilterProvider(""); }}
+                    className="px-2 py-1.5 text-sm text-text-muted hover:text-text border border-border rounded transition-colors"
+                  >
+                    Clear
+                  </button>
+                )}
+              </div>
+
               {/* Pricing Tables */}
               {allProviders.map(provider => {
                 const isDefault = provider === "*";
                 const models = Object.keys(pricingData[provider]).sort();
 
-                // For "*" section: apply provider filter
                 if (isDefault) {
                   return renderProviderSection(provider, "Global Pricing Overrides", models);
                 }
 
-                // For provider-specific sections: only show if matches filter
                 if (filterProvider && provider !== filterProvider) return null;
 
-                let filteredModels = models;
-                if (searchQuery) {
-                  const q = searchQuery.toLowerCase();
-                  filteredModels = models.filter(m => m.toLowerCase().includes(q));
-                }
-                if (!filteredModels.length) return null;
-
-                return (
-                  <div key={provider} className="border border-border rounded-lg overflow-hidden">
-                    <div className="bg-bg-subtle px-4 py-2 font-semibold text-sm flex items-center justify-between">
-                      <span>{providerNames[provider] || provider.toUpperCase()}</span>
-                      <span className="text-text-subtle text-xs font-normal">{filteredModels.length} models</span>
-                    </div>
-                    <div className="overflow-x-auto">
-                      <table className="w-full text-sm">
-                        <thead className="bg-bg-hover text-text-muted uppercase text-xs">
-                          <tr>
-                            <th className="px-3 py-2 text-left">Model</th>
-                            <th className="px-3 py-2 text-right">Input</th>
-                            <th className="px-3 py-2 text-right">Output</th>
-                            <th className="px-3 py-2 text-right">Cached</th>
-                            <th className="px-3 py-2 text-right">Reasoning</th>
-                            <th className="px-3 py-2 text-right">Cache Creation</th>
-                          </tr>
-                        </thead>
-                        <tbody className="divide-y divide-border">
-                          {filteredModels.map(model => (
-                            <tr key={model} className="hover:bg-bg-subtle/50">
-                              <td className="px-3 py-2 font-medium">{model}</td>
-                              {pricingFields.map(field => (
-                                <td key={field} className="px-3 py-2">
-                                  <input
-                                    type="number"
-                                    step="0.01"
-                                    min="0"
-                                    value={pricingData[provider][model][field] || 0}
-                                    onChange={(e) => handlePricingChange(provider, model, field, e.target.value)}
-                                    className="w-20 px-2 py-1 text-right bg-bg-base border border-border rounded focus:outline-none focus:border-primary"
-                                  />
-                                </td>
-                              ))}
-                            </tr>
-                          ))}
-                        </tbody>
-                      </table>
-                    </div>
-                  </div>
-                );
+                return renderProviderSection(provider, providerNames[provider] || provider.toUpperCase(), models);
               })}
 
               {allProviders.length === 0 && (

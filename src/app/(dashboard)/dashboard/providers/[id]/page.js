@@ -6,9 +6,12 @@ import Link from "next/link";
 import Image from "next/image";
 import { Card, Button, Badge, Input, Modal, CardSkeleton, OAuthModal, KiroOAuthWrapper, CursorAuthModal, IFlowCookieModal, GitLabAuthModal, Toggle, Select, EditConnectionModal, NoAuthProxyCard, ConfirmModal } from "@/shared/components";
 import { OAUTH_PROVIDERS, APIKEY_PROVIDERS, FREE_PROVIDERS, FREE_TIER_PROVIDERS, WEB_COOKIE_PROVIDERS, getProviderAlias, isOpenAICompatibleProvider, isAnthropicCompatibleProvider, AI_PROVIDERS, THINKING_CONFIG } from "@/shared/constants/providers";
-import { getModelsByProviderId } from "@/shared/constants/models";
+import { getModelsByProviderId, getModelKind } from "@/shared/constants/models";
 import { useCopyToClipboard } from "@/shared/hooks/useCopyToClipboard";
+import { useModelCaps } from "@/shared/hooks/useModelCaps";
+import { translate } from "@/i18n/runtime";
 import { fetchSuggestedModels } from "@/shared/utils/providerModelsFetcher";
+import { getProviderCustomModelRows } from "@/shared/utils/providerCustomModels";
 import ModelRow from "./ModelRow";
 import PassthroughModelsSection from "./PassthroughModelsSection";
 import CompatibleModelsSection from "./CompatibleModelsSection";
@@ -16,6 +19,7 @@ import ConnectionRow from "./ConnectionRow";
 import AddApiKeyModal from "./AddApiKeyModal";
 import EditCompatibleNodeModal from "./EditCompatibleNodeModal";
 import AddCustomModelModal from "./AddCustomModelModal";
+import BulkImportCodexModal from "./BulkImportCodexModal";
 import KeyPoolTab from "./KeyPoolTab";
 
 const ONE_BY_ONE_DELAY_MS = 1000;
@@ -28,6 +32,7 @@ export default function ProviderDetailPage() {
   const params = useParams();
   const router = useRouter();
   const providerId = params.id;
+  const { getCaps } = useModelCaps();
   const [connections, setConnections] = useState([]);
   const [loading, setLoading] = useState(true);
   const [providerNode, setProviderNode] = useState(null);
@@ -36,15 +41,17 @@ export default function ProviderDetailPage() {
   const [showIFlowCookieModal, setShowIFlowCookieModal] = useState(false);
   const [showAddApiKeyModal, setShowAddApiKeyModal] = useState(false);
   const [addConnectionError, setAddConnectionError] = useState("");
+  const [showBulkImportCodex, setShowBulkImportCodex] = useState(false);
   const [showEditModal, setShowEditModal] = useState(false);
   const [showEditNodeModal, setShowEditNodeModal] = useState(false);
   const [showBulkProxyModal, setShowBulkProxyModal] = useState(false);
   const [selectedConnection, setSelectedConnection] = useState(null);
   const [modelAliases, setModelAliases] = useState({});
+  const [customModels, setCustomModels] = useState([]);
   const [headerImgError, setHeaderImgError] = useState(false);
   const [modelTestResults, setModelTestResults] = useState({});
   const [modelsTestError, setModelsTestError] = useState("");
-  const [testingModelId, setTestingModelId] = useState(null);
+  const [testingModelIds, setTestingModelIds] = useState(() => new Set());
   const [showAddCustomModel, setShowAddCustomModel] = useState(false);
   const [selectedConnectionIds, setSelectedConnectionIds] = useState([]);
   const [bulkProxyPoolId, setBulkProxyPoolId] = useState("__none__");
@@ -52,20 +59,22 @@ export default function ProviderDetailPage() {
   const [providerStrategy, setProviderStrategy] = useState(null);
   const [providerStickyLimit, setProviderStickyLimit] = useState("");
   const [thinkingMode, setThinkingMode] = useState("auto");
+  const [autoPing, setAutoPing] = useState({ enabled: false, connections: {} });
   const [suggestedModels, setSuggestedModels] = useState([]);
   const [kiloFreeModels, setKiloFreeModels] = useState([]);
   const [disabledModelIds, setDisabledModelIds] = useState([]);
   const [modelOrder, setModelOrder] = useState(null);
-  const [confirmState, setConfirmState] = useState(null);
-  const [showAgRiskModal, setShowAgRiskModal] = useState(false);
   const [activeConnectionsTab, setActiveConnectionsTab] = useState("connections");
   const [deletingDisabled, setDeletingDisabled] = useState(false);
+  const [confirmState, setConfirmState] = useState(null);
+  const [showAgRiskModal, setShowAgRiskModal] = useState(false);
   const [oneByOneRunning, setOneByOneRunning] = useState(false);
   const [oneByOneStopping, setOneByOneStopping] = useState(false);
   const [oneByOneCurrentConnectionId, setOneByOneCurrentConnectionId] = useState(null);
   const [oneByOneResults, setOneByOneResults] = useState({});
   const [oneByOneSummary, setOneByOneSummary] = useState(null);
   const stopOneByOneRef = useRef(false);
+  const [importingQoderModels, setImportingQoderModels] = useState(false);
   const { copied, copy } = useCopyToClipboard();
 
   const AG_RISK_STORAGE_KEY = "ag_risk_confirmed";
@@ -156,16 +165,6 @@ export default function ProviderDetailPage() {
     }
   }, [providerStorageAlias]);
 
-  const fetchModelOrder = useCallback(async () => {
-    try {
-      const res = await fetch(`/api/models/order?providerAlias=${encodeURIComponent(providerStorageAlias)}`, { cache: "no-store" });
-      const data = await res.json();
-      if (res.ok) setModelOrder(data.order || null);
-    } catch (error) {
-      console.log("Error fetching model order:", error);
-    }
-  }, [providerStorageAlias]);
-
   const handleDisableModel = async (modelId) => {
     try {
       const res = await fetch("/api/models/disabled", {
@@ -218,47 +217,10 @@ export default function ProviderDetailPage() {
     }
   };
 
-  const handleMoveModel = async (modelId, direction) => {
-    const allModels = [
-      ...models,
-      ...kiloFreeModels.filter((fm) => !models.some((m) => m.id === fm.id)),
-    ].filter((m) => !m.type || m.type === "llm");
-    const disabledSet = new Set(disabledModelIds);
-    const displayModels = allModels.filter((m) => !disabledSet.has(m.id));
-
-    const baseIds = displayModels.map((m) => m.id);
-    let orderedIds = modelOrder
-      ? [
-          ...modelOrder.filter((id) => baseIds.includes(id)),
-          ...baseIds.filter((id) => !modelOrder.includes(id)),
-        ]
-      : baseIds;
-
-    const index = orderedIds.indexOf(modelId);
-    if (index === -1) return;
-    const targetIndex = direction === "up" ? index - 1 : index + 1;
-    if (targetIndex < 0 || targetIndex >= orderedIds.length) return;
-
-    const newOrder = [...orderedIds];
-    [newOrder[index], newOrder[targetIndex]] = [newOrder[targetIndex], newOrder[index]];
-    setModelOrder(newOrder);
-
-    try {
-      await fetch("/api/models/order", {
-        method: "PUT",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ providerAlias: providerStorageAlias, order: newOrder }),
-      });
-    } catch (error) {
-      console.log("Error saving model order:", error);
-      await fetchModelOrder();
-    }
-  };
-
   // Define callbacks BEFORE the useEffect that uses them
   const fetchAliases = useCallback(async () => {
     try {
-      const res = await fetch("/api/models/alias");
+      const res = await fetch("/api/models/alias", { cache: "no-store" });
       const data = await res.json();
       if (res.ok) {
         setModelAliases(data.aliases || {});
@@ -267,6 +229,28 @@ export default function ProviderDetailPage() {
       console.log("Error fetching aliases:", error);
     }
   }, []);
+
+  const fetchCustomModels = useCallback(async () => {
+    try {
+      const res = await fetch("/api/models/custom", { cache: "no-store" });
+      const data = await res.json();
+      if (res.ok) {
+        setCustomModels(data.models || []);
+      }
+    } catch (error) {
+      console.log("Error fetching custom models:", error);
+    }
+  }, []);
+
+  const fetchModelOrder = useCallback(async () => {
+    try {
+      const res = await fetch(`/api/models/order?providerAlias=${encodeURIComponent(providerStorageAlias)}`, { cache: "no-store" });
+      const data = await res.json();
+      if (res.ok) setModelOrder(data.order || null);
+    } catch (error) {
+      console.log("Error fetching model order:", error);
+    }
+  }, [providerStorageAlias]);
 
   // Fetch free models from Kilo API for kilocode provider
   useEffect(() => {
@@ -303,6 +287,8 @@ export default function ProviderDetailPage() {
       // Load per-provider thinking config
       const thinkingCfg = (settingsData.providerThinking || {})[providerId] || {};
       setThinkingMode(thinkingCfg.mode || "auto");
+      const apCfg = settingsData.claudeAutoPing || {};
+      setAutoPing({ enabled: apCfg.enabled === true, connections: apCfg.connections || {} });
       if (nodesRes.ok) {
         let node = (nodesData.nodes || []).find((entry) => entry.id === providerId) || null;
 
@@ -415,12 +401,86 @@ export default function ProviderDetailPage() {
     saveThinkingConfig(mode);
   };
 
+  const saveAutoPing = async (next) => {
+    setAutoPing(next);
+    try {
+      await fetch("/api/settings", {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ claudeAutoPing: next }),
+      });
+    } catch (error) {
+      console.log("Error saving auto-ping config:", error);
+    }
+  };
+
+  const handleAutoPingConnection = (connectionId, on) => {
+    saveAutoPing({ ...autoPing, connections: { ...autoPing.connections, [connectionId]: on } });
+  };
+
+  const handleMoveModel = async (modelId, direction) => {
+    const allModels = [
+      ...models,
+      ...kiloFreeModels.filter((fm) => !models.some((m) => m.id === fm.id)),
+    ].filter((m) => { const k = getModelKind(m); return !k || k === "llm"; });
+    const disabledSet = new Set(disabledModelIds);
+    const displayModels = allModels.filter((m) => !disabledSet.has(m.id));
+
+    const baseIds = displayModels.map((m) => m.id);
+    let orderedIds = modelOrder
+      ? [
+          ...modelOrder.filter((id) => baseIds.includes(id)),
+          ...baseIds.filter((id) => !modelOrder.includes(id)),
+        ]
+      : baseIds;
+
+    const index = orderedIds.indexOf(modelId);
+    if (index === -1) return;
+    const targetIndex = direction === "up" ? index - 1 : index + 1;
+    if (targetIndex < 0 || targetIndex >= orderedIds.length) return;
+
+    const newOrder = [...orderedIds];
+    [newOrder[index], newOrder[targetIndex]] = [newOrder[targetIndex], newOrder[index]];
+    setModelOrder(newOrder);
+
+    await fetch("/api/models/order", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ providerAlias: providerStorageAlias, order: newOrder }),
+    }).catch((error) => {
+      console.log("Error saving model order:", error);
+      fetchModelOrder();
+    });
+  };
+
+  const handleToggleAllConnections = async (targetActive) => {
+    const prev = connections;
+    setConnections(c => c.map(conn => ({ ...conn, isActive: targetActive })));
+    try {
+      await Promise.all(
+        prev.map(conn =>
+          fetch(`/api/providers/${conn.id}`, {
+            method: "PUT",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ isActive: targetActive }),
+          })
+        )
+      );
+    } catch (error) {
+      console.log("Error toggling all connections:", error);
+      await fetchConnections();
+    }
+  };
+
+  const anyActive = connections.some(c => c.isActive !== false);
+
   useEffect(() => {
     fetchConnections();
     fetchAliases();
+    fetchCustomModels();
     fetchDisabledModels();
     fetchModelOrder();
-  }, [fetchConnections, fetchAliases, fetchDisabledModels, fetchModelOrder]);
+  }, [fetchConnections, fetchAliases, fetchCustomModels, fetchDisabledModels, fetchModelOrder]);
 
   // Fetch suggested models from provider's public API (if configured)
   useEffect(() => {
@@ -458,6 +518,92 @@ export default function ProviderDetailPage() {
       }
     } catch (error) {
       console.log("Error deleting alias:", error);
+    }
+  };
+
+  const handleAddCustomModel = async (modelId, type = "llm", providerAliasOverride = providerStorageAlias) => {
+    try {
+      const res = await fetch("/api/models/custom", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ providerAlias: providerAliasOverride, id: modelId, type }),
+      });
+      if (res.ok) {
+        await fetchCustomModels();
+        if (typeof window !== "undefined") window.dispatchEvent(new CustomEvent("customModelChanged"));
+      } else {
+        const data = await res.json();
+        alert(data.error || "Failed to add custom model");
+      }
+    } catch (error) {
+      console.log("Error adding custom model:", error);
+    }
+  };
+
+  const handleDeleteCustomModel = async (modelId, type = "llm", providerAliasOverride = providerStorageAlias) => {
+    try {
+      const params = new URLSearchParams({ providerAlias: providerAliasOverride, id: modelId, type });
+      const res = await fetch(`/api/models/custom?${params}`, { method: "DELETE" });
+      if (res.ok) {
+        await fetchCustomModels();
+        if (typeof window !== "undefined") window.dispatchEvent(new CustomEvent("customModelChanged"));
+      }
+    } catch (error) {
+      console.log("Error deleting custom model:", error);
+    }
+  };
+
+  // Fetch Qoder model list and automatically add to available models
+  const handleImportQoderModels = async () => {
+    if (importingQoderModels) return;
+    const activeConnection = connections.find((conn) => conn.isActive !== false);
+    if (!activeConnection) {
+      alert(translate("Please add an active Qoder connection first"));
+      return;
+    }
+
+    setImportingQoderModels(true);
+    try {
+      const res = await fetch(`/api/providers/${activeConnection.id}/models`);
+      const data = await res.json();
+      if (!res.ok) {
+        alert(data.error || translate("Failed to fetch models"));
+        return;
+      }
+      const models = data.models || [];
+      if (models.length === 0) {
+        alert(translate("No models returned"));
+        return;
+      }
+
+      let importedCount = 0;
+      for (const model of models) {
+        const modelId = model.id || model.name;
+        if (!modelId) continue;
+        
+        // Qoder model ID format may be "qoder/auto" or "auto", need to remove prefix
+        const cleanModelId = modelId.replace(/^qoder\//, "");
+        const alreadyExists = customModels.some(
+          (entry) => entry.providerAlias === providerStorageAlias && entry.id === cleanModelId && (entry.kind || entry.type || "llm") === "llm"
+        ) || Object.values(modelAliases).includes(`${providerStorageAlias}/${cleanModelId}`);
+        if (alreadyExists) {
+          continue;
+        }
+
+        await handleAddCustomModel(cleanModelId, "llm", providerStorageAlias);
+        importedCount += 1;
+      }
+      
+      if (importedCount === 0) {
+        alert(translate("All models already exist, no new models added"));
+      } else {
+        alert(translate("Successfully added") + ` ${importedCount} ` + translate("models"));
+      }
+    } catch (error) {
+      console.log("Error importing Qoder models:", error);
+      alert(translate("Error fetching models") + ": " + error.message);
+    } finally {
+      setImportingQoderModels(false);
     }
   };
 
@@ -641,25 +787,6 @@ export default function ProviderDetailPage() {
     }
   };
 
-  const handleToggleAllConnections = async (targetActive) => {
-    const prev = connections;
-    setConnections(c => c.map(conn => ({ ...conn, isActive: targetActive })));
-    try {
-      await Promise.all(
-        prev.map(conn =>
-          fetch(`/api/providers/${conn.id}`, {
-            method: "PUT",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ isActive: targetActive }),
-          })
-        )
-      );
-    } catch (error) {
-      console.log("Error toggling all connections:", error);
-      await fetchConnections();
-    }
-  };
-
   const handleSwapPriority = async (index1, index2) => {
     // Optimistic update state
     const newConnections = [...connections];
@@ -687,7 +814,6 @@ export default function ProviderDetailPage() {
 
   const selectedConnections = connections.filter((conn) => selectedConnectionIds.includes(conn.id));
   const allSelected = connections.length > 0 && selectedConnectionIds.length === connections.length;
-  const anyActive = connections.some(c => c.isActive !== false);
 
   const toggleSelectConnection = (connectionId) => {
     setSelectedConnectionIds((prev) => (
@@ -799,6 +925,10 @@ export default function ProviderDetailPage() {
                 onMoveUp={() => handleSwapPriority(index, index - 1)}
                 onMoveDown={() => handleSwapPriority(index, index + 1)}
                 onToggleActive={(isActive) => handleUpdateConnectionStatus(conn.id, isActive)}
+                autoPing={providerId === "claude" && conn.authType === "oauth" ? {
+                  on: autoPing.connections[conn.id] === true,
+                  onToggle: (on) => handleAutoPingConnection(conn.id, on),
+                } : null}
                 onUpdateProxy={async (proxyPoolId) => {
                   try {
                     const res = await fetch(`/api/providers/${conn.id}`, {
@@ -882,8 +1012,8 @@ export default function ProviderDetailPage() {
   );
 
   const handleTestModel = async (modelId) => {
-    if (testingModelId) return;
-    setTestingModelId(modelId);
+    if (testingModelIds.has(modelId)) return;
+    setTestingModelIds((prev) => new Set(prev).add(modelId));
     try {
       const res = await fetch("/api/models/test", {
         method: "POST",
@@ -897,7 +1027,7 @@ export default function ProviderDetailPage() {
       setModelTestResults((prev) => ({ ...prev, [modelId]: "error" }));
       setModelsTestError("Network error");
     } finally {
-      setTestingModelId(null);
+      setTestingModelIds((prev) => { const n = new Set(prev); n.delete(modelId); return n; });
     }
   };
 
@@ -908,10 +1038,13 @@ export default function ProviderDetailPage() {
           providerStorageAlias={providerStorageAlias}
           providerDisplayAlias={providerDisplayAlias}
           modelAliases={modelAliases}
+          customModels={customModels}
           copied={copied}
           onCopy={copy}
           onSetAlias={handleSetAlias}
           onDeleteAlias={handleDeleteAlias}
+          onAddCustomModel={(modelId) => handleAddCustomModel(modelId, "llm", providerStorageAlias)}
+          onDeleteCustomModel={(modelId) => handleDeleteCustomModel(modelId, "llm", providerStorageAlias)}
           connections={connections}
           isAnthropic={isAnthropicCompatible}
         />
@@ -922,11 +1055,10 @@ export default function ProviderDetailPage() {
     const allModels = [
       ...models,
       ...kiloFreeModels.filter((fm) => !models.some((m) => m.id === fm.id)),
-    ].filter((m) => !m.type || m.type === "llm");
+    ].filter((m) => { const k = getModelKind(m); return !k || k === "llm"; });
     const disabledSet = new Set(disabledModelIds);
     const displayModels = allModels.filter((m) => !disabledSet.has(m.id));
     const disabledDisplayModels = allModels.filter((m) => disabledSet.has(m.id));
-
     const displayModelIds = displayModels.map((m) => m.id);
     const orderedDisplayModels = modelOrder
       ? [
@@ -936,41 +1068,39 @@ export default function ProviderDetailPage() {
           ...displayModels.filter((m) => !modelOrder.includes(m.id)),
         ]
       : displayModels;
-    // Custom models added by user (stored as aliases: modelId → providerAlias/modelId)
-    const customModels = Object.entries(modelAliases)
-      .filter(([alias, fullModel]) => {
-        const prefix = `${providerStorageAlias}/`;
-        if (!fullModel.startsWith(prefix)) return false;
-        const modelId = fullModel.slice(prefix.length);
-        // Only show if not already in hardcoded list
-        // For passthroughModels, include all aliases (model IDs may contain slashes like "anthropic/claude-3")
-        if (providerInfo.passthroughModels) return !models.some((m) => m.id === modelId);
-        return !models.some((m) => m.id === modelId) && alias === modelId;
-      })
-      .map(([alias, fullModel]) => ({
-        id: fullModel.slice(`${providerStorageAlias}/`.length),
-        alias,
-        fullModel,
-      }));
+    const customModelRows = getProviderCustomModelRows({
+      customModels,
+      modelAliases,
+      providerAlias: providerStorageAlias,
+      builtInModels: models,
+      type: "llm",
+    });
 
     return (
       <div className="flex flex-wrap gap-3">
         {/* Custom models first */}
-        {customModels.map((model) => (
+        {customModelRows.map((model) => (
           <ModelRow
-            key={model.id}
-            model={{ id: model.id }}
+            key={`${model.source}-${model.fullModel}`}
+            model={{ id: model.id, name: model.name }}
             fullModel={`${providerDisplayAlias}/${model.id}`}
             alias={model.alias}
             copied={copied}
             onCopy={copy}
             onSetAlias={() => {}}
-            onDeleteAlias={() => handleDeleteAlias(model.alias)}
+            onDeleteAlias={() => {
+              if (model.source === "custom") {
+                handleDeleteCustomModel(model.id, "llm", providerStorageAlias);
+              } else {
+                handleDeleteAlias(model.alias);
+              }
+            }}
             testStatus={modelTestResults[model.id]}
             onTest={connections.length > 0 || isFreeNoAuth ? () => handleTestModel(model.id) : undefined}
-            isTesting={testingModelId === model.id}
+            isTesting={testingModelIds.has(model.id)}
             isCustom
             isFree={false}
+            caps={getCaps(`${providerId}/${model.id}`)}
           />
         ))}
 
@@ -992,9 +1122,10 @@ export default function ProviderDetailPage() {
               onDeleteAlias={() => handleDeleteAlias(existingAlias)}
               testStatus={modelTestResults[model.id]}
               onTest={connections.length > 0 || isFreeNoAuth ? () => handleTestModel(model.id) : undefined}
-              isTesting={testingModelId === model.id}
+              isTesting={testingModelIds.has(model.id)}
               isFree={model.isFree}
               onDisable={() => handleDisableModel(model.id)}
+              caps={getCaps(`${providerId}/${model.id}`)}
               isFirst={index === 0}
               isLast={index === orderedDisplayModels.length - 1}
               onMoveUp={() => handleMoveModel(model.id, "up")}
@@ -1012,9 +1143,26 @@ export default function ProviderDetailPage() {
           Add Model
         </button>
 
+        {/* Import Qoder models button — only show for qoder provider */}
+        {providerId === "qoder" && connections.some((conn) => conn.isActive !== false) && (
+          <button
+            onClick={handleImportQoderModels}
+            disabled={importingQoderModels}
+            className="flex w-full items-center justify-center gap-1.5 rounded-lg border border-dashed border-blue-500/40 px-3 py-2 text-xs text-blue-600 dark:text-blue-400 transition-colors hover:border-blue-500 hover:bg-blue-500/5 sm:w-auto disabled:opacity-50 disabled:cursor-not-allowed"
+          >
+            <span className="material-symbols-outlined text-sm" style={importingQoderModels ? { animation: "spin 1s linear infinite" } : undefined}>
+              {importingQoderModels ? "progress_activity" : "download"}
+            </span>
+            {importingQoderModels ? translate("Fetching...") : translate("Fetch Qoder Models")}
+          </button>
+        )}
+
         {/* Suggested models from provider API — show only models not yet added */}
         {suggestedModels.length > 0 && (() => {
-          const addedFullModels = new Set(Object.values(modelAliases));
+          const addedFullModels = new Set([
+            ...Object.values(modelAliases),
+            ...customModelRows.map((model) => model.fullModel),
+          ]);
           const hardcodedIds = new Set(models.map((m) => m.id));
           const notAdded = suggestedModels.filter(
             (m) => !addedFullModels.has(`${providerStorageAlias}/${m.id}`) && !hardcodedIds.has(m.id)
@@ -1028,8 +1176,7 @@ export default function ProviderDetailPage() {
                   <button
                     key={m.id}
                     onClick={async () => {
-                      const alias = m.id.split("/").pop();
-                      await handleSetAlias(m.id, alias, providerStorageAlias);
+                      await handleAddCustomModel(m.id, "llm", providerStorageAlias);
                     }}
                     className="flex items-center gap-1 px-2.5 py-1.5 rounded-lg border border-black/10 dark:border-white/10 text-xs text-text-muted hover:text-primary hover:border-primary/40 hover:bg-primary/5 transition-colors"
                     title={`${m.name} · ${(m.contextLength / 1000).toFixed(0)}k ctx`}
@@ -1259,35 +1406,6 @@ export default function ProviderDetailPage() {
             </div>
             {activeConnectionsTab === "connections" && (
             <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:gap-4">
-              {connections.some((c) => !c.isActive) && (
-                <Button
-                  size="sm"
-                  variant="ghost"
-                  icon="delete_sweep"
-                  disabled={deletingDisabled}
-                  onClick={async () => {
-                    setDeletingDisabled(true);
-                    try {
-                      await fetch(`/api/providers/${providerId}/connections/disabled`, { method: "DELETE" });
-                      await fetchConnections();
-                    } finally {
-                      setDeletingDisabled(false);
-                    }
-                  }}
-                >
-                  {deletingDisabled ? "Deleting..." : `Delete Disabled (${connections.filter((c) => !c.isActive).length})`}
-                </Button>
-              )}
-              {connections.length > 1 && (
-                <Button
-                  size="sm"
-                  variant="secondary"
-                  icon={anyActive ? "toggle_off" : "toggle_on"}
-                  onClick={() => handleToggleAllConnections(!anyActive)}
-                >
-                  {anyActive ? "Disable All" : "Enable All"}
-                </Button>
-              )}
               {connections.length > 0 && proxyPools.length > 0 && (
                 <Button
                   size="sm"
@@ -1358,13 +1476,42 @@ export default function ProviderDetailPage() {
                   </div>
                 )}
               </div>
+              {connections.some((c) => !c.isActive) && (
+                <Button
+                  size="sm"
+                  variant="ghost"
+                  icon="delete_sweep"
+                  disabled={deletingDisabled}
+                  onClick={async () => {
+                    setDeletingDisabled(true);
+                    try {
+                      await fetch(`/api/providers/${providerId}/connections/disabled`, { method: "DELETE" });
+                      await fetchConnections();
+                    } finally {
+                      setDeletingDisabled(false);
+                    }
+                  }}
+                >
+                  {deletingDisabled ? "Deleting..." : `Delete Disabled (${connections.filter((c) => !c.isActive).length})`}
+                </Button>
+              )}
+              {connections.length > 1 && (
+                <Button
+                  size="sm"
+                  variant="secondary"
+                  icon={anyActive ? "toggle_off" : "toggle_on"}
+                  onClick={() => handleToggleAllConnections(!anyActive)}
+                >
+                  {anyActive ? "Disable All" : "Enable All"}
+                </Button>
+              )}
             </div>
-            )}
+          )}
           </div>
 
-          {activeConnectionsTab === "pool" ? (
-            <KeyPoolTab provider={providerId} onPullDone={fetchConnections} />
-          ) : connections.length === 0 ? (
+          {activeConnectionsTab === "connections" && (
+            <>
+          {connections.length === 0 ? (
             <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
               <div className="flex items-center gap-3">
                 <div className="inline-flex items-center justify-center w-9 h-9 rounded-full bg-primary/10 text-primary shrink-0">
@@ -1394,6 +1541,11 @@ export default function ProviderDetailPage() {
                     {!isCompatible && providerId === "iflow" && (
                       <Button size="sm" icon="cookie" variant="secondary" onClick={() => setShowIFlowCookieModal(true)}>
                         Cookie
+                      </Button>
+                    )}
+                    {providerId === "codex" && (
+                      <Button size="sm" icon="playlist_add" variant="secondary" onClick={() => setShowBulkImportCodex(true)}>
+                        {translate("Bulk Add")}
                       </Button>
                     )}
                     <Button
@@ -1440,6 +1592,18 @@ export default function ProviderDetailPage() {
                       Cookie
                     </Button>
                   )}
+                  {providerId === "codex" && (
+                    <Button
+                      size="sm"
+                      icon="playlist_add"
+                      variant="secondary"
+                      onClick={() => setShowBulkImportCodex(true)}
+                      title={translate("Bulk import codex accounts from JSON")}
+                      className="w-full sm:w-auto"
+                    >
+                      {translate("Bulk Add")}
+                    </Button>
+                  )}
                   {hasDualAuthModes ? (
                     <>
                       <Button
@@ -1474,8 +1638,15 @@ export default function ProviderDetailPage() {
               )}
             </>
           )}
+          </>
+          )}
+          {activeConnectionsTab === "pool" && (
+            <KeyPoolTab provider={providerId} onPullDone={fetchConnections} />
+          )}
         </Card>
       )}
+
+      {/* Models */}
       <Card>
         <div className="mb-4 flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
           <h2 className="text-lg font-semibold">
@@ -1485,7 +1656,7 @@ export default function ProviderDetailPage() {
             const allIds = [
               ...models,
               ...kiloFreeModels.filter((fm) => !models.some((m) => m.id === fm.id)),
-            ].filter((m) => !m.type || m.type === "llm").map((m) => m.id);
+            ].filter((m) => { const k = getModelKind(m); return !k || k === "llm"; }).map((m) => m.id);
             const activeIds = allIds.filter((id) => !disabledModelIds.includes(id));
             return (
               <div className="flex gap-2">
@@ -1588,14 +1759,18 @@ export default function ProviderDetailPage() {
           providerAlias={providerStorageAlias}
           providerDisplayAlias={providerDisplayAlias}
           onSave={async (modelId) => {
-            // For passthrough providers (OpenRouter), use last segment as alias to avoid slash conflicts
-            const alias = providerInfo?.passthroughModels
-              ? modelId.split("/").pop()
-              : modelId;
-            await handleSetAlias(modelId, alias, providerStorageAlias);
+            await handleAddCustomModel(modelId, "llm", providerStorageAlias);
             setShowAddCustomModel(false);
           }}
           onClose={() => setShowAddCustomModel(false)}
+        />
+      )}
+
+      {providerId === "codex" && (
+        <BulkImportCodexModal
+          isOpen={showBulkImportCodex}
+          onClose={() => setShowBulkImportCodex(false)}
+          onSuccess={fetchConnections}
         />
       )}
 

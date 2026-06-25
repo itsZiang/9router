@@ -190,8 +190,8 @@ export function trackPendingRequest(model, provider, connectionId, started, erro
     lastErrorProvider.ts = Date.now();
   }
 
-  const _u7 = new Date(Date.now() + 7 * 60 * 60 * 1000);
-  const t = `${String(_u7.getUTCHours()).padStart(2, "0")}:${String(_u7.getUTCMinutes()).padStart(2, "0")}:${String(_u7.getUTCSeconds()).padStart(2, "0")}`;
+  const utc7 = new Date(Date.now() + 7 * 60 * 60 * 1000);
+  const t = `${String(utc7.getUTCHours()).padStart(2, "0")}:${String(utc7.getUTCMinutes()).padStart(2, "0")}:${String(utc7.getUTCSeconds()).padStart(2, "0")}`;
   console.log(`[${t}] [PENDING] ${started ? "START" : "END"}${error ? " (ERROR)" : ""} | provider=${provider} | model=${model}`);
   statsEmitter.emit("pending");
 }
@@ -701,7 +701,7 @@ export async function appendRequestLog() {}
 
 export async function getRecentLogs(limit = 200) {
   try {
-    const db = getAdapter();
+    const db = await getAdapter();
     const rows = db.all(
       `SELECT timestamp, provider, model, connectionId, promptTokens, completionTokens, status, tokens FROM usageHistory ORDER BY id DESC LIMIT ?`,
       [limit],

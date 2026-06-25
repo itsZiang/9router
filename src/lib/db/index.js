@@ -51,6 +51,17 @@ export {
   getPricing, getPricingForModel, updatePricing, resetPricing, resetAllPricing,
 } from "./repos/pricingRepo.js";
 
+// Key pool (per-provider reserve of API keys)
+export {
+  addKeysToPool, getPoolKeys, getPoolKeysPaged, getPoolCount, removeKeyFromPool, pullKeysFromPool,
+  getPoolSize, setPoolSize, getAutoReplace, setAutoReplace,
+} from "./repos/keyPoolRepo.js";
+
+// Model order (per-provider custom model ordering)
+export {
+  getModelOrder, setModelOrder,
+} from "./repos/modelOrderRepo.js";
+
 // Disabled models
 export {
   getDisabledModels, getDisabledByProvider, disableModels, enableModels,
