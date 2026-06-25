@@ -67,9 +67,6 @@ export {
   getDisabledModels, getDisabledByProvider, disableModels, enableModels,
 } from "./repos/disabledModelsRepo.js";
 
-// Model order (kv-backed)
-export { getModelOrder, setModelOrder } from "./repos/modelOrderRepo.js";
-
 // Usage
 export {
   statsEmitter, trackPendingRequest, getActiveRequests,
@@ -81,12 +78,6 @@ export {
 export {
   saveRequestDetail, getRequestDetails, getRequestDetailById,
 } from "./repos/requestDetailsRepo.js";
-
-// Key pool
-export {
-  addKeysToPool, getPoolKeys, getPoolKeysPaged, getPoolCount, removeKeyFromPool, pullKeysFromPool,
-  getPoolSize, setPoolSize, getAutoReplace, setAutoReplace,
-} from "./repos/keyPoolRepo.js";
 
 // Export/import full DB
 export async function exportDb() {

@@ -21,6 +21,4 @@ export {
   getPoolSize, setPoolSize, getAutoReplace, setAutoReplace,
   getModelOrder, setModelOrder,
   exportDb, importDb,
-  addKeysToPool, getPoolKeys, getPoolKeysPaged, getPoolCount, removeKeyFromPool, pullKeysFromPool,
-  getPoolSize, setPoolSize, getAutoReplace, setAutoReplace,
 } from "@/lib/db/index.js";
