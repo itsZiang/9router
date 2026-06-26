@@ -12,6 +12,82 @@ let selectionMutex = Promise.resolve();
 // requests hit 403 for the same connection at the same time.
 const replacingConnections = new Set();
 
+// Cloudflare AI daily quota exhaustion pattern
+const CLOUDFLARE_DAILY_QUOTA_PATTERN = "used up your daily free allocation";
+
+// Siliconflow server busy pattern (503)
+const SILICONFLOW_BUSY_PATTERN = "system is really busy";
+const SILICONFLOW_BUSY_COOLDOWN_MS = 15 * 60 * 1000; // 15 minutes
+
+/**
+ * Get the next 00:10 UTC timestamp for re-enabling Cloudflare connections.
+ * If current UTC time is past 00:10, returns 00:10 UTC of the next day.
+ */
+function getNextCloudflareReEnableTime() {
+  const now = new Date();
+  const reEnable = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate(), 0, 10, 0, 0));
+  if (reEnable.getTime() <= now.getTime()) {
+    reEnable.setUTCDate(reEnable.getUTCDate() + 1);
+  }
+  return reEnable.toISOString();
+}
+
+/**
+ * Re-enable Cloudflare connections that were disabled due to daily quota exhaustion
+ * and have passed their re-enable time (00:10 UTC).
+ */
+async function reEnableCloudflareConnections() {
+  try {
+    const allConnections = await getProviderConnections({ provider: "cloudflare-ai" });
+    const now = new Date().toISOString();
+    const toReEnable = allConnections.filter(c => {
+      const psd = c.providerSpecificData || {};
+      return psd.cloudflareQuotaDisabled === true && psd.cloudflareReEnableAt && psd.cloudflareReEnableAt <= now;
+    });
+
+    if (toReEnable.length === 0) return;
+
+    for (const conn of toReEnable) {
+      const psd = { ...(conn.providerSpecificData || {}) };
+      delete psd.cloudflareQuotaDisabled;
+      delete psd.cloudflareReEnableAt;
+      await updateProviderConnection(conn.id, { isActive: true, providerSpecificData: psd });
+      const connName = conn.displayName || conn.name || conn.email || conn.id.slice(0, 8);
+      log.info("AUTH", `[CLOUDFLARE] Re-enabled ${connName} — daily quota cooldown expired (was disabled until ${conn.providerSpecificData?.cloudflareReEnableAt})`);
+    }
+  } catch (err) {
+    log.warn("AUTH", `[CLOUDFLARE] re-enable check failed: ${err.message}`);
+  }
+}
+
+/**
+ * Re-enable Siliconflow connections that were disabled due to server busy (503)
+ * and have passed their 15-minute cooldown.
+ */
+async function reEnableSiliconflowConnections() {
+  try {
+    const allConnections = await getProviderConnections({ provider: "siliconflow" });
+    const now = new Date().toISOString();
+    const toReEnable = allConnections.filter(c => {
+      const psd = c.providerSpecificData || {};
+      return psd.siliconflowBusyDisabled === true && psd.siliconflowReEnableAt && psd.siliconflowReEnableAt <= now;
+    });
+
+    if (toReEnable.length === 0) return;
+
+    for (const conn of toReEnable) {
+      const psd = { ...(conn.providerSpecificData || {}) };
+      delete psd.siliconflowBusyDisabled;
+      delete psd.siliconflowReEnableAt;
+      await updateProviderConnection(conn.id, { isActive: true, providerSpecificData: psd });
+      const connName = conn.displayName || conn.name || conn.email || conn.id.slice(0, 8);
+      log.info("AUTH", `[SILICONFLOW] Re-enabled ${connName} — server busy cooldown expired (was disabled until ${conn.providerSpecificData?.siliconflowReEnableAt})`);
+    }
+  } catch (err) {
+    log.warn("AUTH", `[SILICONFLOW] re-enable check failed: ${err.message}`);
+  }
+}
+
 /**
  * Get provider credentials from localDb
  * Filters out unavailable accounts and returns the selected account based on strategy
@@ -32,6 +108,12 @@ export async function getProviderCredentials(provider, excludeConnectionIds = nu
 
   try {
     await currentMutex;
+
+    // Re-enable Cloudflare connections that passed their daily quota cooldown
+    await reEnableCloudflareConnections();
+
+    // Re-enable Siliconflow connections that passed their 15-min server busy cooldown
+    await reEnableSiliconflowConnections();
 
     // Resolve alias to provider ID (e.g., "kc" -> "kilocode")
     const providerId = resolveProviderId(provider);
@@ -268,6 +350,54 @@ export async function markAccountUnavailable(connectionId, status, errorText, pr
   if (!shouldFallback) return { shouldFallback: false, cooldownMs: 0 };
 
   const reason = typeof errorText === "string" ? errorText.slice(0, 100) : "Provider error";
+
+  // Cloudflare daily quota: disable connection until next 00:10 UTC instead of model-lock
+  const isCloudflareDailyQuota = provider === "cloudflare-ai" &&
+    typeof errorText === "string" &&
+    errorText.toLowerCase().includes(CLOUDFLARE_DAILY_QUOTA_PATTERN);
+
+  if (isCloudflareDailyQuota) {
+    const reEnableAt = getNextCloudflareReEnableTime();
+    const psd = { ...(conn?.providerSpecificData || {}), cloudflareQuotaDisabled: true, cloudflareReEnableAt: reEnableAt };
+    await updateProviderConnection(connectionId, {
+      isActive: false,
+      providerSpecificData: psd,
+      testStatus: "unavailable",
+      lastError: reason,
+      errorCode: status,
+      lastErrorAt: new Date().toISOString(),
+    });
+    const connName = conn?.displayName || conn?.name || conn?.email || connectionId.slice(0, 8);
+    log.warn("AUTH", `[CLOUDFLARE] ${connName} disabled due to daily quota exhaustion — will re-enable at ${reEnableAt}`);
+    console.error(`❌ cloudflare-ai [${status}]: Daily quota exhausted — disabled until ${reEnableAt}`);
+    return { shouldFallback: true, cooldownMs: 0 };
+  }
+
+  // Siliconflow server busy (503): disable ALL siliconflow connections for 15 minutes
+  // Server-wide issue — not tied to a specific key, so disabling the entire pool.
+  // Does NOT trigger auto-replace from pool (503 is not a billing/quota error).
+  const isSiliconflowBusy = provider === "siliconflow" &&
+    typeof errorText === "string" &&
+    errorText.toLowerCase().includes(SILICONFLOW_BUSY_PATTERN);
+
+  if (isSiliconflowBusy) {
+    const reEnableAt = new Date(Date.now() + SILICONFLOW_BUSY_COOLDOWN_MS).toISOString();
+    for (const c of connections) {
+      const psd = { ...(c.providerSpecificData || {}), siliconflowBusyDisabled: true, siliconflowReEnableAt: reEnableAt };
+      await updateProviderConnection(c.id, {
+        isActive: false,
+        providerSpecificData: psd,
+        testStatus: "unavailable",
+        lastError: reason,
+        errorCode: status,
+        lastErrorAt: new Date().toISOString(),
+      });
+    }
+    log.warn("AUTH", `[SILICONFLOW] Disabled ${connections.length} connection(s) due to server busy (503) — will re-enable at ${reEnableAt}`);
+    console.error(`❌ siliconflow [${status}]: System busy — disabled ${connections.length} connection(s) until ${reEnableAt}`);
+    return { shouldFallback: true, cooldownMs: 0 };
+  }
+
   const lockUpdate = buildModelLockUpdate(model, cooldownMs);
 
   await updateProviderConnection(connectionId, {
