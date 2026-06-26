@@ -11,7 +11,7 @@ const STRIP_RULES = [
   // GitHub Copilot Claude (except opus/sonnet 4.6): thinking + reasoning_effort rejected. #713
   { provider: "github", match: (m) => /claude/i.test(m) && !/claude.*(opus|sonnet).*4\.6/i.test(m), drop: ["thinking", "reasoning_effort"] },
   // Cloudflare Workers AI: content must be plain string, rejects OpenAI content-part array (#1926)
-  { provider: "cloudflare-ai", flattenContent: true },
+  { provider: "cloudflare-ai", match: /.*/, drop: [], flattenContent: true },
 ];
 
 // Test a rule's match (regex or predicate) against the model id.
