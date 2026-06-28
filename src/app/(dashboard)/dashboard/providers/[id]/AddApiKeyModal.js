@@ -126,6 +126,14 @@ export default function AddApiKeyModal({ isOpen, provider, providerName, isCompa
     }
   };
 
+  const generateUniqueName = (baseName) => {
+    const uuid = crypto.randomUUID().replace(/-/g, "").slice(0, 8).toUpperCase();
+    if (baseName && baseName !== "Key") {
+      return `${baseName}-${uuid}`;
+    }
+    return `Key-${uuid}`;
+  };
+
   const handleBulkSubmit = async () => {
     const lines = bulkText.split("\n").map(l => l.trim()).filter(Boolean);
     if (!lines.length) return;
@@ -135,14 +143,33 @@ export default function AddApiKeyModal({ isOpen, provider, providerName, isCompa
     let failed = 0;
     for (let i = 0; i < lines.length; i++) {
       const parts = lines[i].split("|");
-      const apiKey = parts.length >= 2 ? parts.slice(1).join("|").trim() : parts[0].trim();
-      const baseName = parts.length >= 2 ? parts[0].trim() : "Key";
-      const name = `${baseName} ${i + 1}`;
+      let apiKey, name, providerSpecificData;
+      if (isCloudflareAi) {
+        // Cloudflare: apiKey|accountId (no name field)
+        if (parts.length < 2) { failed++; continue; }
+        apiKey = parts[0].trim();
+        const accountId = parts[1].trim();
+        name = generateUniqueName("CF");
+        providerSpecificData = { accountId };
+      } else {
+        // Default: name|apiKey or just apiKey
+        apiKey = parts.length >= 2 ? parts.slice(1).join("|").trim() : parts[0].trim();
+        const baseName = parts.length >= 2 ? parts[0].trim() : "Key";
+        name = generateUniqueName(baseName);
+        providerSpecificData = undefined;
+      }
       try {
         const res = await fetch("/api/providers", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ provider, apiKey, name, priority: 1, testStatus: "unknown" }),
+          body: JSON.stringify({
+            provider,
+            apiKey,
+            name,
+            priority: 1,
+            testStatus: "unknown",
+            ...(providerSpecificData ? { providerSpecificData } : {}),
+          }),
         });
         if (res.ok) success++;
         else failed++;
@@ -168,10 +195,16 @@ export default function AddApiKeyModal({ isOpen, provider, providerName, isCompa
 
         {mode === "bulk" && (
           <div className="flex flex-col gap-3">
-            <p className="text-xs text-text-muted">One key per line. Format: <code>name|apiKey</code> or just <code>apiKey</code> (auto-named by index).</p>
+            <p className="text-xs text-text-muted">
+              {isCloudflareAi
+                ? <>One key per line. Format: <code>apiKey|accountId</code></>
+                : <>One key per line. Format: <code>name|apiKey</code> or just <code>apiKey</code> (auto-named by index).</>}
+            </p>
             <textarea
               className="w-full rounded border border-accent/30 bg-sidebar p-2 text-sm font-mono resize-y min-h-[140px] focus:outline-none focus:ring-1 focus:ring-primary"
-              placeholder={BULK_PLACEHOLDER}
+              placeholder={isCloudflareAi
+                ? "api-key-1|account-id-1\napi-key-2|account-id-2"
+                : BULK_PLACEHOLDER}
               value={bulkText}
               onChange={(e) => setBulkText(e.target.value)}
             />
