@@ -42,10 +42,7 @@ const byCategory = (cat) => Object.fromEntries(
   REGISTRY.filter(r => r.category === cat).map(r => [r.id, buildProviderEntry(r)])
 );
 
-export const FREE_PROVIDERS = {
-  ...byCategory("free"),
-  qoder: { id: "qoder", alias: "qd", name: "Qoder AI", icon: "water_drop", color: "#EC4899", deprecated: true, deprecationNotice: RISK_NOTICE, website: "https://qoder.com", notice: { signupUrl: "https://qoder.com" } },
-};
+export const FREE_PROVIDERS = byCategory("free");
 export const FREE_TIER_PROVIDERS = byCategory("freeTier");
 
 // Thinking config definitions

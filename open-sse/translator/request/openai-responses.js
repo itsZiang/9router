@@ -182,10 +182,9 @@ export function openaiResponsesToOpenAIRequest(model, body, stream, credentials)
   }
 
   // Cleanup Responses API specific fields
-  // Responses API dùng max_output_tokens; Chat Completions dùng max_tokens —
-  // map để tránh upstream /chat/completions trả 400 unknown_parameter
-  if (body.max_output_tokens !== undefined) {
-    result.max_tokens = body.max_output_tokens;
+  // Map Responses-only max_output_tokens to Chat max_tokens (avoid leaking unknown field upstream)
+  if (result.max_output_tokens !== undefined) {
+    if (result.max_tokens === undefined) result.max_tokens = result.max_output_tokens;
     delete result.max_output_tokens;
   }
 
@@ -195,13 +194,6 @@ export function openaiResponsesToOpenAIRequest(model, body, stream, credentials)
   delete result.prompt_cache_key;
   delete result.store;
   delete result.reasoning;
-
-  // Responses API dùng max_output_tokens; Chat Completions dùng max_tokens —
-  // map để tránh upstream /chat/completions trả 400 unknown_parameter
-  if (body.max_output_tokens !== undefined) {
-    result.max_tokens = body.max_output_tokens;
-    delete result.max_output_tokens;
-  }
 
   return result;
 }
@@ -332,6 +324,8 @@ export function openaiToOpenAIResponsesRequest(model, body, stream, credentials)
   if (body.max_tokens !== undefined) result.max_output_tokens = clampMaxOutputTokens(body.max_tokens);
   else if (body.max_completion_tokens !== undefined) result.max_output_tokens = clampMaxOutputTokens(body.max_completion_tokens);
   if (body.top_p !== undefined) result.top_p = body.top_p;
+  if (body.reasoning !== undefined) result.reasoning = body.reasoning;
+  if (body.reasoning_effort !== undefined) result.reasoning = { effort: body.reasoning_effort, summary: "auto" };
 
   return result;
 }

@@ -7,7 +7,7 @@ const LOG_LEVELS = {
   ERROR: 3
 };
 
-const LEVEL = LOG_LEVELS.DEBUG;
+const LEVEL = LOG_LEVELS[process.env.LOG_LEVEL?.toUpperCase?.()] ?? LOG_LEVELS.INFO;
 
 function formatTime() {
   const utc7 = new Date(Date.now() + 7 * 60 * 60 * 1000);
@@ -76,4 +76,3 @@ export function maskKey(key) {
   if (!key || key.length < 8) return "***";
   return `${key.slice(0, 4)}...${key.slice(-4)}`;
 }
-

@@ -1,7 +1,7 @@
 import PropTypes from "prop-types";
 import { CapacityBadges } from "@/shared/components";
 
-export default function ModelRow({ model, fullModel, alias, copied, onCopy, testStatus, isCustom, isFree, onDeleteAlias, onTest, isTesting, onDisable, caps, isFirst, isLast, onMoveUp, onMoveDown }) {
+export default function ModelRow({ model, fullModel, alias, copied, onCopy, testStatus, isCustom, isFree, onDeleteAlias, onTest, isTesting, onDisable, caps }) {
   const borderColor = testStatus === "ok"
     ? "border-green-500/40"
     : testStatus === "error"
@@ -17,24 +17,6 @@ export default function ModelRow({ model, fullModel, alias, copied, onCopy, test
   return (
     <div className={`group min-w-0 max-w-full rounded-lg border px-3 py-2 ${borderColor} hover:bg-sidebar/50`}>
       <div className="flex min-w-0 items-start gap-2 sm:items-center">
-        {(onMoveUp || onMoveDown) && (
-          <div className="flex shrink-0 flex-col">
-            <button
-              onClick={onMoveUp}
-              disabled={isFirst}
-              className={`p-0.5 rounded ${isFirst ? "text-text-muted/30 cursor-not-allowed" : "hover:bg-sidebar text-text-muted hover:text-primary"}`}
-            >
-              <span className="material-symbols-outlined text-sm">keyboard_arrow_up</span>
-            </button>
-            <button
-              onClick={onMoveDown}
-              disabled={isLast}
-              className={`p-0.5 rounded ${isLast ? "text-text-muted/30 cursor-not-allowed" : "hover:bg-sidebar text-text-muted hover:text-primary"}`}
-            >
-              <span className="material-symbols-outlined text-sm">keyboard_arrow_down</span>
-            </button>
-          </div>
-        )}
         <span
           className="material-symbols-outlined shrink-0 text-base"
           style={iconColor ? { color: iconColor } : undefined}
@@ -115,8 +97,4 @@ ModelRow.propTypes = {
   isTesting: PropTypes.bool,
   onDisable: PropTypes.func,
   caps: PropTypes.object,
-  isFirst: PropTypes.bool,
-  isLast: PropTypes.bool,
-  onMoveUp: PropTypes.func,
-  onMoveDown: PropTypes.func,
 };
