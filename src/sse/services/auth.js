@@ -17,7 +17,7 @@ const CLOUDFLARE_DAILY_QUOTA_PATTERN = "used up your daily free allocation";
 
 // Siliconflow server busy pattern (503)
 const SILICONFLOW_BUSY_PATTERN = "system is really busy";
-const SILICONFLOW_BUSY_COOLDOWN_MS = 15 * 60 * 1000; // 15 minutes
+const SILICONFLOW_BUSY_COOLDOWN_MS = 10 * 60 * 1000; // 10 minutes
 
 /**
  * Get the next 00:10 UTC timestamp for re-enabling Cloudflare connections.
@@ -66,7 +66,9 @@ async function reEnableCloudflareConnections() {
  */
 async function reEnableSiliconflowConnections() {
   try {
-    const allConnections = await getProviderConnections({ provider: "siliconflow" });
+    // Query all connections and filter by flag — Siliconflow may be registered
+    // as built-in "siliconflow" OR as an openai-compatible-* provider.
+    const allConnections = await getProviderConnections({});
     const now = new Date().toISOString();
     const toReEnable = allConnections.filter(c => {
       const psd = c.providerSpecificData || {};
@@ -376,7 +378,12 @@ export async function markAccountUnavailable(connectionId, status, errorText, pr
   // Siliconflow server busy (503): disable ALL siliconflow connections for 15 minutes
   // Server-wide issue — not tied to a specific key, so disabling the entire pool.
   // Does NOT trigger auto-replace from pool (503 is not a billing/quota error).
-  const isSiliconflowBusy = provider === "siliconflow" &&
+  // Matches both built-in "siliconflow" provider and openai-compatible providers
+  // pointing at Siliconflow (verified via baseUrl containing "siliconflow").
+  const connBaseUrl = (conn?.providerSpecificData?.baseUrl || "").toLowerCase();
+  const isSiliconflowProvider = provider === "siliconflow" ||
+    (typeof provider === "string" && provider.startsWith("openai-compatible-") && connBaseUrl.includes("siliconflow"));
+  const isSiliconflowBusy = isSiliconflowProvider &&
     typeof errorText === "string" &&
     errorText.toLowerCase().includes(SILICONFLOW_BUSY_PATTERN);
 
