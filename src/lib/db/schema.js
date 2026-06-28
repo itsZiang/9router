@@ -82,6 +82,13 @@ export const TABLES = {
     },
     indexes: ["CREATE INDEX IF NOT EXISTS idx_ak_key ON apiKeys(key)"],
   },
+  apiKeyPools: {
+    columns: {
+      poolKey: "TEXT PRIMARY KEY",
+      keys: "TEXT NOT NULL",
+      updatedAt: "TEXT NOT NULL",
+    },
+  },
   combos: {
     columns: {
       id: "TEXT PRIMARY KEY",
