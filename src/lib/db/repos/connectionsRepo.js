@@ -188,6 +188,7 @@ export async function batchCreatePoolConnections(provider, keys, knownExistingKe
 
     for (const k of keys) {
       if (!k.key || existingApiKeys.has(k.key)) continue;
+      const psd = k.providerSpecificData || resolvedProviderSpecificData || null;
       const conn = {
         id: uuidv4(),
         provider,
@@ -196,7 +197,7 @@ export async function batchCreatePoolConnections(provider, keys, knownExistingKe
         priority: nextPriority++,
         isActive: 1,
         apiKey: k.key,
-        ...(resolvedProviderSpecificData ? { providerSpecificData: resolvedProviderSpecificData } : {}),
+        ...(psd ? { providerSpecificData: psd } : {}),
         createdAt: now,
         updatedAt: now,
       };
@@ -229,8 +230,8 @@ export async function moveConnectionsToPool(provider, connections) {
       if (!c.apiKey) { skipped++; continue; }
       if (!existingPoolKeys.has(c.apiKey)) {
         db.run(
-          `INSERT OR IGNORE INTO keyPool(id, provider, name, key, createdAt) VALUES(?, ?, ?, ?, ?)`,
-          [uuidv4(), provider, c.name || null, c.apiKey, now]
+          `INSERT OR IGNORE INTO keyPool(id, provider, name, key, data, createdAt) VALUES(?, ?, ?, ?, ?, ?)`,
+          [uuidv4(), provider, c.name || null, c.apiKey, stringifyJson({ providerSpecificData: c.providerSpecificData || null }), now]
         );
         existingPoolKeys.add(c.apiKey);
       }

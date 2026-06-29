@@ -1,5 +1,6 @@
 import { v4 as uuidv4 } from "uuid";
 import { getAdapter } from "../driver.js";
+import { parseJson, stringifyJson } from "../helpers/jsonCol.js";
 
 const KV_SCOPE = "keyPoolSettings";
 const DEFAULT_POOL_SIZE = 30;
@@ -8,10 +9,22 @@ const DEFAULT_POOL_SIZE = 30;
 const settingsCache = new Map(); // cacheKey → { value, expiresAt }
 const CACHE_TTL_MS = 60_000; // 1 minute
 
+function rowToPoolKey(row) {
+  const extra = parseJson(row.data, {});
+  return {
+    id: row.id,
+    provider: row.provider,
+    name: row.name,
+    key: row.key,
+    providerSpecificData: extra.providerSpecificData || null,
+    createdAt: row.createdAt,
+  };
+}
+
 // --- Pool key CRUD ---
 
 export async function addKeysToPool(provider, keys) {
-  // keys: [{ name, key }]
+  // keys: [{ name, key, providerSpecificData }]
   const db = await getAdapter();
   const now = new Date().toISOString();
   let added = 0;
@@ -26,8 +39,8 @@ export async function addKeysToPool(provider, keys) {
     for (const k of keys) {
       if (!k.key || existing.has(k.key)) { skipped++; continue; }
       db.run(
-        `INSERT OR IGNORE INTO keyPool(id, provider, name, key, createdAt) VALUES(?, ?, ?, ?, ?)`,
-        [uuidv4(), provider, k.name || null, k.key, now]
+        `INSERT OR IGNORE INTO keyPool(id, provider, name, key, data, createdAt) VALUES(?, ?, ?, ?, ?, ?)`,
+        [uuidv4(), provider, k.name || null, k.key, stringifyJson({ providerSpecificData: k.providerSpecificData || null }), now]
       );
       existing.add(k.key);
       added++;
@@ -40,16 +53,17 @@ export async function addKeysToPool(provider, keys) {
 // Return all keys (for internal use — prefer getPoolKeysPaged for API responses)
 export async function getPoolKeys(provider) {
   const db = await getAdapter();
-  return db.all(`SELECT id, provider, name, key, createdAt FROM keyPool WHERE provider = ? ORDER BY createdAt ASC`, [provider]);
+  return db.all(`SELECT id, provider, name, key, data, createdAt FROM keyPool WHERE provider = ? ORDER BY createdAt ASC`, [provider])
+    .map(rowToPoolKey);
 }
 
 // Paginated keys for API responses
 export async function getPoolKeysPaged(provider, limit = 50, offset = 0) {
   const db = await getAdapter();
   return db.all(
-    `SELECT id, provider, name, key, createdAt FROM keyPool WHERE provider = ? ORDER BY createdAt ASC LIMIT ? OFFSET ?`,
+    `SELECT id, provider, name, key, data, createdAt FROM keyPool WHERE provider = ? ORDER BY createdAt ASC LIMIT ? OFFSET ?`,
     [provider, limit, offset]
-  );
+  ).map(rowToPoolKey);
 }
 
 export async function getPoolCount(provider) {
@@ -72,14 +86,15 @@ export async function pullKeysFromPool(provider, n, existingKeys = []) {
   db.transaction(() => {
     // Fetch more than needed to account for dedup
     const candidates = db.all(
-      `SELECT id, name, key FROM keyPool WHERE provider = ? ORDER BY createdAt ASC LIMIT ?`,
+      `SELECT id, name, key, data FROM keyPool WHERE provider = ? ORDER BY createdAt ASC LIMIT ?`,
       [provider, Math.max(n * 3, n + 50)]
     );
 
     for (const row of candidates) {
       if (pulled.length >= n) break;
       if (existingSet.has(row.key)) continue;
-      pulled.push({ id: row.id, name: row.name, key: row.key });
+      const extra = parseJson(row.data, {});
+      pulled.push({ id: row.id, name: row.name, key: row.key, providerSpecificData: extra.providerSpecificData || null });
       existingSet.add(row.key);
     }
 

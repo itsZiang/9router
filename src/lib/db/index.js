@@ -106,7 +106,14 @@ export async function exportDb() {
   for (const r of db.all(`SELECT key, value FROM kv WHERE scope = 'pricing'`)) out.pricing[r.key] = parseJson(r.value);
   for (const r of db.all(`SELECT key, value FROM kv WHERE scope = 'keyPoolSettings'`)) out.keyPoolSettings[r.key] = r.value;
   for (const r of db.all(`SELECT key, value FROM kv WHERE scope = 'disabledModels'`)) out.disabledModels[r.key] = parseJson(r.value, []);
-  out.keyPool = db.all(`SELECT id, provider, name, key, createdAt FROM keyPool`);
+  out.keyPool = db.all(`SELECT id, provider, name, key, data, createdAt FROM keyPool`).map((r) => ({
+    id: r.id,
+    provider: r.provider,
+    name: r.name,
+    key: r.key,
+    providerSpecificData: parseJson(r.data, {}).providerSpecificData || null,
+    createdAt: r.createdAt,
+  }));
 
   return out;
 }
@@ -181,8 +188,8 @@ export async function importDb(payload) {
     }
     for (const k of payload.keyPool || []) {
       db.run(
-        `INSERT OR REPLACE INTO keyPool(id, provider, name, key, createdAt) VALUES(?, ?, ?, ?, ?)`,
-        [k.id, k.provider, k.name || null, k.key, k.createdAt || new Date().toISOString()]
+        `INSERT OR REPLACE INTO keyPool(id, provider, name, key, data, createdAt) VALUES(?, ?, ?, ?, ?, ?)`,
+        [k.id, k.provider, k.name || null, k.key, stringifyJson({ providerSpecificData: k.providerSpecificData || null }), k.createdAt || new Date().toISOString()]
       );
     }
     for (const [key, value] of Object.entries(payload.keyPoolSettings || {})) {

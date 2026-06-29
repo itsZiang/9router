@@ -145,6 +145,7 @@ export const TABLES = {
       provider: "TEXT NOT NULL",
       name: "TEXT",
       key: "TEXT NOT NULL",
+      data: "TEXT",
       createdAt: "TEXT NOT NULL",
     },
     indexes: [
