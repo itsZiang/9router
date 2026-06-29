@@ -3,7 +3,7 @@
 export {
   getSettings, updateSettings, isCloudEnabled, getCloudUrl,
   getProviderConnections, getProviderConnectionById,
-  createProviderConnection, updateProviderConnection, batchCreatePoolConnections,
+  createProviderConnection, updateProviderConnection, batchCreatePoolConnections, moveConnectionsToPool,
   deleteProviderConnection, deleteProviderConnectionsByProvider,
   reorderProviderConnections, cleanupProviderConnections,
   getProviderNodes, getProviderNodeById,

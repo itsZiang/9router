@@ -209,6 +209,45 @@ export async function batchCreatePoolConnections(provider, keys, knownExistingKe
   return created;
 }
 
+// Reverse of batchCreatePoolConnections: move active apikey connections back into the key pool reserve.
+// In a single transaction: inserts each connection's apiKey into keyPool (dedup), deletes the
+// connection rows, and reorders remaining connections. Connections without apiKey are skipped.
+export async function moveConnectionsToPool(provider, connections) {
+  if (!connections || connections.length === 0) return { moved: 0, skipped: 0 };
+  const db = await getAdapter();
+  const now = new Date().toISOString();
+  let moved = 0;
+  let skipped = 0;
+  const toDelete = [];
+
+  db.transaction(() => {
+    const existingPoolKeys = new Set(
+      db.all(`SELECT key FROM keyPool WHERE provider = ?`, [provider]).map((r) => r.key)
+    );
+
+    for (const c of connections) {
+      if (!c.apiKey) { skipped++; continue; }
+      if (!existingPoolKeys.has(c.apiKey)) {
+        db.run(
+          `INSERT OR IGNORE INTO keyPool(id, provider, name, key, createdAt) VALUES(?, ?, ?, ?, ?)`,
+          [uuidv4(), provider, c.name || null, c.apiKey, now]
+        );
+        existingPoolKeys.add(c.apiKey);
+      }
+      toDelete.push(c.id);
+      moved++;
+    }
+
+    if (toDelete.length > 0) {
+      const placeholders = toDelete.map(() => "?").join(",");
+      db.run(`DELETE FROM providerConnections WHERE id IN (${placeholders})`, toDelete);
+      reorderInTx(db, provider);
+    }
+  });
+
+  return { moved, skipped };
+}
+
 // Critical: OAuth refresh token race — atomic merge inside transaction
 export async function updateProviderConnection(id, data) {
   const db = await getAdapter();

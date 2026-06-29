@@ -743,6 +743,21 @@ export default function ProviderDetailPage() {
     });
   };
 
+  const handlePushToPool = async (connId) => {
+    try {
+      const res = await fetch(`/api/providers/${providerId}/pool/push`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ connectionIds: [connId] }),
+      });
+      if (res.ok) {
+        await fetchConnections();
+      }
+    } catch (error) {
+      console.log("Error pushing connection to pool:", error);
+    }
+  };
+
   const handleOAuthSuccess = () => {
     fetchConnections();
     setShowOAuthModal(false);
@@ -985,6 +1000,7 @@ export default function ProviderDetailPage() {
                   setSelectedConnection(conn);
                   setShowEditModal(true);
                 }}
+                onPushToPool={() => handlePushToPool(conn.id)}
                 onDelete={() => handleDelete(conn.id)}
                 oneByOneStatus={oneByOneResults[conn.id] || null}
               />
