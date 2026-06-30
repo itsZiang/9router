@@ -72,6 +72,7 @@ export function createSSEStream(options = {}) {
   let openAIResponsesTerminalSeen = false;
   let openAIResponsesDoneSent = false;
   let streamDoneSent = false;  // track duplicate [DONE] across transform + flush
+  let finishChunkSeen = false; // track if upstream sent a finish_reason chunk
 
   return new TransformStream({
     transform(chunk, controller) {
@@ -152,6 +153,7 @@ export function createSSEStream(options = {}) {
               }
 
               const isFinishChunk = parsed.choices?.[0]?.finish_reason;
+              if (isFinishChunk) finishChunkSeen = true;
               if (isFinishChunk && !hasValidUsage(parsed.usage)) {
                 const estimated = estimateUsage(body, totalContentLength, FORMATS.OPENAI, provider);
                 parsed.usage = filterUsageForFormat(estimated, FORMATS.OPENAI);
@@ -354,6 +356,23 @@ export function createSSEStream(options = {}) {
           // Without it they can hang until timeout and trigger failover.
           // Gemini-family clients (Antigravity, Vertex, Gemini) reject this sentinel with 400 syntax errors.
           const isGeminiFamily = provider === "antigravity" || provider === "gemini" || provider === "vertex";
+
+          // If upstream stream ended without a finish_reason chunk, synthesize one so
+          // the AI SDK reports finishReason="stop" instead of "other" (truncation).
+          if (!finishChunkSeen && !isGeminiFamily && !streamDoneSent) {
+            console.warn(`[SSE] Premature EOF: provider=${provider} model=${model} — synthesizing finish_reason=stop (lines=${sseLineCount}, content=${totalContentLength})`);
+            const syntheticFinish = {
+              id: parsed?.id || `chatcmpl-${Date.now().toString(36)}`,
+              object: "chat.completion.chunk",
+              created: Math.floor(Date.now() / 1000),
+              model: model || "",
+              choices: [{ index: 0, delta: {}, finish_reason: "stop" }]
+            };
+            const finishOutput = `data: ${JSON.stringify(syntheticFinish)}\n\n`;
+            reqLogger?.appendConvertedChunk?.(finishOutput);
+            controller.enqueue(sharedEncoder.encode(finishOutput));
+          }
+
           if (!streamDoneSent && !isGeminiFamily) {
             const doneOutput = "data: [DONE]\n\n";
             reqLogger?.appendConvertedChunk?.(doneOutput);
