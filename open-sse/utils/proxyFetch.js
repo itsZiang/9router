@@ -217,13 +217,35 @@ function resolveConnectionProxyUrl(targetUrl, proxyOptions) {
  * connections. Combined with Connection: close header, the proxy server
  * closes the TCP connection after each response (including full SSE stream),
  * so the next request opens a new connection and gets a fresh rotated IP.
+ *
+ * bodyTimeout=0 + headersTimeout=0 disable undici's default 300s timeouts
+ * which prematurely abort long reasoning streams (e.g. kimi-k2.7).
+ * The stall watchdog (STREAM_STALL_TIMEOUT_MS) and connect timeout
+ * (FETCH_CONNECT_TIMEOUT_MS) provide the real protection.
  */
 async function getDispatcher(proxyUrl) {
   const normalized = normalizeProxyUrl(proxyUrl);
   if (!normalized) return null;
 
   const { ProxyAgent } = await import("undici");
-  return new ProxyAgent({ uri: normalized, connections: 1, pipelining: 0 });
+  return new ProxyAgent({ uri: normalized, connections: 1, pipelining: 0, bodyTimeout: 0, headersTimeout: 0 });
+}
+
+// Cached no-timeout Agent for direct (non-proxy) fetches.
+// undici's default bodyTimeout (300s) and headersTimeout (300s) prematurely
+// abort long SSE streams from reasoning models. 9router has its own timeout
+// mechanisms: FETCH_CONNECT_TIMEOUT_MS (60s, connect phase via AbortController)
+// and STREAM_STALL_TIMEOUT_MS (360s, inter-chunk stall watchdog).
+let _noTimeoutAgent = null;
+async function getNoTimeoutAgent() {
+  if (_noTimeoutAgent) return _noTimeoutAgent;
+  try {
+    const { Agent } = await import("undici");
+    _noTimeoutAgent = new Agent({ bodyTimeout: 0, headersTimeout: 0 });
+  } catch {
+    _noTimeoutAgent = null;
+  }
+  return _noTimeoutAgent;
 }
 
 /**
@@ -372,6 +394,12 @@ export async function proxyAwareFetch(url, options = {}, proxyOptions = null) {
 
   // got-scraping disabled — use native fetch directly
   // (Re-enable per-host by wrapping with tryGotScrapingFetch when needed)
+  // Use no-timeout agent to prevent undici's default 300s body/headers timeout
+  // from aborting long SSE streams (e.g. reasoning models with long pauses).
+  const agent = await getNoTimeoutAgent();
+  if (agent && !options.dispatcher) {
+    return originalFetch(url, { ...options, dispatcher: agent });
+  }
   return originalFetch(url, options);
 }
 

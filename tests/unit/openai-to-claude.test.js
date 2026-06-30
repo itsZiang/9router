@@ -203,4 +203,57 @@ describe("openaiToClaudeResponse", () => {
       limit: 120
     });
   });
+
+  it("synthesizes terminal events on premature EOF (flush with null chunk)", () => {
+    // Simulate a stream that received reasoning but then ended without finish_reason
+    const state = {
+      messageStartSent: true,
+      messageId: "msg_test",
+      model: "kimi-k2.7",
+      nextBlockIndex: 1,
+      thinkingBlockStarted: true,
+      thinkingBlockIndex: 0,
+      textBlockStarted: false,
+      textBlockClosed: false,
+      toolCalls: new Map(),
+      finishReason: null,
+      usage: { input_tokens: 100, output_tokens: 50 }
+    };
+
+    const result = openaiToClaudeResponse(null, state);
+
+    expect(result).toBeDefined();
+    expect(result.length).toBe(3);
+
+    // Should close the open thinking block
+    expect(result[0]).toEqual({ type: "content_block_stop", index: 0 });
+
+    // Should synthesize message_delta with end_turn
+    expect(result[1]).toEqual({
+      type: "message_delta",
+      delta: { stop_reason: "end_turn" },
+      usage: { input_tokens: 100, output_tokens: 50 }
+    });
+
+    // Should synthesize message_stop
+    expect(result[2]).toEqual({ type: "message_stop" });
+
+    // Should mark finishReason so subsequent flush calls are no-ops
+    expect(state.finishReason).toBe("stop");
+  });
+
+  it("returns null on flush when no chunks were ever received", () => {
+    const state = { toolCalls: new Map() };
+    const result = openaiToClaudeResponse(null, state);
+    expect(result).toBeNull();
+  });
+
+  it("returns null on flush when finish_reason was already received", () => {
+    const state = {
+      messageStartSent: true,
+      finishReason: "stop"
+    };
+    const result = openaiToClaudeResponse(null, state);
+    expect(result).toBeNull();
+  });
 });

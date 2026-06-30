@@ -5,8 +5,8 @@ import { MAX_RATE_LIMIT_COOLDOWN_MS, QUOTA_POOL_PATTERNS } from "open-sse/config
 import { resolveProviderId, FREE_PROVIDERS } from "@/shared/constants/providers.js";
 import * as log from "../utils/logger.js";
 
-// Mutex to prevent race conditions during account selection
-let selectionMutex = Promise.resolve();
+// Per-provider mutex: concurrent requests to different providers don't block each other
+const providerMutexes = new Map();
 
 // Per-connection guard: prevents duplicate auto-replace when multiple concurrent
 // requests hit 403 for the same connection at the same time.
@@ -103,22 +103,28 @@ export async function getProviderCredentials(provider, excludeConnectionIds = nu
     ? excludeConnectionIds
     : (excludeConnectionIds ? new Set([excludeConnectionIds]) : new Set());
   const preferredConnectionId = options?.preferredConnectionId || null;
-  // Acquire mutex to prevent race conditions
-  const currentMutex = selectionMutex;
+
+  // Resolve alias to provider ID early (needed for per-provider mutex + re-enable guards)
+  const providerId = resolveProviderId(provider);
+
+  // Acquire per-provider mutex to prevent race conditions during account selection
+  const mutexKey = providerId;
+  const currentMutex = providerMutexes.get(mutexKey) || Promise.resolve();
   let resolveMutex;
-  selectionMutex = new Promise(resolve => { resolveMutex = resolve; });
+  const nextMutex = new Promise(resolve => { resolveMutex = resolve; });
+  providerMutexes.set(mutexKey, nextMutex);
 
   try {
     await currentMutex;
 
-    // Re-enable Cloudflare connections that passed their daily quota cooldown
-    await reEnableCloudflareConnections();
-
-    // Re-enable Siliconflow connections that passed their 15-min server busy cooldown
-    await reEnableSiliconflowConnections();
-
-    // Resolve alias to provider ID (e.g., "kc" -> "kilocode")
-    const providerId = resolveProviderId(provider);
+    // Only run provider-specific re-enable checks for the relevant provider
+    if (providerId === "cloudflare-ai") {
+      await reEnableCloudflareConnections();
+    }
+    // Siliconflow may be built-in "siliconflow" or an openai-compatible-* provider
+    if (providerId === "siliconflow" || (typeof providerId === "string" && providerId.startsWith("openai-compatible-"))) {
+      await reEnableSiliconflowConnections();
+    }
 
     // Inject a virtual connection for no-auth free providers (with optional proxy pool from settings)
     if (FREE_PROVIDERS[providerId]?.noAuth) {
@@ -277,6 +283,10 @@ export async function getProviderCredentials(provider, excludeConnectionIds = nu
     };
   } finally {
     if (resolveMutex) resolveMutex();
+    // Clean up mutex entry if no one else is waiting
+    if (providerMutexes.get(mutexKey) === nextMutex) {
+      providerMutexes.delete(mutexKey);
+    }
   }
 }
 

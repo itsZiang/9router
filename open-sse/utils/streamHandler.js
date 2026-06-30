@@ -146,10 +146,12 @@ export function createDisconnectAwareStream(transformStream, streamController, o
           msg.includes("ECONNRESET") ||
           msg.includes("ETIMEDOUT") ||
           msg.includes("EPIPE") ||
+          msg.includes("Body Timeout") ||
           code === "ECONNRESET" ||
           code === "ETIMEDOUT" ||
           code === "EPIPE" ||
-          code === "UND_ERR_SOCKET";
+          code === "UND_ERR_SOCKET" ||
+          code === "UND_ERR_BODY_TIMEOUT";
 
         // Graceful close on network/abort, or when a structured terminal is available
         // (Responses passthrough prefers response.failed + [DONE] over a raw transport error)

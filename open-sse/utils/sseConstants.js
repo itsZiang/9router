@@ -15,9 +15,11 @@ export const SSE_HEADERS_NO_BUFFER = {
 };
 
 // Variant for client-facing SSE responses (adds permissive CORS)
+// X-Accel-Buffering disables nginx/proxy buffering for streaming responses
 export const SSE_HEADERS_CORS = {
   "Content-Type": "text/event-stream",
   "Cache-Control": "no-cache",
   "Connection": "keep-alive",
-  "Access-Control-Allow-Origin": "*"
+  "Access-Control-Allow-Origin": "*",
+  "X-Accel-Buffering": "no"
 };

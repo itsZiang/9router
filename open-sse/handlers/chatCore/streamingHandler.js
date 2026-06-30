@@ -9,6 +9,19 @@ import { buildRequestDetail, extractRequestConfig, saveUsageStats } from "./requ
 import { saveRequestDetail } from "@/lib/usageDb.js";
 import { SSE_HEADERS_CORS as SSE_HEADERS } from "../../utils/sseConstants.js";
 
+// Shared encoder for terminal byte synthesis
+const _sharedEncoder = new TextEncoder();
+
+// Synthesize [DONE] sentinel for aborted OpenAI passthrough streams.
+// Clients (e.g. opencode via @ai-sdk/openai-compatible) expect this sentinel
+// to properly terminate the SSE stream. Without it they may hang or report truncation.
+function buildAbortedOpenAIPassthroughTerminalBytes() {
+  return _sharedEncoder.encode("data: [DONE]\n\n");
+}
+
+// Gemini-family clients reject the [DONE] sentinel with 400 syntax errors
+const GEMINI_FAMILY_PROVIDERS = new Set(["antigravity", "gemini", "vertex", "gemini-cli"]);
+
 // Codex returns Responses API SSE → which client format to translate INTO, by request sourceFormat.
 // Gemini-family all map to ANTIGRAVITY decoder; unknown sources fall back to OPENAI.
 const CODEX_SOURCE_TO_TARGET = {
@@ -64,7 +77,13 @@ export function handleStreamingResponse({ providerResponse, provider, model, sou
 
   // Responses passthrough: synthesize response.failed + [DONE] if the stream aborts/stalls before a terminal event
   const isResponsesPassthrough = sourceFormat === FORMATS.OPENAI_RESPONSES && targetFormat === FORMATS.OPENAI_RESPONSES;
-  const onAbortTerminal = isResponsesPassthrough ? buildAbortedResponsesTerminalBytes : null;
+  // OpenAI passthrough: synthesize [DONE] on abort so clients get proper stream termination
+  const isOpenAIPassthrough = sourceFormat === FORMATS.OPENAI && targetFormat === FORMATS.OPENAI && !GEMINI_FAMILY_PROVIDERS.has(provider);
+  const onAbortTerminal = isResponsesPassthrough
+    ? buildAbortedResponsesTerminalBytes
+    : isOpenAIPassthrough
+      ? buildAbortedOpenAIPassthroughTerminalBytes
+      : null;
   const stallTimeoutMs = PROVIDERS[provider]?.stallTimeoutMs || STREAM_STALL_TIMEOUT_MS;
   const transformedBody = pipeWithDisconnect(providerResponse, transformStream, streamController, onAbortTerminal, stallTimeoutMs);
 

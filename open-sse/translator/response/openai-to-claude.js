@@ -69,7 +69,39 @@ function stopTextBlock(state, results) {
 
 // Convert OpenAI stream chunk to Claude format
 export function openaiToClaudeResponse(chunk, state) {
-  if (!chunk || !chunk.choices?.[0]) return null;
+  // Flush/EOF call (chunk === null): synthesize terminal events if the stream
+  // ended prematurely (upstream closed without sending a finish_reason chunk).
+  // This prevents "thinking content then nothing" — the client gets a clean
+  // termination with message_delta + message_stop instead of an unterminated stream.
+  if (!chunk) {
+    if (state.finishReason || !state.messageStartSent) return null;
+    const results = [];
+    stopThinkingBlock(state, results);
+    stopTextBlock(state, results);
+    for (const [idx, toolInfo] of state.toolCalls) {
+      const buffered = state.toolArgBuffers?.get(idx);
+      if (buffered) {
+        const sanitized = sanitizeToolArgs(toolInfo.name, buffered);
+        results.push({
+          type: "content_block_delta",
+          index: toolInfo.blockIndex,
+          delta: { type: "input_json_delta", partial_json: sanitized }
+        });
+      }
+      results.push({ type: "content_block_stop", index: toolInfo.blockIndex });
+    }
+    state.finishReason = "stop";
+    const finalUsage = state.usage || { input_tokens: 0, output_tokens: 0 };
+    results.push({
+      type: "message_delta",
+      delta: { stop_reason: "end_turn" },
+      usage: finalUsage
+    });
+    results.push({ type: "message_stop" });
+    return results.length > 0 ? results : null;
+  }
+
+  if (!chunk.choices?.[0]) return null;
 
   const results = [];
   const choice = chunk.choices[0];

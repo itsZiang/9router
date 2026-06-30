@@ -50,6 +50,11 @@ async function readRaw() {
   return row ? parseJson(row.data, {}) : {};
 }
 
+// In-memory settings cache with short TTL to avoid repeated SQLite reads on every request
+let settingsCache = null;
+let settingsCacheExpiry = 0;
+const SETTINGS_CACHE_TTL_MS = 5_000;
+
 // Merge raw settings with defaults; backward-compat for missing keys
 function mergeWithDefaults(raw) {
   const merged = { ...DEFAULT_SETTINGS, ...(raw || {}) };
@@ -70,8 +75,20 @@ function mergeWithDefaults(raw) {
 }
 
 export async function getSettings() {
+  // Return cached settings if still fresh
+  if (settingsCache && Date.now() < settingsCacheExpiry) {
+    return settingsCache;
+  }
   const raw = await readRaw();
-  return mergeWithDefaults(raw);
+  settingsCache = mergeWithDefaults(raw);
+  settingsCacheExpiry = Date.now() + SETTINGS_CACHE_TTL_MS;
+  return settingsCache;
+}
+
+// Invalidate the settings cache (call after any write)
+function invalidateSettingsCache() {
+  settingsCache = null;
+  settingsCacheExpiry = 0;
 }
 
 // Atomic read-merge-write inside transaction (prevents losing concurrent updates)
@@ -87,7 +104,10 @@ export async function updateSettings(updates) {
       [stringifyJson(next)]
     );
   });
-  return mergeWithDefaults(next);
+  const merged = mergeWithDefaults(next);
+  settingsCache = merged;
+  settingsCacheExpiry = Date.now() + SETTINGS_CACHE_TTL_MS;
+  return merged;
 }
 
 export async function isCloudEnabled() {
