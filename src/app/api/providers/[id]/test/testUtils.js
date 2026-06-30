@@ -19,6 +19,7 @@ import {
   KIMCHI_CONFIG,
 } from "@/lib/oauth/constants/oauth";
 import { buildClineHeaders } from "@/shared/utils/clineAuth";
+import { KIMCHI_USER_AGENT } from "open-sse/services/kimchiModels.js";
 
 // OAuth provider test endpoints
 const OAUTH_TEST_CONFIG = {
@@ -99,7 +100,7 @@ const OAUTH_TEST_CONFIG = {
     authPrefix: "Bearer ",
     extraHeaders: {
       Accept: "application/json",
-      "User-Agent": "kimchi/0.0.0",
+      "User-Agent": KIMCHI_USER_AGENT,
     },
     refreshable: false,
   },

@@ -96,6 +96,12 @@ export class KimchiExecutor extends DefaultExecutor {
 
     stripMessageArtifacts(transformed);
     stripToolArtifacts(transformed);
+
+    const slug = model.includes("/") ? model.split("/").pop() : model;
+    const baseTags = [`model:${slug}`, "phase:explore"];
+    const existingTags = Array.isArray(transformed.tags) ? transformed.tags : [];
+    transformed.tags = [...baseTags, ...existingTags.filter((t) => !baseTags.includes(t))];
+
     return transformed;
   }
 }
