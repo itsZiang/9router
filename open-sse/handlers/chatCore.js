@@ -26,6 +26,37 @@ import { compressWithHeadroom, formatHeadroomLog, formatHeadroomSizeLog, isHeadr
 import { getCapabilitiesForModel } from "../providers/capabilities.js";
 import { stripUnsupportedModalities } from "../translator/concerns/modality.js";
 import { prefetchRemoteImages } from "../translator/concerns/prefetch.js";
+import { DEFAULT_MAX_TOKENS } from "../config/runtimeConfig.js";
+
+/**
+ * Known reasoning-model upstream id patterns.
+ * These models often spend >30 k tokens on internal reasoning,
+ * so we auto-bump max_tokens when the client left it at the
+ * default 32 k (or lower) to prevent truncation.
+ */
+const REASONING_MODEL_PATTERNS = [
+  /kimi-k2\./i,
+  /glm-5\./i,
+  /deepseek-v4/i,
+  /minimax-m3/i,
+  /mimo-v2\.5/i
+];
+
+function isReasoningModel(model) {
+  return REASONING_MODEL_PATTERNS.some(p => p.test(model));
+}
+
+function ensureReasoningModelMaxTokens(body, model) {
+  if (!isReasoningModel(model)) return body;
+  const current = body.max_tokens ?? body.max_completion_tokens;
+  // Only bump when current limit is at or below the old default 32 k
+  if (typeof current === "number" && current > 0 && current <= 32000) {
+    const bumped = Math.min(DEFAULT_MAX_TOKENS, 64000);
+    console.log(`[REASONING] ${model}: bump max_tokens ${current} → ${bumped}`);
+    return { ...body, max_tokens: bumped };
+  }
+  return body;
+}
 
 /**
  * Core chat handler - shared between SSE and Worker
@@ -238,6 +269,7 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
   // Execute request
   let providerResponse, providerUrl, providerHeaders, finalBody;
   try {
+    translatedBody = ensureReasoningModelMaxTokens(translatedBody, upstreamModel);
     const result = await executor.execute({ model, body: translatedBody, stream, credentials, signal: streamController.signal, log, proxyOptions });
     providerResponse = result.response;
     providerUrl = result.url;
@@ -277,7 +309,8 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
           try { await onCredentialsRefreshed(newCredentials); } catch (e) { log?.warn?.("TOKEN", `onCredentialsRefreshed failed: ${e.message}`); }
         }
         try {
-          const retryResult = await executor.execute({ model, body: translatedBody, stream, credentials, signal: streamController.signal, log, proxyOptions });
+          const retryBody = ensureReasoningModelMaxTokens(translatedBody, upstreamModel);
+          const retryResult = await executor.execute({ model, body: retryBody, stream, credentials, signal: streamController.signal, log, proxyOptions });
           if (retryResult.response.ok) { providerResponse = retryResult.response; providerUrl = retryResult.url; }
         } catch { log?.warn?.("TOKEN", `${provider.toUpperCase()} | retry after refresh failed`); }
       } else {
