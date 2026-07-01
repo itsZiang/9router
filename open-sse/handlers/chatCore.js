@@ -26,37 +26,6 @@ import { compressWithHeadroom, formatHeadroomLog, formatHeadroomSizeLog, isHeadr
 import { getCapabilitiesForModel } from "../providers/capabilities.js";
 import { stripUnsupportedModalities } from "../translator/concerns/modality.js";
 import { prefetchRemoteImages } from "../translator/concerns/prefetch.js";
-import { DEFAULT_MAX_TOKENS } from "../config/runtimeConfig.js";
-
-/**
- * Known reasoning-model upstream id patterns.
- * These models often spend >30 k tokens on internal reasoning,
- * so we auto-bump max_tokens when the client left it at the
- * default 32 k (or lower) to prevent truncation.
- */
-const REASONING_MODEL_PATTERNS = [
-  /kimi-k2\./i,
-  /glm-5\./i,
-  /deepseek-v4/i,
-  /minimax-m3/i,
-  /mimo-v2\.5/i
-];
-
-function isReasoningModel(model) {
-  return REASONING_MODEL_PATTERNS.some(p => p.test(model));
-}
-
-function ensureReasoningModelMaxTokens(body, model) {
-  if (!isReasoningModel(model)) return body;
-  const current = body.max_tokens ?? body.max_completion_tokens;
-  // Only bump when current limit is at or below the old default 32 k
-  if (typeof current === "number" && current > 0 && current <= 32000) {
-    const bumped = Math.min(DEFAULT_MAX_TOKENS, 64000);
-    console.log(`[REASONING] ${model}: bump max_tokens ${current} → ${bumped}`);
-    return { ...body, max_tokens: bumped };
-  }
-  return body;
-}
 
 /**
  * Core chat handler - shared between SSE and Worker
@@ -65,7 +34,7 @@ function ensureReasoningModelMaxTokens(body, model) {
  * @param {object} options.credentials - Provider credentials
  * @param {string} options.sourceFormatOverride - Override detected source format (e.g. "openai-responses")
  */
-export async function handleChatCore({ body, modelInfo, credentials, log, onCredentialsRefreshed, onRequestSuccess, onDisconnect, clientRawRequest, connectionId, userAgent, apiKey, ccFilterNaming, rtkEnabled, headroomEnabled, headroomUrl, headroomCompressUserMessages, cavemanEnabled, cavemanLevel, ponytailEnabled, ponytailLevel, sourceFormatOverride, providerThinking }) {
+export async function handleChatCore({ body, modelInfo, credentials, log, onCredentialsRefreshed, onRequestSuccess, onDisconnect, clientRawRequest, connectionId, userAgent, apiKey, ccFilterNaming, rtkEnabled, headroomEnabled, headroomUrl, headroomCompressUserMessages, cavemanEnabled, cavemanLevel, ponytailEnabled, ponytailLevel, sourceFormatOverride, providerThinking, requestSignal }) {
   const { provider, model } = modelInfo;
   const requestStartTime = Date.now();
 
@@ -217,6 +186,11 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
   }
 
   const executor = getExecutor(provider);
+  const providerConfig = executor.getProviderConfig?.();
+  if (providerConfig) {
+    log?.debug?.("PROVIDER_CONFIG", `${provider} using ${providerConfig.constructor.name}`);
+  }
+
   trackPendingRequest(model, provider, connectionId, true);
   appendRequestLog({ model, provider, connectionId, status: "PENDING" }).catch(() => { });
 
@@ -231,6 +205,19 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
     onError: () => trackPendingRequest(model, provider, connectionId, false),
     log, provider, model
   });
+
+  // Wire client-disconnect signal so that when the browser/CLI disconnects,
+  // the upstream fetch is aborted via streamController instead of burning
+  // provider quota until the stall timeout (360s) fires.
+  if (requestSignal) {
+    if (requestSignal.aborted) {
+      streamController.handleDisconnect("client_aborted_before_start");
+    } else {
+      requestSignal.addEventListener("abort", () => {
+        streamController.handleDisconnect("client_disconnected");
+      }, { once: true });
+    }
+  }
 
   const proxyOptions = {
     connectionProxyEnabled: credentials?.providerSpecificData?.connectionProxyEnabled === true,
@@ -267,14 +254,14 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
   }
 
   // Execute request
-  let providerResponse, providerUrl, providerHeaders, finalBody;
+  let providerResponse, providerUrl, providerHeaders, finalBody, retryMetadata;
   try {
-    translatedBody = ensureReasoningModelMaxTokens(translatedBody, upstreamModel);
     const result = await executor.execute({ model, body: translatedBody, stream, credentials, signal: streamController.signal, log, proxyOptions });
     providerResponse = result.response;
     providerUrl = result.url;
     providerHeaders = result.headers;
     finalBody = result.transformedBody;
+    retryMetadata = { attemptedRetries: result.attemptedRetries || 0, maxRetries: result.maxRetries || 0 };
     reqLogger.logTargetRequest(providerUrl, providerHeaders, finalBody);
   } catch (error) {
     trackPendingRequest(model, provider, connectionId, false, true);
@@ -309,9 +296,13 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
           try { await onCredentialsRefreshed(newCredentials); } catch (e) { log?.warn?.("TOKEN", `onCredentialsRefreshed failed: ${e.message}`); }
         }
         try {
-          const retryBody = ensureReasoningModelMaxTokens(translatedBody, upstreamModel);
-          const retryResult = await executor.execute({ model, body: retryBody, stream, credentials, signal: streamController.signal, log, proxyOptions });
-          if (retryResult.response.ok) { providerResponse = retryResult.response; providerUrl = retryResult.url; }
+          const retryResult = await executor.execute({ model, body: translatedBody, stream, credentials, signal: streamController.signal, log, proxyOptions });
+          if (retryResult.response.ok) {
+            providerResponse = retryResult.response;
+            providerUrl = retryResult.url;
+            retryMetadata.attemptedRetries = retryResult.attemptedRetries || 0;
+            retryMetadata.maxRetries = retryResult.maxRetries || 0;
+          }
         } catch { log?.warn?.("TOKEN", `${provider.toUpperCase()} | retry after refresh failed`); }
       } else {
         log?.warn?.("TOKEN", `${provider.toUpperCase()} | refresh failed`);
@@ -342,7 +333,7 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
     return createErrorResult(statusCode, errMsg, resetsAtMs);
   }
 
-  const sharedCtx = { provider, model, body, stream, translatedBody, finalBody, requestStartTime, connectionId, apiKey, clientRawRequest, onRequestSuccess };
+  const sharedCtx = { provider, model, body, stream, translatedBody, finalBody, requestStartTime, connectionId, apiKey, clientRawRequest, onRequestSuccess, retryMetadata };
   const appendLog = (extra) => appendRequestLog({ model, provider, connectionId, ...extra }).catch(() => { });
   const trackDone = () => trackPendingRequest(model, provider, connectionId, false);
 
@@ -361,7 +352,8 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
 
   // Streaming response
   const { onStreamComplete } = buildOnStreamComplete({ ...sharedCtx });
-  return handleStreamingResponse({ ...sharedCtx, providerResponse, sourceFormat, targetFormat, userAgent, reqLogger, toolNameMap, streamController, onStreamComplete });
+  const responseIterator = providerConfig?.getResponseIterator?.({ rawResponse: providerResponse, model, stream });
+  return handleStreamingResponse({ ...sharedCtx, providerResponse, sourceFormat, targetFormat, userAgent, reqLogger, toolNameMap, streamController, onStreamComplete, responseIterator });
 }
 
 export function isTokenExpiringSoon(expiresAt, bufferMs = 5 * 60 * 1000) {

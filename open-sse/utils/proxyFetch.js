@@ -1,5 +1,7 @@
 import { Readable } from "stream";
 import { dbg } from "./debugLog.js";
+import { httpClientCache } from "./httpClientCache.js";
+import { STREAM_FIRST_CHUNK_TIMEOUT_MS } from "../config/runtimeConfig.js";
 
 const originalFetch = globalThis.fetch;
 
@@ -212,40 +214,94 @@ function resolveConnectionProxyUrl(targetUrl, proxyOptions) {
 }
 
 /**
- * Create a fresh ProxyAgent per request.
- * connections=1 + pipelining=0 prevents undici from pooling multiple
- * connections. Combined with Connection: close header, the proxy server
- * closes the TCP connection after each response (including full SSE stream),
- * so the next request opens a new connection and gets a fresh rotated IP.
- *
- * bodyTimeout=0 + headersTimeout=0 disable undici's default 300s timeouts
- * which prematurely abort long reasoning streams (e.g. kimi-k2.7).
- * The stall watchdog (STREAM_STALL_TIMEOUT_MS) and connect timeout
- * (FETCH_CONNECT_TIMEOUT_MS) provide the real protection.
+ * Get a cached ProxyAgent from HttpClientCache.
+ * Phase 2 switches from fresh-per-request agents to pooled agents keyed by
+ * proxy URL + pool parameters. bodyTimeout/headersTimeout stay 0 so undici
+ * does not abort long reasoning streams.
  */
 async function getDispatcher(proxyUrl) {
-  const normalized = normalizeProxyUrl(proxyUrl);
-  if (!normalized) return null;
-
-  const { ProxyAgent } = await import("undici");
-  return new ProxyAgent({ uri: normalized, connections: 1, pipelining: 0, bodyTimeout: 0, headersTimeout: 0 });
+  return httpClientCache.getProxyAgent(proxyUrl);
 }
 
-// Cached no-timeout Agent for direct (non-proxy) fetches.
-// undici's default bodyTimeout (300s) and headersTimeout (300s) prematurely
-// abort long SSE streams from reasoning models. 9router has its own timeout
-// mechanisms: FETCH_CONNECT_TIMEOUT_MS (60s, connect phase via AbortController)
-// and STREAM_STALL_TIMEOUT_MS (360s, inter-chunk stall watchdog).
-let _noTimeoutAgent = null;
+/**
+ * Get a cached no-timeout Agent for direct (non-proxy) fetches.
+ * undici's default bodyTimeout/headersTimeout (300s) can abort long SSE
+ * streams; 9router manages connect and stall timeouts explicitly.
+ */
 async function getNoTimeoutAgent() {
-  if (_noTimeoutAgent) return _noTimeoutAgent;
-  try {
-    const { Agent } = await import("undici");
-    _noTimeoutAgent = new Agent({ bodyTimeout: 0, headersTimeout: 0 });
-  } catch {
-    _noTimeoutAgent = null;
+  return httpClientCache.getAgent();
+}
+
+function isStreamingRequest(options = {}) {
+  const headers = options.headers || {};
+  const accept = headers["Accept"] ?? headers["accept"];
+  return typeof accept === "string" && accept.includes("text/event-stream");
+}
+
+/**
+ * Wrap a fetch Response so that the stream aborts if no bytes arrive within
+ * `timeoutMs`. This provides explicit time-to-first-token protection without
+ * relying on undici's body timeout, which cannot distinguish between a slow
+ * first chunk and an inter-chunk stall.
+ */
+export function withFirstChunkTimeout(response, timeoutMs) {
+  if (!response.body || typeof timeoutMs !== "number" || timeoutMs <= 0) {
+    return response;
   }
-  return _noTimeoutAgent;
+  const source = response.body;
+  let timer;
+  let firstChunkSeen = false;
+  let reader;
+
+  const stream = new ReadableStream({
+    start(controller) {
+      reader = source.getReader();
+
+      timer = setTimeout(() => {
+        const reason = new DOMException(
+          `First chunk timeout after ${timeoutMs}ms`,
+          "TimeoutError"
+        );
+        controller.error(reason);
+        reader.cancel("first chunk timeout").catch(() => {});
+      }, timeoutMs);
+
+      function pump() {
+        reader.read().then(({ done, value }) => {
+          if (!firstChunkSeen) {
+            firstChunkSeen = true;
+            clearTimeout(timer);
+          }
+          if (done) {
+            controller.close();
+            return;
+          }
+          controller.enqueue(value);
+          pump();
+        }).catch((err) => {
+          clearTimeout(timer);
+          controller.error(err);
+        });
+      }
+
+      pump();
+    },
+    cancel(reason) {
+      clearTimeout(timer);
+      // Cancel via the locked reader; that propagates to the source stream.
+      return reader ? reader.cancel(reason).catch(() => {}) : Promise.resolve();
+    },
+  });
+
+  return new Response(stream, {
+    status: response.status,
+    statusText: response.statusText,
+    headers: response.headers,
+  });
+}
+
+function maybeFirstChunkTimeout(response, options) {
+  return response;
 }
 
 /**
@@ -309,15 +365,16 @@ async function createBypassRequest(parsedUrl, realIP, options) {
 
 /**
  * Attempt a fetch through the proxy with up to `maxAttempts` retries.
- * Each attempt uses a fresh ProxyAgent (new TCP connection).
- * Returns the response on the first success, or throws the last error.
+ * Reuses a cached ProxyAgent (connection pool) instead of creating a fresh
+ * agent per attempt. Returns the response on the first success, or throws
+ * the last error.
  */
 async function fetchViaProxyWithRetry(url, options, proxyUrl, maxAttempts) {
   let lastError;
+  const dispatcher = await getDispatcher(proxyUrl);
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-    const dispatcher = await getDispatcher(proxyUrl);
     try {
-      return await originalFetch(url, { ...options, dispatcher, headers: { ...options.headers, connection: "close" } });
+      return await originalFetch(url, { ...options, dispatcher });
     } catch (err) {
       lastError = err;
       if (attempt < maxAttempts) {
@@ -345,7 +402,8 @@ export async function proxyAwareFetch(url, options = {}, proxyOptions = null) {
       "x-relay-target": `${parsed.protocol}//${parsed.host}`,
       "x-relay-path": `${parsed.pathname}${parsed.search}`,
     };
-    return originalFetch(vercelRelayUrl, { ...options, headers: relayHeaders });
+    const relayRes = await originalFetch(vercelRelayUrl, { ...options, headers: relayHeaders });
+    return maybeFirstChunkTimeout(relayRes, options);
   }
 
   const connectionProxyUrl = resolveConnectionProxyUrl(targetUrl, proxyOptions);
@@ -361,7 +419,8 @@ export async function proxyAwareFetch(url, options = {}, proxyOptions = null) {
     if (proxyUrl) {
       // Proxy resolves DNS externally (not affected by /etc/hosts) — use proxy directly
       try {
-        return await fetchViaProxyWithRetry(url, options, proxyUrl, retryAttempts);
+        const proxyRes = await fetchViaProxyWithRetry(url, options, proxyUrl, retryAttempts);
+        return maybeFirstChunkTimeout(proxyRes, options);
       } catch (proxyError) {
         if (proxyOptions?.strictProxy === true) {
           throw new Error(`[ProxyFetch] Proxy required but failed (strictProxy=true): ${proxyError.message}`);
@@ -373,7 +432,10 @@ export async function proxyAwareFetch(url, options = {}, proxyOptions = null) {
     try {
       const parsedUrl = new URL(targetUrl);
       const realIP = await resolveRealIP(parsedUrl.hostname);
-      if (realIP) return await createBypassRequest(parsedUrl, realIP, options);
+      if (realIP) {
+        const bypassRes = await createBypassRequest(parsedUrl, realIP, options);
+        return maybeFirstChunkTimeout(bypassRes, options);
+      }
     } catch (error) {
       console.warn(`[ProxyFetch] MITM bypass failed: ${error.message}`);
     }
@@ -381,26 +443,30 @@ export async function proxyAwareFetch(url, options = {}, proxyOptions = null) {
 
   if (proxyUrl) {
     try {
-      return await fetchViaProxyWithRetry(url, options, proxyUrl, retryAttempts);
+      const proxyRes = await fetchViaProxyWithRetry(url, options, proxyUrl, retryAttempts);
+      return maybeFirstChunkTimeout(proxyRes, options);
     } catch (proxyError) {
       // If strictProxy is enabled, fail hard instead of falling back to direct
       if (proxyOptions?.strictProxy === true) {
         throw new Error(`[ProxyFetch] Proxy required but failed (strictProxy=true): ${proxyError.message}`);
       }
       console.warn(`[ProxyFetch] Proxy failed, falling back to direct: ${proxyError.message}`);
-      return originalFetch(url, options);
+      const directRes = await originalFetch(url, options);
+      return maybeFirstChunkTimeout(directRes, options);
     }
   }
 
   // got-scraping disabled — use native fetch directly
   // (Re-enable per-host by wrapping with tryGotScrapingFetch when needed)
-  // Use no-timeout agent to prevent undici's default 300s body/headers timeout
-  // from aborting long SSE streams (e.g. reasoning models with long pauses).
+  // Use cached no-timeout agent to prevent undici's default 300s body/headers
+  // timeout from aborting long SSE streams (e.g. reasoning models).
   const agent = await getNoTimeoutAgent();
   if (agent && !options.dispatcher) {
-    return originalFetch(url, { ...options, dispatcher: agent });
+    const directRes = await originalFetch(url, { ...options, dispatcher: agent });
+    return maybeFirstChunkTimeout(directRes, options);
   }
-  return originalFetch(url, options);
+  const directRes = await originalFetch(url, options);
+  return maybeFirstChunkTimeout(directRes, options);
 }
 
 /**

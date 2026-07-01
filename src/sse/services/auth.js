@@ -103,6 +103,7 @@ export async function getProviderCredentials(provider, excludeConnectionIds = nu
     ? excludeConnectionIds
     : (excludeConnectionIds ? new Set([excludeConnectionIds]) : new Set());
   const preferredConnectionId = options?.preferredConnectionId || null;
+  const allowRateLimited = options?.allowRateLimited === true;
 
   // Resolve alias to provider ID early (needed for per-provider mutex + re-enable guards)
   const providerId = resolveProviderId(provider);
@@ -173,6 +174,54 @@ export async function getProviderCredentials(provider, excludeConnectionIds = nu
     });
 
     if (availableConnections.length === 0) {
+      // Cooldown safety net: when ALL accounts are model-locked but one is about
+      // to expire, allow the request anyway (best-effort). Trades a likely-429
+      // for a chance of success vs. a guaranteed 503.
+      if (allowRateLimited) {
+        const lockedNotExcluded = connections.filter(c => !excludeSet.has(c.id) && isModelLockActive(c, model));
+        if (lockedNotExcluded.length > 0) {
+          // Pick the one with the earliest lock expiry (closest to being unlocked)
+          lockedNotExcluded.sort((a, b) => {
+            const ea = new Date(getEarliestModelLockUntil(a) || 0).getTime();
+            const eb = new Date(getEarliestModelLockUntil(b) || 0).getTime();
+            return ea - eb;
+          });
+          const emergencyConn = lockedNotExcluded[0];
+          const connName = emergencyConn.displayName || emergencyConn.name || emergencyConn.email || emergencyConn.id?.slice(0, 8);
+          const unlockIn = getEarliestModelLockUntil(emergencyConn);
+          log.warn("AUTH", `[FALLBACK-EMERGENCY] ${provider} | all accounts locked — using ${connName} (lock expires ${formatRetryAfter(unlockIn)})`);
+          const emergencyProxy = await resolveConnectionProxyConfig(emergencyConn.providerSpecificData || {});
+          return {
+            authType: emergencyConn.authType,
+            apiKey: emergencyConn.apiKey,
+            accessToken: emergencyConn.accessToken,
+            refreshToken: emergencyConn.refreshToken,
+            idToken: emergencyConn.idToken,
+            expiresAt: emergencyConn.expiresAt,
+            expiresIn: emergencyConn.expiresIn,
+            lastRefreshAt: emergencyConn.lastRefreshAt,
+            projectId: emergencyConn.projectId,
+            connectionName: connName,
+            copilotToken: emergencyConn.providerSpecificData?.copilotToken,
+            providerSpecificData: {
+              ...(emergencyConn.providerSpecificData || {}),
+              connectionProxyEnabled: emergencyProxy.connectionProxyEnabled,
+              connectionProxyUrl: emergencyProxy.connectionProxyUrl,
+              connectionNoProxy: emergencyProxy.connectionNoProxy,
+              connectionProxyPoolId: emergencyProxy.proxyPoolId || null,
+              vercelRelayUrl: emergencyProxy.vercelRelayUrl || "",
+              strictProxy: emergencyProxy.strictProxy === true,
+            },
+            connectionId: emergencyConn.id,
+            testStatus: emergencyConn.testStatus,
+            lastError: emergencyConn.lastError,
+            _connection: emergencyConn,
+            emergencyFallback: true,
+          };
+        }
+        // No locked-but-not-excluded connections — fall through to null
+      }
+
       // Find earliest lock expiry across all connections for retry timing
       const lockedConns = connections.filter(c => isModelLockActive(c, model));
       const expiries = lockedConns.map(c => getEarliestModelLockUntil(c)).filter(Boolean);

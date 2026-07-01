@@ -248,7 +248,7 @@ export function translateNonStreamingResponse(responseBody, targetFormat, source
 /**
  * Handle non-streaming response from provider.
  */
-export async function handleNonStreamingResponse({ providerResponse, provider, model, sourceFormat, targetFormat, body, stream, translatedBody, finalBody, requestStartTime, connectionId, apiKey, clientRawRequest, onRequestSuccess, reqLogger, toolNameMap, trackDone, appendLog }) {
+export async function handleNonStreamingResponse({ providerResponse, provider, model, sourceFormat, targetFormat, body, stream, translatedBody, finalBody, requestStartTime, connectionId, apiKey, clientRawRequest, onRequestSuccess, reqLogger, toolNameMap, trackDone, appendLog, retryMetadata }) {
   trackDone();
   const contentType = providerResponse.headers.get("content-type") || "";
   let responseBody;
@@ -386,10 +386,17 @@ export async function handleNonStreamingResponse({ providerResponse, provider, m
     console.error("[RequestDetail] Failed to save:", err.message);
   });
 
+  const headers = new Headers({
+    "Content-Type": "application/json",
+    "Access-Control-Allow-Origin": "*"
+  });
+  if (retryMetadata) {
+    headers.set("x-9router-attempted-retries", String(retryMetadata.attemptedRetries || 0));
+    headers.set("x-9router-max-retries", String(retryMetadata.maxRetries || 0));
+  }
+
   return {
     success: true,
-    response: new Response(JSON.stringify(translatedResponse), {
-      headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" }
-    })
+    response: new Response(JSON.stringify(translatedResponse), { headers })
   };
 }

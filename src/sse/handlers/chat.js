@@ -209,22 +209,40 @@ async function handleSingleModelChat(body, modelStr, clientRawRequest = null, re
   let lastStatus = null;
 
   while (true) {
-    const credentials = await getProviderCredentials(provider, excludeConnectionIds, model);
+    let credentials = await getProviderCredentials(provider, excludeConnectionIds, model);
 
     // All accounts unavailable
     if (!credentials || credentials.allRateLimited) {
       if (credentials?.allRateLimited) {
-        const errorMsg = lastError || credentials.lastError || "Unavailable";
-        const status = lastStatus || Number(credentials.lastErrorCode) || HTTP_STATUS.SERVICE_UNAVAILABLE;
-        log.warn("CHAT", `[${provider}/${model}] ${errorMsg} (${credentials.retryAfterHuman})`);
-        return unavailableResponse(status, `[${provider}/${model}] ${errorMsg}`, credentials.retryAfter, credentials.retryAfterHuman);
+        // Cooldown safety net: all accounts are model-locked, but one may be
+        // close to unlocking. Try the account with the earliest lock expiry
+        // instead of returning a hard 503. Trades a likely-429 for a chance
+        // of success. Only on the first attempt (no accounts tried yet).
+        if (excludeConnectionIds.size === 0) {
+          const emergencyCreds = await getProviderCredentials(provider, excludeConnectionIds, model, { allowRateLimited: true });
+          if (emergencyCreds && !emergencyCreds.allRateLimited) {
+            log.warn("CHAT", `[${provider}/${model}] Cooldown safety net activated — attempting emergency fallback`);
+            credentials = emergencyCreds;
+          } else {
+            const errorMsg = lastError || credentials.lastError || "Unavailable";
+            const status = lastStatus || Number(credentials.lastErrorCode) || HTTP_STATUS.SERVICE_UNAVAILABLE;
+            log.warn("CHAT", `[${provider}/${model}] ${errorMsg} (${credentials.retryAfterHuman})`);
+            return unavailableResponse(status, `[${provider}/${model}] ${errorMsg}`, credentials.retryAfter, credentials.retryAfterHuman);
+          }
+        } else {
+          const errorMsg = lastError || credentials.lastError || "Unavailable";
+          const status = lastStatus || Number(credentials.lastErrorCode) || HTTP_STATUS.SERVICE_UNAVAILABLE;
+          log.warn("CHAT", `[${provider}/${model}] ${errorMsg} (${credentials.retryAfterHuman})`);
+          return unavailableResponse(status, `[${provider}/${model}] ${errorMsg}`, credentials.retryAfter, credentials.retryAfterHuman);
+        }
+      } else {
+        if (excludeConnectionIds.size === 0) {
+          log.warn("AUTH", `No active credentials for provider: ${provider}`);
+          return errorResponse(HTTP_STATUS.NOT_FOUND, `No active credentials for provider: ${provider}`);
+        }
+        log.warn("CHAT", "No more accounts available", { provider });
+        return errorResponse(lastStatus || HTTP_STATUS.SERVICE_UNAVAILABLE, lastError || "All accounts unavailable");
       }
-      if (excludeConnectionIds.size === 0) {
-        log.warn("AUTH", `No active credentials for provider: ${provider}`);
-        return errorResponse(HTTP_STATUS.NOT_FOUND, `No active credentials for provider: ${provider}`);
-      }
-      log.warn("CHAT", "No more accounts available", { provider });
-      return errorResponse(lastStatus || HTTP_STATUS.SERVICE_UNAVAILABLE, lastError || "All accounts unavailable");
     }
 
     // Log account selection
@@ -254,6 +272,7 @@ async function handleSingleModelChat(body, modelStr, clientRawRequest = null, re
       connectionId: credentials.connectionId,
       userAgent,
       apiKey,
+      requestSignal: request?.signal,
       ccFilterNaming: !!chatSettings.ccFilterNaming,
       rtkEnabled: !!chatSettings.rtkEnabled,
       headroomEnabled: !!chatSettings.headroomEnabled,

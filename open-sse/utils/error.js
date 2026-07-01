@@ -63,7 +63,19 @@ export async function parseUpstreamError(response, executor = null) {
     bodyText = "";
   }
 
-  // Let executor-specific parser extract provider-specific fields (e.g. codex resetsAtMs)
+  // Let provider config parser extract provider-specific fields first.
+  const providerConfig = executor?.getProviderConfig?.();
+  if (providerConfig && typeof providerConfig.parseError === "function") {
+    try {
+      const parsed = providerConfig.parseError({ response, bodyText });
+      if (parsed && typeof parsed === "object") {
+        const msg = parsed.message || DEFAULT_ERROR_MESSAGES[response.status] || `Upstream error: ${response.status}`;
+        return { statusCode: parsed.status || response.status, message: msg, resetsAtMs: parsed.resetsAtMs };
+      }
+    } catch { /* fall through */ }
+  }
+
+  // Legacy executor-specific parser (kept for specialized executors not yet migrated).
   if (executor && typeof executor.parseError === "function") {
     try {
       const parsed = executor.parseError(response, bodyText);
