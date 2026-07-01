@@ -9,8 +9,8 @@ vi.mock("../../open-sse/utils/proxyFetch.js", () => ({
 
 const { BaseExecutor } = await import("../../open-sse/executors/base.js");
 
-function res(status) {
-  return { status, headers: { get: () => "" } };
+function res(status, headers = {}) {
+  return { status, headers: { get: (k) => headers[k.toLowerCase()] ?? "" } };
 }
 
 function makeExec(config) {
@@ -103,5 +103,49 @@ describe("BaseExecutor.execute — computeRetryDelay hook veto", () => {
     // hook vetoes retry → no fallback url → returns the 429 response as-is
     expect(out.response.status).toBe(429);
     expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("BaseExecutor.execute — RetryEngine integration", () => {
+  it("honors Retry-After header and retries after the specified delay", async () => {
+    const ex = makeExec({ baseUrl: "https://x/api", retry: { 429: { attempts: 2, delayMs: 0, backoff: "fixed" } } });
+    fetchMock
+      .mockResolvedValueOnce(res(429, { "retry-after": "0" }))
+      .mockResolvedValueOnce(res(200));
+    const out = await ex.execute({ model: "m", body: {}, stream: false, credentials: creds });
+    expect(out.response.status).toBe(200);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(out.attemptedRetries).toBe(1);
+    expect(out.maxRetries).toBe(2);
+  });
+
+  it("does not retry non-retryable 400 errors", async () => {
+    const ex = makeExec({ baseUrl: "https://x/api" });
+    fetchMock.mockResolvedValueOnce(res(400));
+    const out = await ex.execute({ model: "m", body: {}, stream: false, credentials: creds });
+    expect(out.response.status).toBe(400);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(out.attemptedRetries).toBe(0);
+    expect(out.maxRetries).toBe(0);
+  });
+
+  it("does not retry 401 even when configured", async () => {
+    const ex = makeExec({ baseUrl: "https://x/api", retry: { 401: { attempts: 3, delayMs: 0 } } });
+    fetchMock.mockResolvedValueOnce(res(401));
+    const out = await ex.execute({ model: "m", body: {}, stream: false, credentials: creds });
+    expect(out.response.status).toBe(401);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("retries 429 using the default exponential_jitter policy", async () => {
+    const ex = makeExec({ baseUrl: "https://x/api" });
+    fetchMock
+      .mockResolvedValueOnce(res(429))
+      .mockResolvedValueOnce(res(200));
+    const out = await ex.execute({ model: "m", body: {}, stream: false, credentials: creds });
+    expect(out.response.status).toBe(200);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(out.attemptedRetries).toBe(1);
+    expect(out.maxRetries).toBe(3);
   });
 });
