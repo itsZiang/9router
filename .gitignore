@@ -78,3 +78,5 @@ open-sse.old/
 .tmp/
 .graphifyignore
 graphify-out/*
+
+app.log
