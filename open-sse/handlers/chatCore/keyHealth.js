@@ -16,7 +16,28 @@
 
 import { recordKeyFailure, recordKeySuccess, recordKeyTerminal, trackConnectionExtraKeys } from "../../services/apiKeyRotator";
 import { updateProviderConnection } from "../../stubs/lib/db/providers";
-export function recordKeyHealthStatus(status, creds, log) {
+import { isCreditsExhausted } from "../../services/accountFallback";
+
+/**
+ * Persist the updated health for the current key to the provider connection's
+ * providerSpecificData.apiKeyHealth. Shared by every terminal/failure branch.
+ */
+function persistKeyHealth(connId, psd, health, currentKeyId, prevStatus, updatedHealth, log) {
+  if (updatedHealth.status === prevStatus) return;
+  updateProviderConnection(connId, {
+    providerSpecificData: {
+      ...psd,
+      apiKeyHealth: {
+        ...health,
+        [currentKeyId]: updatedHealth
+      }
+    }
+  }).catch(err => {
+    log?.error?.("DB", `Failed to persist apiKeyHealth: ${err instanceof Error ? err.message : String(err)}`);
+  });
+}
+
+export function recordKeyHealthStatus(status, creds, log, opts = {}) {
   const connId = creds?.connectionId;
   if (!connId) return;
   const psd = creds.providerSpecificData;
@@ -45,28 +66,17 @@ export function recordKeyHealthStatus(status, creds, log) {
         log?.error?.("DB", `Failed to persist apiKeyHealth: ${err instanceof Error ? err.message : String(err)}`);
       });
     }
-  } else if (status === 402) {
-    // 402 "Insufficient account balance" is terminal for this key — the balance
-    // won't recover mid-session, so mark the current key invalid immediately
-    // (don't wait for FAILURE_THRESHOLD) so the rotator stops returning it.
-    // The per-connection path already terminalizes 402 via credits_exhausted;
-    // this closes the per-KEY gap (#5239) for API Key Round-Robin connections.
+  } else if (status === 402 || (status === 403 && isCreditsExhausted(opts.errorBody || ""))) {
+    // 402 "Insufficient account balance" — or 403 carrying a credits-exhausted
+    // body ("balance is insufficient", "insufficient balance", …) — is terminal
+    // for this key: the balance won't recover mid-session, so mark the current
+    // key invalid immediately (don't wait for FAILURE_THRESHOLD) so the rotator
+    // stops returning it. SiliconFlow and other OpenAI-compatible providers
+    // return 403 (not 402) for depleted accounts, so we route on the body text.
     const updatedHealth = recordKeyTerminal(connId, currentKeyId);
-    log?.error?.("AUTH", `402 on connection ${connId.slice(0, 8)} - key ${currentKeyId} marked invalid (insufficient balance)`);
+    log?.error?.("AUTH", `${status} on connection ${connId.slice(0, 8)} - key ${currentKeyId} marked invalid (insufficient balance)`);
     const prevStatus = health?.[currentKeyId]?.status;
-    if (updatedHealth.status !== prevStatus) {
-      updateProviderConnection(connId, {
-        providerSpecificData: {
-          ...psd,
-          apiKeyHealth: {
-            ...health,
-            [currentKeyId]: updatedHealth
-          }
-        }
-      }).catch(err => {
-        log?.error?.("DB", `Failed to persist apiKeyHealth: ${err instanceof Error ? err.message : String(err)}`);
-      });
-    }
+    persistKeyHealth(connId, psd, health, currentKeyId, prevStatus, updatedHealth, log);
   } else if (status >= 200 && status < 300) {
     const updatedHealth = recordKeySuccess(connId, currentKeyId);
     const prevStatus = health?.[currentKeyId]?.status;

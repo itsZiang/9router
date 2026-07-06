@@ -322,7 +322,7 @@ export async function handleChatCore({
 
   // Key-health updater extracted to chatCore/keyHealth.ts (#3501); bind the per-request log once
   // and delegate so the existing call sites stay byte-identical.
-  const recordKeyHealthStatus = (status, creds) => recordKeyHealthStatusFor(status, creds, log);
+  const recordKeyHealthStatus = (status, creds, _unused, opts) => recordKeyHealthStatusFor(status, creds, log, opts);
   const persistCodexQuotaState = async (headers, status = 0) => {
     const currentConnectionId = getCurrentConnectionId();
     if (provider !== "codex" || !currentConnectionId || !headers) return;
@@ -1829,6 +1829,18 @@ export async function handleChatCore({
               if (res.response.status === 401 && execCreds?.connectionId) {
                 recordKeyHealthStatus(401, execCreds);
               }
+              // 403 with a credits-exhausted body is terminal for the key (e.g.
+              // SiliconFlow "balance is insufficient"). Peek the body via clone()
+              // so the original stream stays untouched for downstream error parsing.
+              if (res.response.status === 403 && execCreds?.connectionId) {
+                try {
+                  const bodyPeek403 = await res.response.clone().text();
+                  recordKeyHealthStatus(403, execCreds, undefined, { errorBody: bodyPeek403 });
+                } catch {
+                  // body peek failed — leave the key alone; downstream classifier
+                  // still handles the 403 at connection level.
+                }
+              }
 
               // Qwen 429 strict quota backoff (wait 1.5s, 3s and retry)
               if (provider === "qwen" && res.response.status === 429 && attempts < maxAttempts - 1) {
@@ -2049,9 +2061,21 @@ export async function handleChatCore({
         // Non-stream: release semaphore immediately after reading full response body.
         const status = rawResult.response.status;
 
-        // Use execution credentials captured during request processing
+        // Use execution credentials captured during request processing.
+        // For 403 we need the response body to distinguish a credits-exhausted
+        // signal (terminal — disable key) from a generic forbidden (transient),
+        // so peek it via clone() before the body is consumed below.
         if (rawResult._executionCredentials?.connectionId && rawResult._executionCredentials?.apiKey) {
-          recordKeyHealthStatus(status, rawResult._executionCredentials);
+          let errorBodyForHealth = "";
+          if (status === 403) {
+            try {
+              errorBodyForHealth = await rawResult.response.clone().text();
+            } catch {
+              // Clone/read failed — fall through with empty body; keyHealth will
+              // treat it as a generic 403 (no-op), same as before this fix.
+            }
+          }
+          recordKeyHealthStatus(status, rawResult._executionCredentials, undefined, { errorBody: errorBodyForHealth });
         }
         releaseRawResultAccountSemaphore = typeof rawResult._accountSemaphoreRelease === "function" ? rawResult._accountSemaphoreRelease : () => {};
         const statusText = rawResult.response.statusText;
@@ -2274,8 +2298,12 @@ export async function handleChatCore({
     delete translatedBody.stream_options;
   }
 
-  // Handle 401/403 (and Qwen explicit expiration) - try token refresh using executor
-  if ((providerResponse.status === HTTP_STATUS.UNAUTHORIZED || providerResponse.status === HTTP_STATUS.FORBIDDEN || isQwenExpiredError) && !hadStreamOptions // Skip refresh if failure may be from stream_options removal, not auth
+  // Handle 401/403 (and Qwen explicit expiration) - try token refresh using executor.
+  // Skip the refresh path for API-key providers (no refreshToken) — their 401/403
+  // is a ban/quota signal, not a recoverable OAuth expiry. Saves the 3x retry
+  // delay and lets the error-classification layer handle it immediately.
+  const hasRefreshCapability = typeof credentials?.refreshToken === "string" && credentials.refreshToken.length > 0;
+  if ((providerResponse.status === HTTP_STATUS.UNAUTHORIZED || providerResponse.status === HTTP_STATUS.FORBIDDEN || isQwenExpiredError) && !hadStreamOptions && hasRefreshCapability // Skip refresh if failure may be from stream_options removal, not auth
   ) {
     // Fix A: wrap refreshCredentials in runWithOnPersist so the persist callback
     // executes INSIDE the per-connection mutex held by getAccessToken. This makes
@@ -2483,13 +2511,18 @@ export async function handleChatCore({
             const quotaScope = getQuotaScopeLabelForProvider(provider, model);
             console.warn(`[provider] Node ${errorConnectionId} ${quotaScope}-only quota exhausted (${statusCode}) for ${model} - ${Math.ceil(quotaCooldownMs / 1000)}s (cooldown_scope=${quotaScope}, ttl_source=${retryAfterMs ? "upstream" : "inferred"}, connection stays active)`);
           } else {
+            // Account-level credits exhausted (not a per-model quota) — disable
+            // the connection so the key pool stops dispatching to it. This is the
+            // branch SiliconFlow/OpenAI-compatible API-key providers hit when
+            // their balance runs out ("balance is insufficient").
             await updateProviderConnection(errorConnectionId, {
+              isActive: false,
               testStatus: "credits_exhausted",
               lastErrorType: errorType,
               lastError: message,
               errorCode: statusCode
             });
-            console.warn(`[provider] Node ${errorConnectionId} exhausted quota (${statusCode})`);
+            console.warn(`[provider] Node ${errorConnectionId} credits exhausted (${statusCode}) — disabling connection`);
           }
         } else if (errorType === PROVIDER_ERROR_TYPES.UNAUTHORIZED) {
           // Normal 401 (token/session auth issue): keep account active for refresh/re-auth.
