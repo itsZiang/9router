@@ -1,5 +1,10 @@
-// Auto-generated stub: stubs/shared/utils/circuitBreaker
-export const getAllCircuitBreakerStatuses = () => null,
-  getCircuitBreaker = () => null;
+const noopBreaker = {
+  getStatus: () => ({ state: "CLOSED" }),
+  reset: () => {},
+  recordFailure: () => {},
+  recordSuccess: () => {}
+};
+export const getAllCircuitBreakerStatuses = () => [],
+  getCircuitBreaker = () => noopBreaker;
 const _defaultExport = {};
 export default _defaultExport;

@@ -145,11 +145,9 @@ const isCloudEnv = () => {
 // Lazy import http2 (only in Node.js environment)
 let http2 = null;
 if (!isCloudEnv()) {
-  try {
-    http2 = await import("http2");
-  } catch {
-    http2 = null;
-  }
+  import("http2").then((m) => {
+    http2 = m.default || m;
+  }).catch(() => {});
 }
 
 // Phase 10: CURSOR_DEBUG=1 enables verbose streaming debug logs (decoded

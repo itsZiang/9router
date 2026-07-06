@@ -62,7 +62,9 @@ function recordBillableTokens(usage, apiKeyInfo, provider, model) {
   }
 }
 export function recordNonStreamingUsageStats(usage, ctx) {
-  if (!usage || typeof usage !== "object") return;
+  if (!usage || typeof usage !== "object") {
+    return;
+  }
   if (ctx.traceEnabled) logUsageTrace(usage, ctx.provider, ctx.connectionId);
   persistUsageRow(usage, ctx);
   recordBillableTokens(usage, ctx.apiKeyInfo, ctx.provider, ctx.model);

@@ -212,7 +212,34 @@ class AmeliaClient {
 // ── Client pool ──────────────────────────────────────────────────────────
 
 const POOL_MAX = 5;
+const POOL_MIN = 1; // keep at least one warm client to avoid cold-start latency
 const pool = [];
+let refillTimer = null;
+function scheduleRefill() {
+  // Background-fill the pool up to POOL_MIN so the next request doesn't
+  // pay the full init()+connect() cost after errors drained the pool.
+  if (refillTimer) return;
+  refillTimer = setTimeout(async () => {
+    refillTimer = null;
+    while (pool.length < POOL_MIN) {
+      try {
+        const client = new AmeliaClient();
+        await client.init();
+        await client.connect();
+        // Another caller may have pushed a client in the meantime.
+        if (pool.length >= POOL_MAX) {
+          client.close().catch(() => {});
+          break;
+        }
+        pool.push(client);
+      } catch {
+        // Could not warm a client now; the next request will lazily create one.
+        break;
+      }
+    }
+  }, 100);
+  refillTimer.unref?.();
+}
 async function getClient() {
   if (pool.length > 0) return pool.pop();
   const client = new AmeliaClient();
@@ -226,6 +253,7 @@ function releaseClient(client) {
   } else {
     client.close().catch(() => {});
   }
+  if (pool.length < POOL_MIN) scheduleRefill();
 }
 
 // ── Executor ─────────────────────────────────────────────────────────────
@@ -362,7 +390,17 @@ export class ChipotleExecutor extends BaseExecutor {
         transformedBody: body
       };
     } catch (err) {
-      if (client) client.close().catch(() => {});
+      // Return the client to the pool if it is still connected, so the pool
+      // does not deplete to 0 under sustained transient errors (timeouts,
+      // aborts). Only close the client when the WebSocket itself is dead.
+      if (client) {
+        if (client.stompConnected && client.ws && client.ws.readyState === 1) {
+          releaseClient(client);
+        } else {
+          client.close().catch(() => {});
+        }
+        client = null;
+      }
       const msg = err instanceof Error ? err.message : String(err);
       log?.error?.("CHIPOTLE", `Error: ${msg}`);
       return {

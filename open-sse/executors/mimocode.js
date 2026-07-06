@@ -252,6 +252,16 @@ export class MimocodeExecutor extends BaseExecutor {
           existing.add(fp);
         }
       }
+      // Prune accounts whose fingerprint was removed from credentials so
+      // pickAccount() does not keep cycling through stale/dead entries.
+      const live = new Set(fingerprints.filter(fp => typeof fp === "string"));
+      this.accounts = this.accounts.filter(a => live.has(a.fingerprint));
+      // Keep nextAccountIdx in bounds after pruning.
+      if (this.accounts.length > 0) {
+        this.nextAccountIdx = this.nextAccountIdx % this.accounts.length;
+      } else {
+        this.nextAccountIdx = 0;
+      }
     }
 
     // #3837: resolve each account's structured proxy config from accountProxies.

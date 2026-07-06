@@ -52,6 +52,7 @@ import { MimocodeExecutor } from "./mimocode";
 import { GrokCliExecutor } from "./grok-cli";
 import { CodeBuddyCnExecutor } from "./codebuddy-cn";
 import { ZenmuxFreeExecutor } from "./zenmux-free";
+import { KimchiExecutor } from "./kimchi";
 const executors = {
   antigravity: new AntigravityExecutor(),
   agy: new AntigravityExecutor(),
@@ -188,7 +189,8 @@ const executors = {
   cbcn: new CodeBuddyCnExecutor(),
   // Alias for codebuddy-cn
   "zenmux-free": new ZenmuxFreeExecutor(),
-  zmf: new ZenmuxFreeExecutor() // Alias for zenmux-free
+  zmf: new ZenmuxFreeExecutor(), // Alias for zenmux-free
+  kimchi: new KimchiExecutor()
 };
 const defaultCache = new Map();
 export function getExecutor(provider) {

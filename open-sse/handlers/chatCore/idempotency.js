@@ -17,7 +17,7 @@ export async function checkIdempotencyCache({
   log
 }) {
   const idempotencyKey = getIdempotencyKey(clientRawRequest?.headers);
-  const cachedIdemp = checkIdempotency(idempotencyKey);
+  const cachedIdemp = await checkIdempotency(idempotencyKey);
   if (cachedIdemp) {
     log?.debug?.("IDEMPOTENCY", `Hit for key=${idempotencyKey?.slice(0, 12)}...`);
     const idempotentUsage = cachedIdemp.response && typeof cachedIdemp.response === "object" ? cachedIdemp.response.usage : undefined;

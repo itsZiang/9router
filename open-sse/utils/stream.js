@@ -1258,7 +1258,9 @@ export function createSSEStream(options = {}) {
                       const now = Date.now();
                       try {
                         recordToolLatency(provider || "unknown", toolTs ? now - toolTs : null, lastChunkTs ? now - lastChunkTs : null);
-                      } catch {}
+            } catch (err) {
+               console.error("[Stream] recordToolLatency failed:", err?.message || err);
+             }
                       pendingToolFinishTime = null;
                     }
                   }
@@ -1804,7 +1806,9 @@ export function createSSEStream(options = {}) {
                   includeEvents: false
                 })
               });
-            } catch {}
+            } catch (err) {
+              console.error("[Stream] flush onComplete failed:", err?.message || err);
+            }
           } else {
             clearPendingRequestFromStream();
           }
@@ -1884,7 +1888,9 @@ export function createSSEStream(options = {}) {
                 })
               });
               failureHandled = true;
-            } catch {}
+            } catch (err) {
+              console.error("[Stream] error-path onComplete failed:", err?.message || err);
+            }
           }
           clearIdleTimer();
           if (!failureHandled) {

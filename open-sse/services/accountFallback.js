@@ -144,10 +144,18 @@ export function isAccountDeactivated(errorText) {
 
 /**
  * T10: Returns true if response body indicates credits/quota are permanently exhausted.
+ *
+ * In addition to the exact `CREDITS_EXHAUSTED_SIGNALS` substrings, this also catches
+ * any text where BOTH "insufficient" and "balance" appear together — providers phrase
+ * the out-of-credit signal differently ("balance is insufficient", "insufficient balance",
+ * "your account balance is insufficient", etc.) and a substring check on every word-order
+ * variant is fragile. Requiring both words is specific enough (false positives are
+ * negligible: no legitimate success response contains both words).
  */
 export function isCreditsExhausted(errorText) {
   const lower = String(errorText || "").toLowerCase();
-  return CREDITS_EXHAUSTED_SIGNALS.some(sig => lower.includes(sig));
+  if (CREDITS_EXHAUSTED_SIGNALS.some(sig => lower.includes(sig))) return true;
+  return lower.includes("insufficient") && lower.includes("balance");
 }
 
 /**

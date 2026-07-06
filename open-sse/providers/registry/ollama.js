@@ -16,9 +16,9 @@ export default {
   },
   category: "freeTier",
   transport: {
-    baseUrl: "https://ollama.com/api/chat",
+    baseUrl: "https://ollama.com/v1/chat/completions",
     validateUrl: "https://ollama.com/api/tags",
-    format: "ollama",
+    format: "openai",
   },
   models: [
     { id: "gpt-oss:120b", name: "GPT OSS 120B" },

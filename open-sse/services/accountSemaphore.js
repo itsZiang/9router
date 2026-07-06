@@ -8,6 +8,15 @@
 
 const DEFAULT_TIMEOUT_MS = 30_000;
 const DEFAULT_MAX_QUEUE_SIZE = 20;
+/**
+ * Safety-net: if a caller acquires a slot and never calls the release function
+ * (e.g. an unhandled rejection with no abort signal), `running` would stay
+ * elevated forever and block all future acquisitions for that key. This
+ * watchdog auto-releases the slot after the deadline so the gate recovers
+ * without a process restart. The release fn clears the watchdog when called
+ * normally, so this only fires on the leak path.
+ */
+const DEFAULT_STUCK_RELEASE_MS = 10 * 60_000; // 10 min
 const gates = new Map();
 
 /**
@@ -83,17 +92,18 @@ function drainQueue(semaphoreKey) {
     if (!next) break;
     clearTimeout(next.timer);
     gate.running++;
-    next.resolve(createReleaseFn(semaphoreKey));
+    next.resolve(createReleaseFn(semaphoreKey, armWatchdog(semaphoreKey, DEFAULT_STUCK_RELEASE_MS)));
   }
   if (gate.running === 0 && gate.queue.length === 0) {
     scheduleCleanup(semaphoreKey);
   }
 }
-function createReleaseFn(semaphoreKey) {
+function createReleaseFn(semaphoreKey, watchdogTimer = null) {
   let released = false;
   return () => {
     if (released) return;
     released = true;
+    if (watchdogTimer) clearTimeout(watchdogTimer);
     const gate = gates.get(semaphoreKey);
     if (!gate) return;
     if (gate.running > 0) {
@@ -105,6 +115,24 @@ function createReleaseFn(semaphoreKey) {
     }
     scheduleCleanup(semaphoreKey);
   };
+}
+function armWatchdog(semaphoreKey, ms) {
+  const timer = setTimeout(() => {
+    const gate = gates.get(semaphoreKey);
+    if (!gate) return;
+    // The caller never released within the watchdog window. Force-decrement
+    // so the gate can recover instead of staying stuck at its concurrency cap.
+    if (gate.running > 0) {
+      gate.running--;
+    }
+    if (gate.queue.length > 0) {
+      drainQueue(semaphoreKey);
+      return;
+    }
+    scheduleCleanup(semaphoreKey);
+  }, ms);
+  timer.unref?.();
+  return timer;
 }
 function createSemaphoreTimeoutError(semaphoreKey, timeoutMs) {
   const error = new Error(`Semaphore timeout after ${timeoutMs}ms for ${semaphoreKey}`);
@@ -139,7 +167,8 @@ export function acquire(semaphoreKey, {
   clearCleanupTimer(gate);
   if (gate.running < gate.maxConcurrency && !isBlocked(gate)) {
     gate.running++;
-    return Promise.resolve(createReleaseFn(semaphoreKey));
+    const watchdog = armWatchdog(semaphoreKey, DEFAULT_STUCK_RELEASE_MS);
+    return Promise.resolve(createReleaseFn(semaphoreKey, watchdog));
   }
   if (gate.queue.length >= maxQueueSize) {
     const err = new Error(`Semaphore queue full (${maxQueueSize}) for ${semaphoreKey}`);

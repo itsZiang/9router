@@ -6,6 +6,7 @@
 export * from "./providers/shared";
 export { REGISTRY } from "./providers/index";
 import { REGISTRY } from "./providers/index";
+import { PROVIDERS as PROVIDERS_REGISTRY } from "../providers/index";
 // ── Generator Functions ───────────────────────────────────────────────────
 
 /** Generate legacy PROVIDERS object shape for constants.js backward compatibility */
@@ -59,6 +60,16 @@ export function generateLegacyProviders() {
     if (entry.clientVersion) p.clientVersion = entry.clientVersion;
     providers[id] = p;
   }
+
+  // Fall back to provider registry for providers not yet in the config registry.
+  // Prevents silent routing to OpenAI when a provider exists in the provider
+  // registry but hasn't been migrated to the config registry yet.
+  for (const [id, config] of Object.entries(PROVIDERS_REGISTRY)) {
+    if (!providers[id]) {
+      providers[id] = { ...config };
+    }
+  }
+
   return providers;
 }
 

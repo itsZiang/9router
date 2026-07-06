@@ -14,6 +14,8 @@ export function getUpstreamTimeoutConfig(env, warn) {
     streamIdleTimeoutMs: 600000,
     streamReadinessTimeoutMs: 45000,
     streamReadinessMaxTimeoutMs: 90000,
+    fetchBodyTimeoutMs: 30000,
+    sseHeartbeatIntervalMs: 10000,
   };
 }
 

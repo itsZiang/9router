@@ -52,7 +52,9 @@ function recordStreamingBillableTokens(usage, ctx) {
   }
 }
 export function recordStreamingUsageStats(usage, ctx) {
-  if (!usage || typeof usage !== "object") return;
+  if (!usage || typeof usage !== "object") {
+    return;
+  }
   persistStreamingUsageRow(usage, ctx);
   recordStreamingBillableTokens(usage, ctx);
 }

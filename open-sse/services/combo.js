@@ -464,8 +464,23 @@ export async function handleComboChat({
   relayOptions,
   signal,
   apiKeyAllowedConnections = null,
-  nesting = null
+  nesting = null,
+  // Legacy / fallback parameters
+  comboName,
+  models,
+  comboStrategy,
+  comboStickyLimit
 }) {
+  if (!combo) {
+    combo = {
+      name: comboName,
+      models: models || [],
+      strategy: comboStrategy,
+      config: {
+        stickyRoundRobinLimit: comboStickyLimit
+      }
+    };
+  }
   const comboCtx = createComboContext({
     body,
     combo,
@@ -1775,7 +1790,8 @@ export async function handleComboChat({
           }
         })().catch(err => {
           const logError = log.error ?? log.warn;
-          logError("COMBO", `Speculative task error for target ${i}`, err);
+          const errMsg = err instanceof Error ? err.message : String(err);
+          logError("COMBO", `Speculative task error for target ${i}`, errMsg);
         });
         runningTasks.add(task);
         task.finally(() => runningTasks.delete(task));

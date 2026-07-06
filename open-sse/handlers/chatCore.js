@@ -113,6 +113,8 @@ import { recordStreamingUsageStats } from "./chatCore/streamingUsageStats";
 import { recordStreamingCost } from "./chatCore/streamingCost";
 import { parseNonStreamingResponseBody } from "./chatCore/nonStreamingResponseParse";
 import { recordNonStreamingUsageStats } from "./chatCore/nonStreamingUsageStats";
+import { buildRequestDetail, extractRequestConfig } from "./chatCore/requestDetail";
+import { saveRequestDetail } from "@/lib/usageDb";
 import { normalizeExecutorResult, executeWithUpstreamStartTimeout } from "./chatCore/upstreamTimeouts";
 import { getModelNormalizeToolCallId, getModelPreserveOpenAIDeveloperRole } from "@/lib/localDb";
 import { getProviderCredentials, extractSessionAffinityKey } from "@/sse/services/auth";
@@ -2861,6 +2863,23 @@ export async function handleChatCore({
       comboStrategy,
       endpoint: endpointPath
     });
+    // Save structured request detail for the Details tab (/dashboard/usage?tab=details)
+    saveRequestDetail(buildRequestDetail({
+      provider, model, connectionId: successConnectionId,
+      latency: { ttft: Date.now() - startTime, total: Date.now() - startTime },
+      tokens: usage || { prompt_tokens: 0, completion_tokens: 0 },
+      request: extractRequestConfig(body, stream),
+      providerRequest: finalBody || translatedBody || null,
+      providerResponse: responseBody || null,
+      response: {
+        content: translatedResponse?.choices?.[0]?.message?.content || translatedResponse?.content || null,
+        thinking: translatedResponse?.choices?.[0]?.message?.reasoning_content || translatedResponse?.reasoning_content || null,
+        finish_reason: translatedResponse?.choices?.[0]?.finish_reason || "unknown"
+      },
+      status: "success"
+    }, { endpoint: endpointPath || null })).catch(err => {
+      console.error("[RequestDetail] Failed to save non-streaming request:", err?.message || err);
+    });
 
     // Translate response to client's expected format (usually OpenAI)
     // Pass toolNameMap so Claude OAuth proxy_ prefix is stripped in tool_use blocks (#605)
@@ -3209,146 +3228,171 @@ export async function handleChatCore({
     errorCode: streamErrorCode,
     ttft
   }) => {
-    const normalizedStreamStatus = streamStatus || 200;
-    if (streamCompletionRecorded) return;
-    streamCompletionRecorded = true;
-    if (normalizedStreamStatus !== 200) {
-      if (streamFailureCompletionRecorded) return;
-      streamFailureCompletionRecorded = true;
-    }
-    const cacheUsageLogMeta = buildCacheUsageLogMeta(streamUsage);
-    const streamConnectionId = getCurrentConnectionId();
-    if (normalizedStreamStatus === 200) {
-      void maybeSyncClaudeExtraUsageState({
+    try {
+      const normalizedStreamStatus = streamStatus || 200;
+      if (streamCompletionRecorded) return;
+      streamCompletionRecorded = true;
+      if (normalizedStreamStatus !== 200) {
+        if (streamFailureCompletionRecorded) return;
+        streamFailureCompletionRecorded = true;
+      }
+      const cacheUsageLogMeta = buildCacheUsageLogMeta(streamUsage);
+      const streamConnectionId = getCurrentConnectionId();
+      if (normalizedStreamStatus === 200) {
+        void maybeSyncClaudeExtraUsageState({
+          provider,
+          connectionId: streamConnectionId,
+          providerSpecificData: credentials?.providerSpecificData,
+          log
+        });
+      }
+
+      // Reasoning Replay Cache (#1628): Capture reasoning_content from streaming responses
+      // with tool_calls so it can be replayed on subsequent turns (DeepSeek V4, Kimi K2, etc.)
+      if (normalizedStreamStatus === 200 && streamResponseBody) {
+        try {
+          const body = streamResponseBody;
+          const choices = body.choices;
+          const msg = choices?.[0]?.message;
+          cacheReasoningFromAssistantMessage(msg, provider, model, {
+            requestId: skillRequestId,
+            messageIndex: 0
+          });
+        } catch {
+          // Cache capture is non-critical — never block the stream
+        }
+      }
+      effectiveServiceTier = resolveReportedServiceTier(streamResponseBody) ?? effectiveServiceTier;
+
+      // Context Editing telemetry (streaming): the reconstructed stream body now carries
+      // context_management.applied_edits from the final message_delta snapshot. Mirror the
+      // non-streaming hook so streaming context-clear savings also surface under engine
+      // "context-editing" in compression analytics. Best-effort, Claude-only.
+      if (normalizedStreamStatus === 200) {
+        recordContextEditingTelemetryHook({
+          contextEditingEnabled,
+          provider,
+          responseBody: streamResponseBody,
+          skillRequestId,
+          log
+        });
+      }
+      streamFailure.finalizeStreamRequestLog({
+        pendingRequestId,
+        model,
         provider,
         connectionId: streamConnectionId,
-        providerSpecificData: credentials?.providerSpecificData,
-        log
+        providerResponse: providerPayload ?? streamResponseBody ?? undefined,
+        clientResponse: clientPayload ?? streamResponseBody ?? undefined,
+        status: normalizedStreamStatus,
+        error: streamError,
+        errorCode: streamErrorCode
       });
-    }
 
-    // Reasoning Replay Cache (#1628): Capture reasoning_content from streaming responses
-    // with tool_calls so it can be replayed on subsequent turns (DeepSeek V4, Kimi K2, etc.)
-    if (normalizedStreamStatus === 200 && streamResponseBody) {
-      try {
-        const body = streamResponseBody;
-        const choices = body.choices;
-        const msg = choices?.[0]?.message;
-        cacheReasoningFromAssistantMessage(msg, provider, model, {
-          requestId: skillRequestId,
-          messageIndex: 0
-        });
-      } catch {
-        // Cache capture is non-critical — never block the stream
+      // Track cache token metrics for streaming responses
+      if (streamUsage && typeof streamUsage === "object") {
+        attachCompressionUsageReceiptAfterAnalytics(streamUsage, "stream");
       }
-    }
-    effectiveServiceTier = resolveReportedServiceTier(streamResponseBody) ?? effectiveServiceTier;
-
-    // Context Editing telemetry (streaming): the reconstructed stream body now carries
-    // context_management.applied_edits from the final message_delta snapshot. Mirror the
-    // non-streaming hook so streaming context-clear savings also surface under engine
-    // "context-editing" in compression analytics. Best-effort, Claude-only.
-    if (normalizedStreamStatus === 200) {
-      recordContextEditingTelemetryHook({
-        contextEditingEnabled,
+      recordStreamingUsageStats(streamUsage, {
         provider,
-        responseBody: streamResponseBody,
-        skillRequestId,
+        model,
+        streamStatus: normalizedStreamStatus,
+        startTime,
+        ttft,
+        streamErrorCode,
+        connectionId: streamConnectionId,
+        apiKeyInfo,
+        effectiveServiceTier,
+        isCombo,
+        comboStrategy,
+        endpoint: endpointPath
+      });
+      // Save structured request detail for the Details tab (/dashboard/usage?tab=details)
+      const streamDetailId = `${Date.now()}-${Math.random().toString(36).slice(2, 11)}`;
+      saveRequestDetail(buildRequestDetail({
+        provider, model, connectionId: streamConnectionId,
+        latency: {
+          ttft: ttft ? ttft - startTime : Date.now() - startTime,
+          total: Date.now() - startTime
+        },
+        tokens: streamUsage || { prompt_tokens: 0, completion_tokens: 0 },
+        request: extractRequestConfig(body, stream),
+        providerRequest: finalBody || translatedBody || null,
+        providerResponse: providerPayload ?? streamResponseBody ?? null,
+        response: {
+          content: streamResponseBody?.choices?.[0]?.message?.content || streamResponseBody?.content || null,
+          thinking: streamResponseBody?.choices?.[0]?.message?.reasoning_content || streamResponseBody?.reasoning_content || null,
+          type: "streaming"
+        },
+        status: normalizedStreamStatus === 200 ? "success" : "error"
+      }, { id: streamDetailId, endpoint: endpointPath || null })).catch(err => {
+        console.error("[RequestDetail] Failed to save streaming request:", err?.message || err);
+      });
+      persistAttemptLogs({
+        status: normalizedStreamStatus,
+        error: streamError || undefined,
+        tokens: streamUsage || {},
+        responseBody: streamResponseBody ?? undefined,
+        providerRequest: finalBody || translatedBody,
+        providerResponse: providerPayload,
+        clientResponse: clientPayload ?? streamResponseBody ?? undefined,
+        claudeCacheMeta: claudePromptCacheLogMeta,
+        claudeCacheUsageMeta: cacheUsageLogMeta,
+        cacheSource: "upstream"
+      });
+      recordStreamingCost({
+        apiKeyId: apiKeyInfo?.id,
+        provider,
+        model,
+        streamUsage,
+        serviceTier: effectiveServiceTier,
+        calculateCost,
+        recordCost
+      });
+
+      // === Quota Share POST-hook streaming (B/F7) — fire-and-forget, fail-open ===
+      // Resolve the real per-request cost (calculateCost) so USD-unit pools accrue
+      // on streaming traffic too; this previously recorded usd:0 hardcoded, which
+      // meant DeepSeek-style `usd/monthly` shared pools never blocked on streams.
+      scheduleStreamingQuotaShareConsumption({
+        apiKeyId: apiKeyInfo?.id,
+        connectionId: credentials?.connectionId,
+        provider,
+        model,
+        streamUsage,
+        streamStatus: normalizedStreamStatus,
+        serviceTier: effectiveServiceTier,
+        calculateCost,
         log
       });
-    }
-    streamFailure.finalizeStreamRequestLog({
-      pendingRequestId,
-      model,
-      provider,
-      connectionId: streamConnectionId,
-      providerResponse: providerPayload ?? streamResponseBody ?? undefined,
-      clientResponse: clientPayload ?? streamResponseBody ?? undefined,
-      status: normalizedStreamStatus,
-      error: streamError,
-      errorCode: streamErrorCode
-    });
+      // === /Quota Share POST-hook streaming ===
 
-    // Track cache token metrics for streaming responses
-    if (streamUsage && typeof streamUsage === "object") {
-      attachCompressionUsageReceiptAfterAnalytics(streamUsage, "stream");
-    }
-    recordStreamingUsageStats(streamUsage, {
-      provider,
-      model,
-      streamStatus: normalizedStreamStatus,
-      startTime,
-      ttft,
-      streamErrorCode,
-      connectionId: streamConnectionId,
-      apiKeyInfo,
-      effectiveServiceTier,
-      isCombo,
-      comboStrategy,
-      endpoint: endpointPath
-    });
-    persistAttemptLogs({
-      status: normalizedStreamStatus,
-      error: streamError || undefined,
-      tokens: streamUsage || {},
-      responseBody: streamResponseBody ?? undefined,
-      providerRequest: finalBody || translatedBody,
-      providerResponse: providerPayload,
-      clientResponse: clientPayload ?? streamResponseBody ?? undefined,
-      claudeCacheMeta: claudePromptCacheLogMeta,
-      claudeCacheUsageMeta: cacheUsageLogMeta,
-      cacheSource: "upstream"
-    });
-    recordStreamingCost({
-      apiKeyId: apiKeyInfo?.id,
-      provider,
-      model,
-      streamUsage,
-      serviceTier: effectiveServiceTier,
-      calculateCost,
-      recordCost
-    });
-
-    // === Quota Share POST-hook streaming (B/F7) — fire-and-forget, fail-open ===
-    // Resolve the real per-request cost (calculateCost) so USD-unit pools accrue
-    // on streaming traffic too; this previously recorded usd:0 hardcoded, which
-    // meant DeepSeek-style `usd/monthly` shared pools never blocked on streams.
-    scheduleStreamingQuotaShareConsumption({
-      apiKeyId: apiKeyInfo?.id,
-      connectionId: credentials?.connectionId,
-      provider,
-      model,
-      streamUsage,
-      streamStatus: normalizedStreamStatus,
-      serviceTier: effectiveServiceTier,
-      calculateCost,
-      log
-    });
-    // === /Quota Share POST-hook streaming ===
-
-    if (memoryOwnerId && memorySettings?.enabled && memorySettings.maxTokens > 0 && streamStatus === 200) {
-      const requestMemoryText = extractMemoryTextFromRequestBody(body);
-      if (requestMemoryText) {
-        extractFacts(requestMemoryText, memoryOwnerId, pipelineSessionId);
+      if (memoryOwnerId && memorySettings?.enabled && memorySettings.maxTokens > 0 && streamStatus === 200) {
+        const requestMemoryText = extractMemoryTextFromRequestBody(body);
+        if (requestMemoryText) {
+          extractFacts(requestMemoryText, memoryOwnerId, pipelineSessionId);
+        }
+        const streamedMemoryText = extractMemoryTextFromResponse(streamResponseBody ?? null);
+        if (streamedMemoryText) {
+          extractFacts(streamedMemoryText, memoryOwnerId, pipelineSessionId);
+        }
       }
-      const streamedMemoryText = extractMemoryTextFromResponse(streamResponseBody ?? null);
-      if (streamedMemoryText) {
-        extractFacts(streamedMemoryText, memoryOwnerId, pipelineSessionId);
-      }
-    }
 
-    // Semantic cache: store assembled streaming response for future cache hits
-    storeStreamingSemanticCacheResponse({
-      enabled: semanticCacheEnabled,
-      streamStatus,
-      streamResponseBody,
-      body,
-      headers: clientRawRequest?.headers,
-      model,
-      apiKeyId: apiKeyInfo?.id ?? undefined,
-      streamUsage,
-      log
-    });
+      // Semantic cache: store assembled streaming response for future cache hits
+      storeStreamingSemanticCacheResponse({
+        enabled: semanticCacheEnabled,
+        streamStatus,
+        streamResponseBody,
+        body,
+        headers: clientRawRequest?.headers,
+        model,
+        apiKeyId: apiKeyInfo?.id ?? undefined,
+        streamUsage,
+        log
+      });
+    } catch (err) {
+      console.error("[Stream] onStreamComplete callback failed:", err?.message || err);
+    }
   };
   const streamFailureFinalizers = streamFailure.createStreamFailureFinalizers({
     isFailureCompletionRecorded: () => streamFailureCompletionRecorded,
