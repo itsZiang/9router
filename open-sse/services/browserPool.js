@@ -69,7 +69,10 @@ async function resolveCloakLaunch() {
   if (state.cloakLaunchResolved) return state.cloakLaunch;
   state.cloakLaunchResolved = true;
   try {
-    const mod = await import(getCloakbrowserModuleId());
+    // webpackIgnore tells webpack not to statically analyse this import —
+    // cloakbrowser is an optional runtime-only package, intentionally resolved
+    // at runtime so Turbopack/webpack never tries to bundle it.
+    const mod = await import(/* webpackIgnore: true */ getCloakbrowserModuleId());
     state.cloakLaunch = mod.launch ?? null;
   } catch {
     state.cloakLaunch = null;

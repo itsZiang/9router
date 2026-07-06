@@ -264,7 +264,7 @@ export async function handleChatCore({
   // to avoid an extra DB read on the hot path. Falls through to getCachedSettings()
   // only when this function is called outside the normal chat dispatch.
   {
-    const _s = cachedSettings ?? (await getCachedSettings());
+    const _s = (cachedSettings ?? (await getCachedSettings())) || {};
     if (_s.customSystemPromptEnabled === true && typeof _s.customSystemPrompt === "string" && _s.customSystemPrompt) {
       body = injectCustomSystemPrompt(body, _s.customSystemPrompt);
       log?.debug?.("CUSTOMSP", "custom system prompt injected");
@@ -516,7 +516,7 @@ export async function handleChatCore({
   }
   const noLogEnabled = apiKeyInfo?.noLog === true;
   // Consolidate settings reads — fetch once, reuse throughout the request
-  const settings = cachedSettings ?? (await getCachedSettings());
+  const settings = (cachedSettings ?? (await getCachedSettings())) || {};
   // Opt-in tool-source diagnostics (#1825): summarize the request's tool definitions
   // (count + MCP/hosted/client source breakdown + first names) as a single debug line.
   if (settings.logToolSources === true) {

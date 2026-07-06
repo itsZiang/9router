@@ -27,7 +27,7 @@ export async function resolveExecutorWithProxy(prov, log) {
   // Read custom fallback codes from settings. Default: 5xx + 429 + network errors.
   let fallbackCodes = [429, 500, 502, 503, 504];
   try {
-    const allSettings = await getCachedSettings();
+    const allSettings = (await getCachedSettings()) || {};
     if (typeof allSettings.cliproxyapi_fallback_codes === "string" && allSettings.cliproxyapi_fallback_codes.trim()) {
       const parsed = allSettings.cliproxyapi_fallback_codes.split(",").map(s => Number.parseInt(s.trim(), 10)).filter(n => !Number.isNaN(n));
       if (parsed.length > 0) fallbackCodes = parsed;

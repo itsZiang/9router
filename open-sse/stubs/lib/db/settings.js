@@ -1,4 +1,5 @@
 // Auto-generated stub: stubs/lib/db/settings
-export const getSettings = () => null;
+export const getSettings = async () => ({});
 const _defaultExport = {};
 export default _defaultExport;
+

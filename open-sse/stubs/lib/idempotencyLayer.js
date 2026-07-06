@@ -1,6 +1,6 @@
 // Auto-generated stub: stubs/lib/idempotencyLayer
-export const checkIdempotency = () => undefined,
+export const checkIdempotency = async () => undefined,
   getIdempotencyKey = () => null,
-  saveIdempotency = () => undefined;
+  saveIdempotency = async () => undefined;
 const _defaultExport = {};
 export default _defaultExport;
