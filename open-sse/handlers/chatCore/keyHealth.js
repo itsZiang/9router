@@ -15,7 +15,9 @@
  */
 
 import { recordKeyFailure, recordKeySuccess, recordKeyTerminal, trackConnectionExtraKeys } from "../../services/apiKeyRotator";
-import { updateProviderConnection } from "../../stubs/lib/db/providers";
+// Real SQLite repo (NOT the no-op stub) — see chatCore.js import note.
+// apiKeyHealth persists must actually write to the DB.
+import { updateProviderConnection } from "@/lib/localDb";
 import { isCreditsExhausted } from "../../services/accountFallback";
 
 /**

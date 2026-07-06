@@ -1,5 +1,6 @@
 import { getCodexModelScope } from "../../config/codexQuotaScopes";
-import { getProviderConnectionById, updateProviderConnection } from "../../stubs/lib/db/providers";
+// Real SQLite repo (NOT the no-op stub) — see chatCore.js import note.
+import { getProviderConnectionById, updateProviderConnection } from "@/lib/localDb";
 function asProviderData(value) {
   return value && typeof value === "object" ? value : {};
 }

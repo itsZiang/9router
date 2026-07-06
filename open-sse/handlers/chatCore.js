@@ -68,7 +68,13 @@ import { COOLDOWN_MS, HTTP_STATUS, PROVIDER_MAX_TOKENS, STREAM_READINESS_MAX_TIM
 import { createRecoverableStream, makeContinuationBody } from "../services/streamRecovery";
 import { resolveResilienceSettings, isStreamRecoveryExplicitlyConfigured } from "../stubs/lib/resilience/settings";
 import { classifyProviderError, PROVIDER_ERROR_TYPES, isEmptyContentResponse } from "../services/errorClassifier";
-import { updateProviderConnection, getProviderConnectionById } from "../stubs/lib/db/providers";
+// IMPORTANT: this MUST point at the real SQLite repo (via the @/ alias), not the
+// open-sse stub. The stub `../stubs/lib/db/providers` is a host-agnostic no-op
+// (`updateProviderConnection = async () => undefined`); using it here means the
+// credits-exhausted / banned / deactivated disable branches log "disabling
+// connection" but never persist isActive:false, so the key keeps getting picked.
+// @/lib/localDb is the same real shim tokenRefresh.js + usageDb already use.
+import { updateProviderConnection, getProviderConnectionById } from "@/lib/localDb";
 import { wasRefreshTokenRotated } from "../services/refreshSerializer";
 import { connectionHasExtraKeys } from "../services/apiKeyRotator";
 import { recordKeyHealthStatus as recordKeyHealthStatusFor } from "./chatCore/keyHealth";
@@ -136,7 +142,7 @@ import { extractUsageFromResponse } from "./usageExtractor";
 import { sanitizeOpenAIResponse, sanitizeResponsesApiResponse, shouldParseTextualReasoningTags } from "./responseSanitizer";
 import { withRateLimit, updateFromHeaders, updateFromResponseBody, initializeRateLimits } from "../services/rateLimitManager";
 import { acquire as acquireAccountSemaphore, markBlocked as markAccountSemaphoreBlocked } from "../services/accountSemaphore";
-import { lockModel, lockModelIfPerModelQuota } from "../services/accountFallback";
+import { lockModel, lockModelIfPerModelQuota, isCreditsExhausted } from "../services/accountFallback";
 import { saveIdempotency } from "../stubs/lib/idempotencyLayer";
 import { isModelUnavailableError, getNextFamilyFallback, isContextOverflowError, findLargerContextModel, getModelFamily } from "../services/modelFamilyFallback";
 import { computeRequestHash, deduplicate, shouldDeduplicate } from "../services/requestDedup";
@@ -2504,10 +2510,16 @@ export async function handleChatCore({
           if (accountSemaphoreKey) {
             markAccountSemaphoreBlocked(accountSemaphoreKey, quotaCooldownMs);
           }
-          if (isModelScope() && errorConnectionId) {
+          // Account-level balance exhaustion (e.g. SiliconFlow "Sorry, your account balance
+          // is insufficient") is never a per-model quota. Even for providers otherwise
+          // treated as per-model quota (openai-compatible-* custom providers), this signal
+          // means the whole API key is depleted and the connection must be disabled.
+          const errorBodyForClassification = typeof upstreamErrorBody === "string" ? upstreamErrorBody : (upstreamErrorBody ? JSON.stringify(upstreamErrorBody) : "");
+          const isAccountCreditsExhausted = isCreditsExhausted(`${message} ${errorBodyForClassification}`);
+          if (!isAccountCreditsExhausted && isModelScope() && errorConnectionId) {
             lockModel(provider, errorConnectionId, model, "quota_exhausted", quotaCooldownMs);
             console.warn(`[provider] Node ${errorConnectionId} ModelScope model quota exhausted (${statusCode}) for ${model} - ${Math.ceil(quotaCooldownMs / 1000)}s (connection stays active)`);
-          } else if (lockModelIfPerModelQuota(provider, errorConnectionId, model, "quota_exhausted", quotaCooldownMs)) {
+          } else if (!isAccountCreditsExhausted && lockModelIfPerModelQuota(provider, errorConnectionId, model, "quota_exhausted", quotaCooldownMs)) {
             const quotaScope = getQuotaScopeLabelForProvider(provider, model);
             console.warn(`[provider] Node ${errorConnectionId} ${quotaScope}-only quota exhausted (${statusCode}) for ${model} - ${Math.ceil(quotaCooldownMs / 1000)}s (cooldown_scope=${quotaScope}, ttl_source=${retryAfterMs ? "upstream" : "inferred"}, connection stays active)`);
           } else {
@@ -2896,25 +2908,6 @@ export async function handleChatCore({
       comboStrategy,
       endpoint: endpointPath
     });
-    // Save structured request detail for the Details tab (/dashboard/usage?tab=details)
-    saveRequestDetail(buildRequestDetail({
-      provider, model, connectionId: successConnectionId,
-      latency: { ttft: Date.now() - startTime, total: Date.now() - startTime },
-      tokens: usage || { prompt_tokens: 0, completion_tokens: 0 },
-      request: extractRequestConfig(body, stream),
-      providerRequest: finalBody || translatedBody || null,
-      providerResponse: responseBody || null,
-      response: {
-        content: translatedResponse?.choices?.[0]?.message?.content || translatedResponse?.content || null,
-        thinking: translatedResponse?.choices?.[0]?.message?.reasoning_content || translatedResponse?.reasoning_content || null,
-        finish_reason: translatedResponse?.choices?.[0]?.finish_reason || "unknown"
-      },
-      status: "success"
-    }, { endpoint: endpointPath || null })).catch(err => {
-      console.error("[RequestDetail] Failed to save non-streaming request:", err?.message || err);
-    });
-
-    // Translate response to client's expected format (usually OpenAI)
     // Pass toolNameMap so Claude OAuth proxy_ prefix is stripped in tool_use blocks (#605)
     let translatedResponse = needsTranslation(responsePayloadFormat, clientResponseFormat) ? translateNonStreamingResponse(responseBody, responsePayloadFormat, clientResponseFormat, responseToolNameMap) : responseBody;
     const memoryExtractionResponse = translatedResponse;
@@ -2934,6 +2927,24 @@ export async function handleChatCore({
         }
       }
     }
+
+    // Save structured request detail for the Details tab (/dashboard/usage?tab=details)
+    saveRequestDetail(buildRequestDetail({
+      provider, model, connectionId: successConnectionId,
+      latency: { ttft: Date.now() - startTime, total: Date.now() - startTime },
+      tokens: usage || { prompt_tokens: 0, completion_tokens: 0 },
+      request: extractRequestConfig(body, stream),
+      providerRequest: finalBody || translatedBody || null,
+      providerResponse: responseBody || null,
+      response: {
+        content: translatedResponse?.choices?.[0]?.message?.content || translatedResponse?.content || null,
+        thinking: translatedResponse?.choices?.[0]?.message?.reasoning_content || translatedResponse?.reasoning_content || null,
+        finish_reason: translatedResponse?.choices?.[0]?.finish_reason || "unknown"
+      },
+      status: "success"
+    }, { endpoint: endpointPath || null })).catch(err => {
+      console.error("[RequestDetail] Failed to save non-streaming request:", err?.message || err);
+    });
 
     // Reasoning Replay Cache (#1628): Capture reasoning_content from non-streaming responses
     // with tool_calls so it can be replayed on subsequent turns (DeepSeek V4, Kimi K2, etc.)
