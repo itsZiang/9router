@@ -1,24 +1,100 @@
-import { ERROR_TYPES, DEFAULT_ERROR_MESSAGES } from "../config/errorConfig.js";
+import { getDefaultErrorMessage, getErrorInfo } from "../config/errorConfig";
+import { normalizePayloadForLog } from "../stubs/lib/logPayloads";
 
 /**
- * Build OpenAI-compatible error response body
- * @param {number} statusCode - HTTP status code
- * @param {string} message - Error message
- * @returns {object} Error response object
+ * Sanitize an error message to prevent stack trace exposure in API responses.
+ * Strips stack traces, file paths, and absolute Windows/POSIX paths from
+ * error messages before they reach the client.
  */
-export function buildErrorBody(statusCode, message) {
-  const errorInfo = ERROR_TYPES[statusCode] || 
-    (statusCode >= 500 
-      ? { type: "server_error", code: "internal_server_error" }
-      : { type: "invalid_request_error", code: "" });
 
-  return {
+// Length cap protects against pathological inputs even before tokenization.
+const MAX_ERROR_LEN = 4096;
+const SOURCE_EXT = ["ts", "tsx", "js", "jsx", "mjs", "cjs"];
+function looksLikeAbsolutePath(tok) {
+  // POSIX: "/<...>.ts" (optionally followed by :line[:col]).
+  // Windows: "C:\<...>.ts" or "C:/<...>.ts".
+  if (tok.length < 4 || tok.length > 2048) return false;
+  const isPosix = tok.charCodeAt(0) === 0x2f; // '/'
+  const isWindows = tok.length > 2 && tok.charCodeAt(1) === 0x3a && /[A-Za-z]/.test(tok[0]);
+  if (!isPosix && !isWindows) return false;
+  const dot = tok.lastIndexOf(".");
+  if (dot <= 0 || dot === tok.length - 1) return false;
+  const ext = tok.slice(dot + 1).split(":", 1)[0].toLowerCase();
+  return SOURCE_EXT.includes(ext);
+}
+
+/**
+ * Strip stack-trace tail and absolute source paths from error messages.
+ *
+ * Implemented via simple whitespace tokenization (linear time) instead of a
+ * single complex regex, so CodeQL `js/polynomial-redos` stays clean even when
+ * the runtime error message is attacker-controlled.
+ */
+export function sanitizeErrorMessage(message) {
+  let str = typeof message === "string" ? message : String(message ?? "");
+  if (str.length > MAX_ERROR_LEN) str = str.slice(0, MAX_ERROR_LEN);
+  const nl = str.indexOf("\n");
+  const firstLine = nl >= 0 ? str.slice(0, nl) : str;
+  // Preserve original whitespace by splitting on captured separator.
+  const parts = firstLine.split(/(\s+)/);
+  for (let i = 0; i < parts.length; i++) {
+    if (looksLikeAbsolutePath(parts[i])) parts[i] = "<path>";
+  }
+  return parts.join("");
+}
+const BLOCKED_KEYS = /stack|trace|path|file|cwd|dir|password|secret|token|key/i;
+const MAX_DEPTH = 4;
+
+/**
+ * Recursively sanitize an arbitrary JSON value from an upstream provider body.
+ * - Strings: run through sanitizeErrorMessage (strips stacks + absolute paths).
+ * - Keys matching BLOCKED_KEYS are dropped (credential/path guards).
+ * - Depth capped at MAX_DEPTH to prevent pathological nesting.
+ * - Arrays capped at 32 elements.
+ * - Returns null for null/undefined/non-JSON-serializable values.
+ */
+export function sanitizeUpstreamDetails(value, depth = 0) {
+  if (depth > MAX_DEPTH) return "[truncated]";
+  if (value === null || value === undefined) return null;
+  if (typeof value === "string") return sanitizeErrorMessage(value);
+  if (typeof value === "number" || typeof value === "boolean") return value;
+  if (Array.isArray(value)) {
+    return value.slice(0, 32).map(v => sanitizeUpstreamDetails(v, depth + 1));
+  }
+  if (typeof value === "object") {
+    const out = {};
+    for (const [k, v] of Object.entries(value)) {
+      if (BLOCKED_KEYS.test(k)) continue;
+      out[k] = sanitizeUpstreamDetails(v, depth + 1);
+    }
+    return out;
+  }
+  return null;
+}
+
+/**
+ * Build OpenAI-compatible error response body. Message is always sanitized
+ * so callers do not need to remember to strip stack traces themselves.
+ * Optional third argument `upstreamDetails` (raw parsed provider body) is
+ * sanitized by sanitizeUpstreamDetails before inclusion as `upstream_details`.
+ */
+export function buildErrorBody(statusCode, message, upstreamDetails) {
+  const errorInfo = getErrorInfo(statusCode);
+  const safeMessage = sanitizeErrorMessage(message) || getDefaultErrorMessage(statusCode);
+  const body = {
     error: {
-      message: message || DEFAULT_ERROR_MESSAGES[statusCode] || "An error occurred",
+      message: safeMessage,
       type: errorInfo.type,
       code: errorInfo.code
     }
   };
+  if (upstreamDetails !== undefined && upstreamDetails !== null) {
+    const sanitized = sanitizeUpstreamDetails(upstreamDetails);
+    if (sanitized !== null && typeof sanitized === "object" && !Array.isArray(sanitized)) {
+      body.upstream_details = sanitized;
+    }
+  }
+  return body;
 }
 
 /**
@@ -28,11 +104,10 @@ export function buildErrorBody(statusCode, message) {
  * @returns {Response} HTTP Response object
  */
 export function errorResponse(statusCode, message) {
-  return new Response(JSON.stringify(buildErrorBody(statusCode, message)), {
+  return new Response(JSON.stringify(buildErrorBody(statusCode, sanitizeErrorMessage(message))), {
     status: statusCode,
     headers: {
-      "Content-Type": "application/json",
-      "Access-Control-Allow-Origin": "*"
+      "Content-Type": "application/json"
     }
   });
 }
@@ -44,77 +119,179 @@ export function errorResponse(statusCode, message) {
  * @param {string} message - Error message
  */
 export async function writeStreamError(writer, statusCode, message) {
-  const errorBody = buildErrorBody(statusCode, message);
+  const errorBody = buildErrorBody(statusCode, sanitizeErrorMessage(message));
   const encoder = new TextEncoder();
   await writer.write(encoder.encode(`data: ${JSON.stringify(errorBody)}\n\n`));
+}
+function normalizeRetryAfterSeconds(retryAfter) {
+  if (typeof retryAfter === "number" && Number.isFinite(retryAfter)) {
+    if (retryAfter > 0 && retryAfter < 1_000_000_000) {
+      return Math.max(Math.ceil(retryAfter), 1);
+    }
+    const retryTimeMs = new Date(retryAfter).getTime();
+    if (Number.isFinite(retryTimeMs)) {
+      return Math.max(Math.ceil((retryTimeMs - Date.now()) / 1000), 1);
+    }
+  }
+  if (retryAfter instanceof Date || typeof retryAfter === "string") {
+    const retryTimeMs = new Date(retryAfter).getTime();
+    if (Number.isFinite(retryTimeMs)) {
+      return Math.max(Math.ceil((retryTimeMs - Date.now()) / 1000), 1);
+    }
+  }
+  return 1;
+}
+
+/**
+ * Parse Antigravity error message to extract retry time
+ * Example: "You have exhausted your capacity on this model. Your quota will reset after 2h7m23s."
+ * @param {string} message - Error message
+ * @returns {number|null} Retry time in milliseconds, or null if not found
+ */
+export function parseAntigravityRetryTime(message) {
+  if (typeof message !== "string") return null;
+
+  // Match patterns like: 2h7m23s, 5m30s, 45s, 1h20m, etc.
+  const match = message.match(/reset after (\d+h)?(\d+m)?(\d+s)?/i);
+  if (!match) return null;
+  let totalMs = 0;
+
+  // Extract hours
+  if (match[1]) {
+    const hours = parseInt(match[1]);
+    totalMs += hours * 60 * 60 * 1000;
+  }
+
+  // Extract minutes
+  if (match[2]) {
+    const minutes = parseInt(match[2]);
+    totalMs += minutes * 60 * 1000;
+  }
+
+  // Extract seconds
+  if (match[3]) {
+    const seconds = parseInt(match[3]);
+    totalMs += seconds * 1000;
+  }
+  return totalMs > 0 ? totalMs : null;
 }
 
 /**
  * Parse upstream provider error response
  * @param {Response} response - Fetch response from provider
- * @param {object} [executor] - Optional executor with parseError() override for provider-specific parsing
- * @returns {Promise<{statusCode: number, message: string, resetsAtMs?: number}>}
+ * @param {string} provider - Provider name (for Antigravity-specific parsing)
+ * @returns {Promise<{statusCode: number, message: string, retryAfterMs: number|null, responseBody: unknown}>}
  */
-export async function parseUpstreamError(response, executor = null) {
-  let bodyText = "";
-  try {
-    bodyText = await response.text();
-  } catch {
-    bodyText = "";
-  }
-
-  // Let provider config parser extract provider-specific fields first.
-  const providerConfig = executor?.getProviderConfig?.();
-  if (providerConfig && typeof providerConfig.parseError === "function") {
-    try {
-      const parsed = providerConfig.parseError({ response, bodyText });
-      if (parsed && typeof parsed === "object") {
-        const msg = parsed.message || DEFAULT_ERROR_MESSAGES[response.status] || `Upstream error: ${response.status}`;
-        return { statusCode: parsed.status || response.status, message: msg, resetsAtMs: parsed.resetsAtMs };
-      }
-    } catch { /* fall through */ }
-  }
-
-  // Legacy executor-specific parser (kept for specialized executors not yet migrated).
-  if (executor && typeof executor.parseError === "function") {
-    try {
-      const parsed = executor.parseError(response, bodyText);
-      if (parsed && typeof parsed === "object") {
-        const msg = parsed.message || DEFAULT_ERROR_MESSAGES[response.status] || `Upstream error: ${response.status}`;
-        return { statusCode: parsed.status || response.status, message: msg, resetsAtMs: parsed.resetsAtMs };
-      }
-    } catch { /* fall through to default parsing */ }
-  }
-
+export async function parseUpstreamError(response, provider = null) {
   let message = "";
+  let retryAfterMs = null;
+  let responseBody = null;
+  let errorCode = undefined;
+  let errorType = undefined;
   try {
-    const json = JSON.parse(bodyText);
-    message = json.error?.message || json.message || json.error || bodyText;
+    const text = await response.text();
+    responseBody = normalizePayloadForLog(text);
+
+    // Try parse as JSON
+    try {
+      const parsed = JSON.parse(text);
+      // Handle array responses (e.g., from some Gemini APIs)
+      const json = (Array.isArray(parsed) && parsed.length > 0 ? parsed[0] : parsed) || {};
+      message = json.error?.message || json.message || json.error || text;
+      errorCode = json.error?.code || json.code;
+      errorType = json.error?.type || json.type;
+    } catch {
+      message = text;
+    }
   } catch {
-    message = bodyText;
+    message = `Upstream error: ${response.status}`;
+    responseBody = {
+      _rawText: message
+    };
+  }
+  const messageStr = typeof message === "string" ? message : JSON.stringify(message);
+  const retryAfterHeader = response.headers?.get?.("retry-after");
+  if (retryAfterHeader && !retryAfterMs) {
+    const retryAfterSec = Number.parseInt(retryAfterHeader, 10);
+    if (Number.isFinite(retryAfterSec) && retryAfterSec > 0) {
+      retryAfterMs = retryAfterSec * 1000;
+    } else {
+      const retryAfterDate = new Date(retryAfterHeader).getTime();
+      if (Number.isFinite(retryAfterDate) && retryAfterDate > Date.now()) {
+        retryAfterMs = retryAfterDate - Date.now();
+      }
+    }
   }
 
-  const messageStr = typeof message === "string" ? message : JSON.stringify(message);
-  const finalMessage = messageStr || DEFAULT_ERROR_MESSAGES[response.status] || `Upstream error: ${response.status}`;
+  // Parse Antigravity-specific retry time from error message
+  if (provider === "antigravity" && response.status === 429) {
+    retryAfterMs = parseAntigravityRetryTime(messageStr);
+  }
 
-  return { statusCode: response.status, message: finalMessage };
+  // Also parse retry time for other providers (Qwen, etc.) with "quota will reset after XhYmZs" format
+  if (response.status === 429 && !retryAfterMs) {
+    retryAfterMs = parseAntigravityRetryTime(messageStr);
+  }
+
+  // Generic providers: "Please retry after 20s"
+  if (response.status === 429 && !retryAfterMs) {
+    const retryMatch = messageStr.match(/retry\s+after\s+(\d+)\s*s/i);
+    if (retryMatch) {
+      retryAfterMs = Number.parseInt(retryMatch[1], 10) * 1000;
+    }
+  }
+
+  // Cap maximum retry time at 24 hours to prevent infinite wait
+  const MAX_RETRY_MS = 24 * 60 * 60 * 1000;
+  if (retryAfterMs && retryAfterMs > MAX_RETRY_MS) {
+    retryAfterMs = MAX_RETRY_MS;
+  }
+  const responseHeaders = response.headers ? Object.fromEntries(response.headers.entries()) : null;
+  return {
+    statusCode: response.status,
+    message: messageStr,
+    errorCode,
+    errorType,
+    retryAfterMs,
+    responseBody,
+    responseHeaders
+  };
 }
 
 /**
  * Create error result for chatCore handler
  * @param {number} statusCode - HTTP status code
  * @param {string} message - Error message
- * @param {number} [resetsAtMs] - Optional precise cooldown expiry (ms epoch) for provider-specific quota errors
- * @returns {{ success: false, status: number, error: string, response: Response, resetsAtMs?: number }}
+ * @param {number|null} retryAfterMs - Optional retry-after time in milliseconds
+ * @returns {{ success: false, status: number, error: string, response: Response, retryAfterMs?: number }}
  */
-export function createErrorResult(statusCode, message, resetsAtMs) {
-  return {
+export function createErrorResult(statusCode, message, retryAfterMs = null, errorCode, errorType, upstreamDetails) {
+  const body = buildErrorBody(statusCode, message, upstreamDetails);
+  if (errorCode) {
+    body.error.code = errorCode;
+  }
+  if (errorType) {
+    body.error.type = errorType;
+  }
+  const result = {
     success: false,
     status: statusCode,
-    error: message,
-    resetsAtMs,
-    response: errorResponse(statusCode, message)
+    error: body.error.message,
+    errorType,
+    errorCode,
+    response: new Response(JSON.stringify(body), {
+      status: statusCode,
+      headers: {
+        "Content-Type": "application/json"
+      }
+    })
   };
+
+  // Add retryAfterMs if available (for Antigravity quota errors)
+  if (retryAfterMs) {
+    result.retryAfterMs = retryAfterMs;
+  }
+  return result;
 }
 
 /**
@@ -126,18 +303,102 @@ export function createErrorResult(statusCode, message, resetsAtMs) {
  * @returns {Response}
  */
 export function unavailableResponse(statusCode, message, retryAfter, retryAfterHuman) {
-  const retryAfterSec = Math.max(Math.ceil((new Date(retryAfter).getTime() - Date.now()) / 1000), 1);
-  const msg = `${message} (${retryAfterHuman})`;
-  return new Response(
-    JSON.stringify({ error: { message: msg } }),
-    {
-      status: statusCode,
-      headers: {
-        "Content-Type": "application/json",
-        "Retry-After": String(retryAfterSec)
-      }
+  const retryAfterSec = normalizeRetryAfterSeconds(retryAfter);
+  const msg = retryAfterHuman ? `${message} (${retryAfterHuman})` : message;
+  return new Response(JSON.stringify({
+    error: {
+      message: msg
     }
-  );
+  }), {
+    status: statusCode,
+    headers: {
+      "Content-Type": "application/json",
+      "Retry-After": String(retryAfterSec)
+    }
+  });
+}
+export function providerCircuitOpenResponse(provider, retryAfter) {
+  const retryAfterSec = normalizeRetryAfterSeconds(retryAfter);
+  return new Response(JSON.stringify({
+    error: {
+      message: `Provider ${provider} circuit breaker is open`,
+      type: "server_error",
+      code: "provider_circuit_open",
+      provider,
+      retry_after: retryAfterSec
+    }
+  }), {
+    status: 503,
+    headers: {
+      "Content-Type": "application/json",
+      "Retry-After": String(retryAfterSec),
+      "X-OmniRoute-Provider-Breaker": "open"
+    }
+  });
+}
+export function buildModelCooldownBody({
+  model,
+  retryAfterSec
+}) {
+  const resolvedModel = typeof model === "string" && model.trim().length > 0 ? model.trim() : null;
+  return {
+    error: {
+      message: resolvedModel ? `All credentials for model ${resolvedModel} are cooling down` : "All credentials for the requested model are cooling down",
+      type: "rate_limit_error",
+      code: "model_cooldown",
+      ...(resolvedModel ? {
+        model: resolvedModel
+      } : {}),
+      reset_seconds: Math.max(Math.ceil(retryAfterSec), 1)
+    }
+  };
+}
+export function modelCooldownResponse({
+  model,
+  retryAfter
+}) {
+  const retryAfterSec = normalizeRetryAfterSeconds(retryAfter);
+  return new Response(JSON.stringify(buildModelCooldownBody({
+    model,
+    retryAfterSec
+  })), {
+    status: 429,
+    headers: {
+      "Content-Type": "application/json",
+      "Retry-After": String(retryAfterSec)
+    }
+  });
+}
+
+/**
+ * Build an executor-style error result (response + url + headers + transformedBody).
+ * Shared by web-cookie executors that return the `{ response, url, headers, transformedBody }` shape.
+ */
+export function makeExecutorErrorResult(status, message, body, url) {
+  return {
+    response: new Response(JSON.stringify({
+      error: {
+        message: sanitizeErrorMessage(message),
+        type: "upstream_error",
+        code: `HTTP_${status}`
+      }
+    }), {
+      status,
+      headers: {
+        "Content-Type": "application/json"
+      }
+    }),
+    url,
+    headers: {},
+    transformedBody: body
+  };
+}
+
+/**
+ * Normalize a cookie string: strip a leading "Cookie:" prefix if present.
+ */
+export function normalizeCookie(raw) {
+  return raw?.startsWith("Cookie:") ? raw.slice(7).trim() : raw || "";
 }
 
 /**
@@ -149,11 +410,14 @@ export function unavailableResponse(statusCode, message, retryAfter, retryAfterH
  * @returns {string} Formatted error message
  */
 export function formatProviderError(error, provider, model, statusCode) {
-  const code = statusCode || error.code || "FETCH_FAILED";
+  const providerCode = "code" in error ? error.code : undefined;
+  const code = statusCode || providerCode || "FETCH_FAILED";
   const message = error.message || "Unknown error";
   // Expose low-level cause (e.g. UND_ERR_SOCKET, ECONNRESET, ETIMEDOUT) for diagnosing fetch failures
-  const causeCode = error.cause?.code;
-  const causeMsg = error.cause?.message;
+  const cause = error.cause;
+  const causeObj = cause && typeof cause === "object" ? cause : undefined;
+  const causeCode = typeof causeObj?.code === "string" ? causeObj.code : undefined;
+  const causeMsg = typeof causeObj?.message === "string" ? causeObj.message : undefined;
   const causeStr = causeCode || causeMsg ? ` (cause: ${[causeCode, causeMsg].filter(Boolean).join(": ")})` : "";
   return `[${code}]: ${message}${causeStr}`;
 }

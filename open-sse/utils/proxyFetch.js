@@ -1,484 +1,544 @@
-import { Readable } from "stream";
-import { dbg } from "./debugLog.js";
-import { httpClientCache } from "./httpClientCache.js";
-import { STREAM_FIRST_CHUNK_TIMEOUT_MS } from "../config/runtimeConfig.js";
-
-const originalFetch = globalThis.fetch;
-
-// ─── TLS fingerprinting via got-scraping (browser-like JA3) ───────────────
-// Disabled: not in use. Kept commented for future re-enable.
-// Restore the original block to re-enable per-host JA3 spoofing.
-/*
-let _gotScraping = null;
-let _gotScrapingChecked = false;
-const _gotScrapingLoggedHosts = new Set();
-
-async function getGotScraping() {
-  if (_gotScrapingChecked) return _gotScraping;
-  _gotScrapingChecked = true;
-  try {
-    const mod = await import("got-scraping");
-    _gotScraping = typeof mod.gotScraping === "function" ? mod.gotScraping : null;
-    if (_gotScraping) dbg("TLS", "got-scraping loaded (browser-like JA3 enabled)");
-  } catch (e) {
-    console.warn(`[ProxyFetch] got-scraping unavailable, falling back to native fetch: ${e.message}`);
-    _gotScraping = null;
-  }
-  return _gotScraping;
+// @ts-nocheck
+import "./setupPolyfill";
+import { AsyncLocalStorage } from "node:async_hooks";
+import { fetch as undiciFetch } from "undici";
+import { buildVercelRelayHeaders, createProxyDispatcher, getDefaultDispatcher, getRetryDispatcher, isRelayType, normalizeProxyUrl, proxyConfigToUrl, proxyUrlForLogs } from "./proxyDispatcher";
+import tlsClient from "./tlsClient";
+import { isProxyReachable } from "../stubs/lib/proxyHealth";
+import { isControlPlaneProxyDirectFallbackEnabled, isFeatureFlagEnabled } from "../stubs/shared/utils/featureFlags";
+import { findWorkingProxy } from "./proxyFallback";
+function isTlsFingerprintEnabled() {
+  return process.env.ENABLE_TLS_FINGERPRINT === "true";
 }
 
-async function gotScrapingFetch(url, options) {
-  const gs = await getGotScraping();
-  if (!gs) return null;
+/** Per-request tracking of whether TLS fingerprint was used */
 
-  const method = (options.method || "GET").toUpperCase();
-  const headersInit = options.headers || {};
-  const headers = headersInit instanceof Headers
-    ? Object.fromEntries(headersInit.entries())
-    : { ...headersInit };
-
-  return new Promise((resolve, reject) => {
-    let settled = false;
-    const stream = gs.stream({
-      url,
-      method,
-      headers,
-      body: method === "GET" || method === "HEAD" ? undefined : options.body,
-      throwHttpErrors: false,
-      retry: { limit: 0 },
-      timeout: { request: undefined },
-      followRedirect: false,
-      decompress: true,
-    });
-
-    if (options.signal) {
-      const onAbort = () => { try { stream.destroy(new Error("aborted")); } catch { } };
-      if (options.signal.aborted) onAbort();
-      else options.signal.addEventListener("abort", onAbort, { once: true });
-    }
-
-    stream.once("response", (res) => {
-      if (settled) return;
-      settled = true;
-      const resHeaders = new Headers();
-      for (const [k, v] of Object.entries(res.headers || {})) {
-        if (Array.isArray(v)) v.forEach((x) => resHeaders.append(k, String(x)));
-        else if (v != null) resHeaders.set(k, String(v));
-      }
-      const body = Readable.toWeb(stream);
-      resolve(new Response(body, { status: res.statusCode, statusText: res.statusMessage || "", headers: resHeaders }));
-    });
-
-    stream.once("error", (err) => {
-      if (settled) return;
-      settled = true;
-      reject(err);
-    });
-  });
-}
-
-async function tryGotScrapingFetch(url, options) {
-  try {
-    const res = await gotScrapingFetch(url, options);
-    if (res) {
-      try {
-        const host = new URL(typeof url === "string" ? url : url.toString()).hostname;
-        if (!_gotScrapingLoggedHosts.has(host)) {
-          _gotScrapingLoggedHosts.add(host);
-          dbg("TLS", `using got-scraping for ${host}`);
-        }
-      } catch { }
-    }
-    return res;
-  } catch (e) {
-    console.warn(`[ProxyFetch] got-scraping request failed, fallback to native fetch: ${e.message}`);
-    return null;
-  }
-}
-*/
-
-// DNS cache — use Map to avoid prototype pollution via malformed hostnames
-const DNS_CACHE = new Map();
-const MITM_BYPASS_HOSTS = [
-  "cloudcode-pa.googleapis.com",
-  "daily-cloudcode-pa.googleapis.com",
-  "api.individual.githubcopilot.com",
-  "q.us-east-1.amazonaws.com",
-  "codewhisperer.us-east-1.amazonaws.com",
-  "api2.cursor.sh",
-];
-const GOOGLE_DNS_SERVERS = ["8.8.8.8", "8.8.4.4"];
-const HTTPS_PORT = 443;
-const HTTP_SUCCESS_MIN = 200;
-const HTTP_SUCCESS_MAX = 300;
-
-function normalizeString(value) {
-  if (value === undefined || value === null) return "";
-  return String(value).trim();
-}
+const tlsFingerprintContext = new AsyncLocalStorage();
 
 /**
- * Resolve real IP using Google DNS (bypass system DNS)
+ * #5217 (Gap-secondary): a mutable sink that records the proxy actually applied
+ * by `runWithProxyContext` for the in-flight request. Executors that pin their
+ * own per-account proxy *internally* (e.g. OpencodeExecutor wraps its dispatch
+ * in `runWithProxyContext(account.proxy, …)`) never propagate that choice back
+ * to the caller's `proxyInfo`, so the post-execution `[ProxyEgress]` line logged
+ * `proxy=direct` even though `[ProxyFetch] Applied request proxy context: …`
+ * fired. Wrapping the execution in `runWithAppliedProxyCapture(sink, fn)` lets
+ * the egress logger read the innermost applied proxy (the last writer wins, which
+ * is the executor's per-account proxy).
  */
-async function resolveRealIP(hostname) {
-  const cached = DNS_CACHE.get(hostname);
-  if (cached && Date.now() < cached.expiry) return cached.ip;
 
-  try {
-    const dns = await import("dns");
-    const { promisify } = await import("util");
-    const resolver = new dns.Resolver();
-    resolver.setServers(GOOGLE_DNS_SERVERS);
-    const resolve4 = promisify(resolver.resolve4.bind(resolver));
-    const addresses = await resolve4(hostname);
-    DNS_CACHE.set(hostname, { ip: addresses[0], expiry: Date.now() + 5 * 60 * 1000 });
-    return addresses[0];
-  } catch (error) {
-    console.warn(`[ProxyFetch] DNS resolve failed for ${hostname}:`, error.message);
-    return null;
-  }
-}
+const appliedProxyContext = new AsyncLocalStorage();
 
 /**
- * Check if request should bypass MITM DNS redirect
+ * Run `fn` with an applied-proxy capture sink in context. Any
+ * `runWithProxyContext` call inside `fn` that ends up applying a proxy records
+ * that proxy config into `sink.proxy` (innermost wins). The sink is a plain
+ * mutable object the caller retains, so it can read `sink.proxy` after `fn`
+ * resolves. Pure plumbing — no behavioral change to the request itself.
  */
-function shouldBypassMitmDns(url) {
-  try {
-    const hostname = new URL(url).hostname;
-    return MITM_BYPASS_HOSTS.some(host => hostname.includes(host));
-  } catch { return false; }
+export function runWithAppliedProxyCapture(sink, fn) {
+  return appliedProxyContext.run(sink, fn);
 }
-
-function shouldBypassByNoProxy(targetUrl, noProxyValue) {
-  const noProxy = normalizeString(noProxyValue);
-  if (!noProxy) return false;
-
-  let hostname;
-  try { hostname = new URL(targetUrl).hostname.toLowerCase(); } catch { return false; }
-  const patterns = noProxy.split(",").map((p) => p.trim().toLowerCase()).filter(Boolean);
-
-  return patterns.some((pattern) => {
-    if (pattern === "*") return true;
-    if (pattern.startsWith(".")) return hostname.endsWith(pattern) || hostname === pattern.slice(1);
-    return hostname === pattern || hostname.endsWith(`.${pattern}`);
-  });
-}
-
 /**
- * Get proxy URL from environment
+ * Flatten a fetch error's `cause` chain (and any Happy-Eyeballs `AggregateError`
+ * sub-errors) into a single diagnostic line: code/syscall/errno/address:port + a
+ * truncated message. undici/native both reject with a bare `TypeError: fetch failed`
+ * whose real reason hides in `.cause`; surfacing it is what makes dispatcher-failure
+ * bursts (#4252) diagnosable. Never includes a stack trace (Rule #12). Pure + testable.
  */
-function getEnvProxyUrl(targetUrl) {
-  const noProxy = process.env.NO_PROXY || process.env.no_proxy;
-  if (shouldBypassByNoProxy(targetUrl, noProxy)) return null;
-
-  let protocol;
-  try { protocol = new URL(targetUrl).protocol; } catch { return null; }
-
-  if (protocol === "https:") {
-    return process.env.HTTPS_PROXY || process.env.https_proxy ||
-      process.env.ALL_PROXY || process.env.all_proxy;
-  }
-
-  return process.env.HTTP_PROXY || process.env.http_proxy ||
-    process.env.ALL_PROXY || process.env.all_proxy;
-}
-
-/**
- * Normalize proxy URL (allow host:port)
- */
-function normalizeProxyUrl(proxyUrl) {
-  const normalizedInput = normalizeString(proxyUrl);
-  if (!normalizedInput) return null;
-
-  try {
-
-    new URL(normalizedInput);
-    return normalizedInput;
-  } catch {
-    // Allow "127.0.0.1:7890" style values
-    return `http://${normalizedInput}`;
-  }
-}
-
-function resolveConnectionProxyUrl(targetUrl, proxyOptions) {
-  const enabled = proxyOptions?.enabled === true || proxyOptions?.connectionProxyEnabled === true;
-  if (!enabled) return null;
-
-  const proxyUrlRaw = normalizeString(proxyOptions?.url ?? proxyOptions?.connectionProxyUrl);
-  if (!proxyUrlRaw) return null;
-
-  const noProxy = normalizeString(proxyOptions?.noProxy ?? proxyOptions?.connectionNoProxy);
-  if (noProxy && shouldBypassByNoProxy(targetUrl, noProxy)) return null;
-
-  return normalizeProxyUrl(proxyUrlRaw);
-}
-
-/**
- * Get a cached ProxyAgent from HttpClientCache.
- * Phase 2 switches from fresh-per-request agents to pooled agents keyed by
- * proxy URL + pool parameters. bodyTimeout/headersTimeout stay 0 so undici
- * does not abort long reasoning streams.
- */
-async function getDispatcher(proxyUrl) {
-  return httpClientCache.getProxyAgent(proxyUrl);
-}
-
-/**
- * Get a cached no-timeout Agent for direct (non-proxy) fetches.
- * undici's default bodyTimeout/headersTimeout (300s) can abort long SSE
- * streams; 9router manages connect and stall timeouts explicitly.
- */
-async function getNoTimeoutAgent() {
-  return httpClientCache.getAgent();
-}
-
-function isStreamingRequest(options = {}) {
-  const headers = options.headers || {};
-  const accept = headers["Accept"] ?? headers["accept"];
-  return typeof accept === "string" && accept.includes("text/event-stream");
-}
-
-/**
- * Wrap a fetch Response so that the stream aborts if no bytes arrive within
- * `timeoutMs`. This provides explicit time-to-first-token protection without
- * relying on undici's body timeout, which cannot distinguish between a slow
- * first chunk and an inter-chunk stall.
- */
-export function withFirstChunkTimeout(response, timeoutMs) {
-  if (!response.body || typeof timeoutMs !== "number" || timeoutMs <= 0) {
-    return response;
-  }
-  const source = response.body;
-  let timer;
-  let firstChunkSeen = false;
-  let reader;
-
-  const stream = new ReadableStream({
-    start(controller) {
-      reader = source.getReader();
-
-      timer = setTimeout(() => {
-        const reason = new DOMException(
-          `First chunk timeout after ${timeoutMs}ms`,
-          "TimeoutError"
-        );
-        controller.error(reason);
-        reader.cancel("first chunk timeout").catch(() => {});
-      }, timeoutMs);
-
-      function pump() {
-        reader.read().then(({ done, value }) => {
-          if (!firstChunkSeen) {
-            firstChunkSeen = true;
-            clearTimeout(timer);
-          }
-          if (done) {
-            controller.close();
-            return;
-          }
-          controller.enqueue(value);
-          pump();
-        }).catch((err) => {
-          clearTimeout(timer);
-          controller.error(err);
-        });
-      }
-
-      pump();
-    },
-    cancel(reason) {
-      clearTimeout(timer);
-      // Cancel via the locked reader; that propagates to the source stream.
-      return reader ? reader.cancel(reason).catch(() => {}) : Promise.resolve();
-    },
-  });
-
-  return new Response(stream, {
-    status: response.status,
-    statusText: response.statusText,
-    headers: response.headers,
-  });
-}
-
-function maybeFirstChunkTimeout(response, options) {
-  return response;
-}
-
-/**
- * Create HTTPS request with manual socket connection (bypass DNS)
- */
-async function createBypassRequest(parsedUrl, realIP, options) {
-  const httpsModule = await import("https");
-  const netModule = await import("net");
-  // CJS modules expose exports via .default in ESM dynamic import context
-  const https = httpsModule.default ?? httpsModule;
-  const net = netModule.default ?? netModule;
-
-  return new Promise((resolve, reject) => {
-    const socket = new net.Socket();
-
-    socket.connect(HTTPS_PORT, realIP, () => {
-      const reqOptions = {
-        socket,
-        // SNI + cert hostname are validated against the hostname the caller
-        // asked for, not the IP we connected to. This keeps the DNS-bypass
-        // (avoiding /etc/hosts MITM) while still rejecting on-path attackers
-        // that present a different cert. The MITM_BYPASS_HOSTS targets are
-        // all public-CA-issued (Google / GitHub / AWS / Cursor) so default
-        // verification works without any extra trust store.
-        servername: parsedUrl.hostname,
-        path: parsedUrl.pathname + parsedUrl.search,
-        method: options.method || "POST",
-        headers: {
-          ...options.headers,
-          Host: parsedUrl.hostname,
-        },
-      };
-
-      const req = https.request(reqOptions, (res) => {
-        const response = {
-          ok: res.statusCode >= HTTP_SUCCESS_MIN && res.statusCode < HTTP_SUCCESS_MAX,
-          status: res.statusCode,
-          statusText: res.statusMessage,
-          headers: new Map(Object.entries(res.headers)),
-          body: Readable.toWeb(res),
-          text: async () => {
-            const chunks = [];
-            for await (const chunk of res) chunks.push(chunk);
-            return Buffer.concat(chunks).toString();
-          },
-          json: async () => JSON.parse(await response.text()),
-        };
-        resolve(response);
-      });
-
-      req.on("error", reject);
-      if (options.body) {
-        req.write(typeof options.body === "string" ? options.body : JSON.stringify(options.body));
-      }
-      req.end();
-    });
-
-    socket.on("error", reject);
-  });
-}
-
-/**
- * Attempt a fetch through the proxy with up to `maxAttempts` retries.
- * Reuses a cached ProxyAgent (connection pool) instead of creating a fresh
- * agent per attempt. Returns the response on the first success, or throws
- * the last error.
- */
-async function fetchViaProxyWithRetry(url, options, proxyUrl, maxAttempts) {
-  let lastError;
-  const dispatcher = await getDispatcher(proxyUrl);
-  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-    try {
-      return await originalFetch(url, { ...options, dispatcher });
-    } catch (err) {
-      lastError = err;
-      if (attempt < maxAttempts) {
-        const delayMs = attempt * 500; // 500ms, 1000ms, 1500ms …
-        console.warn(`[ProxyFetch] Attempt ${attempt}/${maxAttempts} failed (${err.message}), retrying in ${delayMs}ms…`);
-        await new Promise(resolve => setTimeout(resolve, delayMs));
+export function describeFetchCause(err) {
+  const parts = [];
+  const seen = new Set();
+  let cur = err;
+  for (let depth = 0; cur && depth < 5 && !seen.has(cur); depth++) {
+    seen.add(cur);
+    const e = cur;
+    const seg = [typeof e.name === "string" && e.name !== "Error" ? e.name : null, typeof e.message === "string" ? e.message.slice(0, 160) : null, e.code != null ? `code=${String(e.code)}` : null, e.syscall != null ? `syscall=${String(e.syscall)}` : null, e.errno != null ? `errno=${String(e.errno)}` : null, e.address != null ? `address=${String(e.address)}${e.port != null ? `:${String(e.port)}` : ""}` : null].filter(Boolean).join(" ");
+    if (seg) parts.push(seg);
+    if (Array.isArray(e.errors)) {
+      for (const sub of e.errors.slice(0, 4)) {
+        const s = sub ?? {};
+        const subSeg = [s.code != null ? `code=${String(s.code)}` : null, s.syscall != null ? `syscall=${String(s.syscall)}` : null, s.address != null ? `address=${String(s.address)}${s.port != null ? `:${String(s.port)}` : ""}` : null].filter(Boolean).join(" ");
+        if (subSeg) parts.push(`↳ ${subSeg}`);else if (typeof s.message === "string") parts.push(`↳ ${s.message.slice(0, 80)}`);
       }
     }
+    cur = e.cause;
   }
-  throw lastError;
+  return parts.join(" | ") || String(err);
+}
+function isStreamLikeBody(body) {
+  return body !== null && body !== undefined && typeof body === "object" && (typeof body.getReader === "function" || typeof body.stream === "function");
+}
+function requestHasNonReplayableBody(input, options) {
+  if (isStreamLikeBody(options.body)) return true;
+  if (typeof Request !== "undefined" && input instanceof Request) {
+    if (input.bodyUsed) return true;
+    if (input.body !== null) return true;
+  }
+  return false;
 }
 
-// Number of times to attempt a proxy connection before giving up (or falling back).
-const PROXY_RETRY_ATTEMPTS = 3;
+/** Injectable dependencies for testability (Approach B DI). */
 
-export async function proxyAwareFetch(url, options = {}, proxyOptions = null) {
-  const targetUrl = typeof url === "string" ? url : url.toString();
-
-  // Vercel relay: forward request via relay headers
-  const vercelRelayUrl = normalizeString(proxyOptions?.vercelRelayUrl);
-  if (vercelRelayUrl) {
-    const parsed = new URL(targetUrl);
-    const relayHeaders = {
-      ...options.headers,
-      "x-relay-target": `${parsed.protocol}//${parsed.host}`,
-      "x-relay-path": `${parsed.pathname}${parsed.search}`,
+const isCloud = typeof caches !== "undefined" && typeof caches === "object";
+const PATCH_STATE_KEY = Symbol.for("omniroute.proxyFetch.state");
+function getPatchState() {
+  const scopedGlobal = globalThis;
+  if (!scopedGlobal[PATCH_STATE_KEY]) {
+    scopedGlobal[PATCH_STATE_KEY] = {
+      originalFetch: globalThis.fetch,
+      proxyContext: new AsyncLocalStorage(),
+      isPatched: false
     };
-    const relayRes = await originalFetch(vercelRelayUrl, { ...options, headers: relayHeaders });
-    return maybeFirstChunkTimeout(relayRes, options);
   }
+  return scopedGlobal[PATCH_STATE_KEY];
+}
+const patchState = getPatchState();
+const originalFetch = patchState.originalFetch;
+const originalFetchWithDispatcher = originalFetch;
+const proxyContext = patchState.proxyContext;
+function noProxyMatch(targetUrl) {
+  const noProxy = process.env.NO_PROXY || process.env.no_proxy;
+  if (!noProxy) return false;
+  let target;
+  try {
+    target = new URL(targetUrl);
+  } catch {
+    return false;
+  }
+  const hostname = target.hostname.toLowerCase();
+  const port = target.port || (target.protocol === "https:" ? "443" : "80");
+  const patterns = noProxy.split(",").map(p => p.trim().toLowerCase()).filter(Boolean);
+  return patterns.some(pattern => {
+    if (pattern === "*") return true;
+    const [patternHost, patternPort] = pattern.split(":");
+    if (patternPort && patternPort !== port) return false;
+    if (!patternHost) return false;
 
-  const connectionProxyUrl = resolveConnectionProxyUrl(targetUrl, proxyOptions);
-  const envProxyUrl = connectionProxyUrl ? null : normalizeProxyUrl(getEnvProxyUrl(targetUrl));
-  const proxyUrl = connectionProxyUrl || envProxyUrl;
-
-  // Retry count only applies to explicitly configured connection proxies;
-  // env-var proxies use a single attempt (existing behavior).
-  const retryAttempts = connectionProxyUrl ? PROXY_RETRY_ATTEMPTS : 1;
-
-  // MITM DNS bypass: for known MITM-intercepted hosts, resolve real IP to avoid DNS spoof
-  if (shouldBypassMitmDns(targetUrl)) {
-    if (proxyUrl) {
-      // Proxy resolves DNS externally (not affected by /etc/hosts) — use proxy directly
-      try {
-        const proxyRes = await fetchViaProxyWithRetry(url, options, proxyUrl, retryAttempts);
-        return maybeFirstChunkTimeout(proxyRes, options);
-      } catch (proxyError) {
-        if (proxyOptions?.strictProxy === true) {
-          throw new Error(`[ProxyFetch] Proxy required but failed (strictProxy=true): ${proxyError.message}`);
+    // Support wildcard matching (e.g. 192.168.* or *.local).
+    // Uses a linear glob scan instead of dynamic RegExp to avoid ReDoS.
+    if (patternHost.includes("*")) {
+      const parts = patternHost.split("*");
+      let pos = 0;
+      let ok = hostname.startsWith(parts[0]);
+      if (ok) {
+        pos = parts[0].length;
+        for (let i = 1; i < parts.length && ok; i++) {
+          const seg = parts[i];
+          if (i === parts.length - 1) {
+            ok = seg === "" || hostname.endsWith(seg) && hostname.length - seg.length >= pos;
+          } else {
+            const idx = seg ? hostname.indexOf(seg, pos) : pos;
+            if (idx === -1) {
+              ok = false;
+            } else {
+              pos = idx + seg.length;
+            }
+          }
         }
-        console.warn(`[ProxyFetch] Proxy failed, falling back to direct bypass: ${proxyError.message}`);
       }
+      if (ok) return true;
     }
-    // No proxy — manually resolve real IP to bypass DNS spoof
-    try {
-      const parsedUrl = new URL(targetUrl);
-      const realIP = await resolveRealIP(parsedUrl.hostname);
-      if (realIP) {
-        const bypassRes = await createBypassRequest(parsedUrl, realIP, options);
-        return maybeFirstChunkTimeout(bypassRes, options);
+    if (patternHost.startsWith(".")) {
+      return hostname.endsWith(patternHost) || hostname === patternHost.slice(1);
+    }
+    return hostname === patternHost || hostname.endsWith(`.${patternHost}`);
+  });
+}
+function isLocalAddress(hostname) {
+  const host = hostname.replace(/^\[/, "").replace(/\]$/, "").replace(/^::ffff:/i, "");
+  if (host === "localhost" || host === "0.0.0.0" || host === "127.0.0.1" || host === "::1") {
+    return true;
+  }
+  if (host.endsWith(".local") || host.endsWith(".lan") || host.endsWith(".internal")) return true;
+  // RFC1918 + loopback + link-local (169.254, incl. cloud metadata 169.254.169.254)
+  // + CGNAT (100.64/10). 127/8 covers all loopback, not just 127.0.0.1.
+  if (host.startsWith("192.168.")) return true;
+  if (host.startsWith("10.")) return true;
+  if (host.startsWith("127.")) return true;
+  if (host.startsWith("169.254.")) return true;
+  if (/^172\.(1[6-9]|2\d|3[0-1])\./.test(host)) return true;
+  if (/^100\.(6[4-9]|[7-9]\d|1[01]\d|12[0-7])\./.test(host)) return true;
+  // IPv6 ULA (fc00::/7 → fc/fd prefix) and link-local (fe80::/10)
+  if (/^f[cd][0-9a-f]*:/i.test(host) || host.startsWith("fe80:")) return true;
+  return false;
+}
+function resolveEnvProxyUrl(targetUrl) {
+  if (noProxyMatch(targetUrl)) return null;
+  let protocol;
+  try {
+    protocol = new URL(targetUrl).protocol;
+  } catch {
+    return null;
+  }
+  const proxyUrl = protocol === "https:" ? process.env.HTTPS_PROXY || process.env.https_proxy || process.env.ALL_PROXY || process.env.all_proxy : process.env.HTTP_PROXY || process.env.http_proxy || process.env.ALL_PROXY || process.env.all_proxy;
+  if (!proxyUrl) return null;
+  return normalizeProxyUrl(proxyUrl, "environment proxy");
+}
+export function resolveProxyForRequest(targetUrl) {
+  let target;
+  try {
+    target = new URL(targetUrl);
+  } catch {
+    target = null;
+  }
+
+  // Always bypass proxy for local/LAN addresses
+  if (target && isLocalAddress(target.hostname.toLowerCase())) {
+    return {
+      source: "direct",
+      proxyUrl: null
+    };
+  }
+  const contextProxy = proxyContext.getStore();
+  if (contextProxy) {
+    return {
+      source: "context",
+      proxyUrl: proxyConfigToUrl(contextProxy)
+    };
+  }
+  const envProxyUrl = resolveEnvProxyUrl(targetUrl);
+  if (envProxyUrl) {
+    return {
+      source: "env",
+      proxyUrl: envProxyUrl
+    };
+  }
+  return {
+    source: "direct",
+    proxyUrl: null
+  };
+}
+function getTargetUrl(input) {
+  if (typeof input === "string") return input;
+  if (input && typeof input.url === "string") return input.url;
+  return String(input);
+}
+export async function runWithProxyContext(proxyConfig, fn, opts) {
+  if (typeof fn !== "function") {
+    throw new TypeError("runWithProxyContext requires a callback function");
+  }
+
+  // Inherit existing context if no specific proxyConfig is provided
+  const currentContext = proxyContext.getStore();
+  const effectiveProxyConfig = proxyConfig || currentContext || null;
+  const resolvedProxyUrl = effectiveProxyConfig ? proxyConfigToUrl(effectiveProxyConfig) : null;
+
+  // The caller must opt in, and the runtime feature flag must also be enabled.
+  // This fallback changes egress IP, so upgrades must not silently turn it on.
+  const directFallbackOnUnreachable = opts?.directFallbackOnUnreachable === true && isControlPlaneProxyDirectFallbackEnabled();
+  // Run fn with the proxy context cleared so the request egresses directly.
+  const runDirect = () => proxyContext.run(null, fn);
+
+  // T14: Proxy Fast-Fail
+  // Perform a short TCP reachability check before issuing upstream requests.
+  // Skip for edge-relay types (vercel / deno): proxyConfigToUrl returns
+  // "https://<host>" which is the relay endpoint itself, not an HTTP proxy —
+  // the actual routing is handled via x-relay-* headers below.
+  const isVercelRelay = isRelayType(effectiveProxyConfig?.type);
+  if (resolvedProxyUrl && !isVercelRelay) {
+    const reachable = await isProxyReachable(resolvedProxyUrl);
+    if (!reachable) {
+      const proxyLabel = proxyUrlForLogs(resolvedProxyUrl);
+      if (directFallbackOnUnreachable) {
+        console.warn(`[ProxyFetch] Proxy unreachable (${proxyLabel}); using a direct connection for this request.`);
+        return runDirect();
       }
-    } catch (error) {
-      console.warn(`[ProxyFetch] MITM bypass failed: ${error.message}`);
+      const err = new Error(`[Proxy Fast-Fail] Proxy unreachable: ${proxyLabel}`);
+      err.code = "PROXY_UNREACHABLE";
+      err.statusCode = 503;
+      throw err;
     }
   }
 
-  if (proxyUrl) {
+  // Fail-closed family check: when the proxy URL carries a ?family=ipv6|ipv4 marker
+  // (set for HOSTNAME proxies by proxyConfigToUrl), verify the hostname actually has a
+  // record in that family before egressing. Refuse early rather than silently fall back
+  // to the other family. No-op for IP literals (their family is intrinsic).
+  if (resolvedProxyUrl && !isVercelRelay) {
     try {
-      const proxyRes = await fetchViaProxyWithRetry(url, options, proxyUrl, retryAttempts);
-      return maybeFirstChunkTimeout(proxyRes, options);
-    } catch (proxyError) {
-      // If strictProxy is enabled, fail hard instead of falling back to direct
-      if (proxyOptions?.strictProxy === true) {
-        throw new Error(`[ProxyFetch] Proxy required but failed (strictProxy=true): ${proxyError.message}`);
+      const u = new URL(resolvedProxyUrl);
+      const fam = u.searchParams.get("family");
+      if (fam === "ipv6" || fam === "ipv4") {
+        const {
+          assertHostnameSupportsFamily
+        } = await import("./proxyFamilyResolve");
+        await assertHostnameSupportsFamily(u.hostname, fam === "ipv6" ? 6 : 4);
       }
-      console.warn(`[ProxyFetch] Proxy failed, falling back to direct: ${proxyError.message}`);
-      const directRes = await originalFetch(url, options);
-      return maybeFirstChunkTimeout(directRes, options);
+    } catch (familyErr) {
+      if (directFallbackOnUnreachable) {
+        console.warn(`[ProxyFetch] Proxy family pre-check failed (${proxyUrlForLogs(resolvedProxyUrl)}); using a direct connection for this request.`);
+        return runDirect();
+      }
+      const e = familyErr;
+      e.code = e.code || "PROXY_FAMILY_UNAVAILABLE";
+      e.statusCode = e.statusCode || 503;
+      throw e;
     }
   }
-
-  // got-scraping disabled — use native fetch directly
-  // (Re-enable per-host by wrapping with tryGotScrapingFetch when needed)
-  // Use cached no-timeout agent to prevent undici's default 300s body/headers
-  // timeout from aborting long SSE streams (e.g. reasoning models).
-  const agent = await getNoTimeoutAgent();
-  if (agent && !options.dispatcher) {
-    const directRes = await originalFetch(url, { ...options, dispatcher: agent });
-    return maybeFirstChunkTimeout(directRes, options);
-  }
-  const directRes = await originalFetch(url, options);
-  return maybeFirstChunkTimeout(directRes, options);
+  return proxyContext.run(effectiveProxyConfig, async () => {
+    if (resolvedProxyUrl && effectiveProxyConfig !== currentContext) {
+      console.log(`[ProxyFetch] Applied request proxy context: ${proxyUrlForLogs(resolvedProxyUrl)}`);
+    }
+    // #5217: record the proxy actually applied so a post-execution egress logger
+    // reflects the real egress (executors that pin a per-account proxy internally
+    // otherwise leave proxyInfo reading "direct"). Innermost runWithProxyContext
+    // wins, which is exactly the per-account proxy the executor selected.
+    if (effectiveProxyConfig) {
+      const sink = appliedProxyContext.getStore();
+      if (sink) sink.proxy = effectiveProxyConfig;
+    }
+    return fn();
+  });
 }
 
 /**
- * Patched global fetch with env-proxy support and MITM DNS bypass
+ * Like {@link runWithProxyContext}, but if the assigned proxy is unreachable or fails
+ * its pre-checks the request can degrade to a DIRECT connection instead of throwing.
+ *
+ * For control-plane flows — OAuth code/token exchange, connection tests, token refresh —
+ * where a dead pinned proxy must not block reaching the upstream (it otherwise surfaces
+ * as a generic "Internal server error"). Data-plane chat keeps strict pinning via
+ * runWithProxyContext so per-account egress-IP isolation is preserved.
+ *
+ * This remains disabled unless OMNIROUTE_CONTROL_PLANE_PROXY_DIRECT_FALLBACK is enabled
+ * from Feature Flags or the environment.
  */
-async function patchedFetch(url, options = {}) {
-  return proxyAwareFetch(url, options, null);
+export async function runWithProxyContextOrDirect(proxyConfig, fn) {
+  return runWithProxyContext(proxyConfig, fn, {
+    directFallbackOnUnreachable: true
+  });
+}
+async function patchedFetch(input, options = {}, deps = {}) {
+  if (options?.dispatcher) {
+    // When a dispatcher is present, we MUST use the undici library fetch
+    // to ensure version compatibility. Node 22 built-in fetch (undici v6)
+    // is incompatible with undici v8 dispatchers (missing onRequestStart, etc.)
+    const _undiciDispatcher = deps.undiciFetch ?? undiciFetch;
+    return _undiciDispatcher(input, options);
+  }
+  const targetUrl = getTargetUrl(input);
+  let resolved;
+  try {
+    resolved = resolveProxyForRequest(targetUrl);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    console.error(`[ProxyFetch] Proxy configuration error: ${message}`);
+    throw error;
+  }
+  const {
+    source,
+    proxyUrl
+  } = resolved;
+  if (!proxyUrl) {
+    // TLS fingerprint spoofing for direct connections (no proxy configured)
+    if (isTlsFingerprintEnabled() && tlsClient.available) {
+      try {
+        const store = tlsFingerprintContext.getStore();
+        if (store) store.used = true;
+        return await tlsClient.fetch(targetUrl, {
+          ...options,
+          headers: options.headers,
+          signal: options.signal ?? undefined
+        });
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        console.warn(`[ProxyFetch] TLS fingerprint failed, falling back to native fetch: ${message}`);
+        const store = tlsFingerprintContext.getStore();
+        if (store) store.used = false;
+      }
+    }
+    // Direct connection (no proxy) — use undici with custom dispatcher for timeout control.
+    // Falls back to original native fetch if dispatcher initialization fails (#1054).
+    // Retries once on transient dispatcher errors before falling back (fix: proxyfetch-undici-retry).
+    //
+    // Non-replayable body guard: if the body is stream-like (ReadableStream/Blob)
+    // or the input is a Request that carries a body, the first dispatcher attempt
+    // owns that body. Retrying or falling back to native fetch would replay a
+    // consumed/locked body and can mask the original transport error with
+    // "Response body object should not be disturbed or locked".
+    const hasNonReplayableBody = requestHasNonReplayableBody(input, options);
+    const maxAttempts = hasNonReplayableBody ? 1 : 2;
+    const _undiciDirect = deps.undiciFetch ?? undiciFetch;
+    const _nativeFallback = deps.nativeFetch ?? originalFetchWithDispatcher;
+    let lastDispatcherError = null;
+    for (let attempt = 0; attempt < maxAttempts; attempt++) {
+      try {
+        return await _undiciDirect(input, {
+          ...options,
+          // #4252: first attempt uses the pooled keep-alive dispatcher; a retry
+          // (after a transient socket error) uses the no-keep-alive dispatcher so
+          // it opens a FRESH socket instead of grabbing another stale pooled one
+          // — the burst pattern was the retry re-hitting a dead pooled socket and
+          // then falling through to native fetch (which also pools) → 502.
+          dispatcher: attempt === 0 ? getDefaultDispatcher() : getRetryDispatcher()
+        });
+      } catch (dispatcherError) {
+        const msg = dispatcherError instanceof Error ? dispatcherError.message : String(dispatcherError);
+        // CAUTION: Do NOT fallback to native fetch if the error is a version mismatch (invalid onRequestStart)
+        // because the native fetch will definitely fail with the undici v8 dispatcher.
+        if (msg.includes("onRequestStart")) {
+          console.error(`[ProxyFetch] Fatal version mismatch: Dispatcher (v8) vs Fetch (v6/native). Hardware upgrade or SOCKS5 config isolation required. Error: ${msg}`);
+          throw dispatcherError;
+        }
+        // Only retry/fallback for connection/dispatcher errors, not HTTP errors.
+        // Prefer the .code property when available (more stable across undici
+        // versions than message-string matching); fall back to substring match
+        // for errors that lack a structured code.
+        const errCode = dispatcherError?.code;
+        if (msg.includes("fetch failed") || errCode === "ECONNREFUSED" || msg.includes("ECONNREFUSED") || typeof errCode === "string" && errCode.startsWith("UND_ERR") || msg.includes("UND_ERR")) {
+          if (attempt === 0 && maxAttempts > 1) {
+            // First failure — retry once with a short jittered delay before giving up.
+            lastDispatcherError = dispatcherError;
+            await new Promise(r => setTimeout(r, 25 + Math.random() * 50));
+            continue;
+          }
+          if (hasNonReplayableBody) {
+            const detail = `dispatcher=[${describeFetchCause(dispatcherError)}] native=[skipped: non-replayable request body]`;
+            console.warn(`[ProxyFetch] skipping native fetch fallback for non-replayable body: ${detail}`);
+            if (dispatcherError instanceof Error) {
+              dispatcherError.proxyFetchDetail = detail;
+            }
+            throw dispatcherError;
+          }
+
+          // All attempts exhausted — try proxy fallback before native fetch
+          if (source === "direct" && isFeatureFlagEnabled("PROXY_AUTO_SELECT_ENABLED")) {
+            let targetHostname = "";
+            try {
+              targetHostname = new URL(targetUrl).hostname;
+            } catch {
+              // ignore
+            }
+            if (targetHostname) {
+              const fallbackProxyUrl = await findWorkingProxy(targetHostname, targetUrl);
+              if (fallbackProxyUrl) {
+                try {
+                  const dispatcher = createProxyDispatcher(fallbackProxyUrl);
+                  return await _undiciDirect(input, {
+                    ...options,
+                    dispatcher
+                  });
+                } catch {
+                  // Proxy also failed — fall through to native fetch
+                }
+              }
+            }
+          }
+          // Preserve original phrase intact for monitoring: "Undici dispatcher failed, falling back to native fetch"
+          // #4252: append the flattened err.cause (code/syscall/errno/address) — the bare
+          // "fetch failed" message hides what actually broke, making bursts undiagnosable.
+          console.warn(`[ProxyFetch] Undici dispatcher failed, falling back to native fetch (after retry): ${describeFetchCause(dispatcherError)}`);
+          try {
+            return await _nativeFallback(input, options);
+          } catch (nativeError) {
+            // #4252: both the undici dispatcher AND native fetch failed. Surface BOTH
+            // causes (server log) and tag the propagated error so the combo executor sees
+            // a diagnosable failure IMMEDIATELY instead of a bare "fetch failed" — the
+            // latter left jobs sitting until the 30s semaphore queue timeout, which then
+            // tripped the circuit breaker.
+            const detail = `dispatcher=[${describeFetchCause(dispatcherError)}] native=[${describeFetchCause(nativeError)}]`;
+            console.warn(`[ProxyFetch] native fetch fallback ALSO failed: ${detail}`);
+            if (nativeError instanceof Error) {
+              nativeError.proxyFetchDetail = detail;
+            }
+            throw nativeError;
+          }
+        }
+        throw dispatcherError;
+      }
+    }
+    // Should not be reached, but satisfy TypeScript control-flow.
+    throw lastDispatcherError;
+  }
+
+  // Edge relay (vercel / deno): instead of routing through an HTTP proxy
+  // dispatcher, we send x-relay-* headers to the edge function which forwards
+  // the request upstream. Both backends share the same envelope shape.
+  const contextProxy = proxyContext.getStore();
+  if (contextProxy && typeof contextProxy === "object" && isRelayType(contextProxy.type)) {
+    const vc = contextProxy;
+    if (!vc.relayAuth) {
+      // Generic message without internal labels — this throw can bubble up to
+      // catch blocks that put error.message in response bodies (combo per-model
+      // timeout, executor catch-all). Don't leak "[ProxyFetch]" diagnostics.
+      const label = vc.type === "vercel" ? "Vercel relay" : `${vc.type || "Edge"} relay`;
+      throw new Error(`${label} configuration error: missing relayAuth`);
+    }
+    const targetUrl = getTargetUrl(input);
+    const relayHeaders = buildVercelRelayHeaders(targetUrl, vc.relayAuth);
+    const mergedHeaders = new Headers(options?.headers);
+    for (const [k, v] of Object.entries(relayHeaders)) mergedHeaders.set(k, v);
+    // Pass host through proxyUrlForLogs so the same redaction policy applies
+    // to relay routing logs (the rest of this module already follows that rule).
+    const hostForLogs = proxyUrlForLogs(vc.host ? `https://${vc.host}` : "");
+    if (process.env.OMNIROUTE_PROXY_FETCH_DEBUG === "true") {
+      console.debug(`[ProxyFetch] Routing via ${vc.type || "edge"} relay: ${hostForLogs}`);
+    }
+    return await originalFetch(`https://${vc.host}`, {
+      ...options,
+      headers: mergedHeaders,
+      duplex: "half"
+    });
+  }
+  try {
+    const dispatcher = createProxyDispatcher(proxyUrl);
+    const _undiciProxy = deps.undiciFetch ?? undiciFetch;
+    return await _undiciProxy(input, {
+      ...options,
+      dispatcher
+    });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    console.error(`[ProxyFetch] Proxy request failed (${source}, fail-closed): ${message}`);
+    throw error;
+  }
 }
 
-// Idempotency guard — only patch once to avoid wrapping multiple times
-if (globalThis.fetch !== patchedFetch) {
+/**
+ * Named export for proxyFetch — identical to the patched globalThis.fetch but
+ * accepts an optional ProxyFetchDeps for unit test dependency injection.
+ * Production code should use globalThis.fetch (or the default export) instead.
+ */
+export async function proxyFetch(input, options = {}, deps = {}) {
+  return patchedFetch(input, options, deps);
+}
+if (!isCloud && !patchState.isPatched) {
   globalThis.fetch = patchedFetch;
+  patchState.isPatched = true;
 }
 
-export default patchedFetch;
+/**
+ * Run a function with TLS fingerprint tracking context.
+ * After fn completes, returns { result, tlsFingerprintUsed }.
+ */
+export async function runWithTlsTracking(fn) {
+  const store = {
+    used: false
+  };
+  const result = await tlsFingerprintContext.run(store, fn);
+  return {
+    result,
+    tlsFingerprintUsed: store.used
+  };
+}
+
+/** Check if TLS fingerprint is enabled and available */
+export function isTlsFingerprintActive() {
+  return isTlsFingerprintEnabled() && tlsClient.available;
+}
+
+/**
+ * Get the original unpatched global fetch function (Node.js native fetch
+ * before the proxy/TLS fingerprint patch was applied).
+ * Use this to bypass the patched fetch for specific requests when the
+ * proxy dispatcher has compatibility issues with a particular endpoint.
+ */
+export function getOriginalFetch() {
+  return originalFetch;
+}
+export async function proxyAwareFetch(url, options = {}, proxyOptions = null) {
+  return proxyFetch(url, options);
+}
+
+export default isCloud ? originalFetch : patchedFetch;

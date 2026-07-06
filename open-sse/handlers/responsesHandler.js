@@ -3,11 +3,11 @@
  * Converts Chat Completions to Codex Responses API format
  */
 
-import { handleChatCore } from "./chatCore.js";
-import { convertResponsesApiFormat } from "../translator/formats/responsesApi.js";
-import { createResponsesApiTransformStream } from "../transformer/responsesTransformer.js";
-import { convertResponsesStreamToJson } from "../transformer/streamToJsonConverter.js";
-import { SSE_HEADERS_CORS } from "../utils/sseConstants.js";
+import { handleChatCore } from "./chatCore";
+import { convertResponsesApiFormat } from "../translator/helpers/responsesApiHelper";
+import { createResponsesApiTransformStream } from "../transformer/responsesTransformer";
+import { createSseHeartbeatTransform, HEARTBEAT_SHAPES } from "../utils/sseHeartbeat";
+import { SSE_HEARTBEAT_INTERVAL_MS } from "../config/constants";
 
 /**
  * Handle /v1/responses request
@@ -20,20 +20,27 @@ import { SSE_HEADERS_CORS } from "../utils/sseConstants.js";
  * @param {function} options.onRequestSuccess - Callback when request succeeds
  * @param {function} options.onDisconnect - Callback when client disconnects
  * @param {string} options.connectionId - Connection ID for usage tracking
+ * @param {AbortSignal} [options.signal] - Abort signal for request/disconnect cleanup
  * @returns {Promise<{success: boolean, response?: Response, status?: number, error?: string}>}
  */
-export async function handleResponsesCore({ body, modelInfo, credentials, log, onCredentialsRefreshed, onRequestSuccess, onDisconnect, connectionId }) {
+export async function handleResponsesCore({
+  body,
+  modelInfo,
+  credentials,
+  log,
+  onCredentialsRefreshed,
+  onRequestSuccess,
+  onDisconnect,
+  connectionId,
+  signal
+}) {
   // Convert Responses API format to Chat Completions format
-  const convertedBody = convertResponsesApiFormat(body);
+  const convertedBody = convertResponsesApiFormat(body, credentials);
 
-  // Preserve client's stream preference (matches OpenClaw behavior)
-  // Default to false if omitted: Boolean(undefined) = false
-  const clientRequestedStreaming = convertedBody.stream === true;
-  if (convertedBody.stream === undefined) {
-    convertedBody.stream = false;
-  }
+  // Ensure stream is enabled
+  convertedBody.stream = true;
 
-  // Call chat core handler — force sourceFormat so streaming path knows this is a Responses API client
+  // Call chat core handler
   const result = await handleChatCore({
     body: convertedBody,
     modelInfo,
@@ -42,58 +49,38 @@ export async function handleResponsesCore({ body, modelInfo, credentials, log, o
     onCredentialsRefreshed,
     onRequestSuccess,
     onDisconnect,
+    clientRawRequest: null,
     connectionId,
-    sourceFormatOverride: "openai-responses"
+    userAgent: null,
+    comboName: null
   });
-
   if (!result.success || !result.response) {
     return result;
   }
-
   const response = result.response;
   const contentType = response.headers.get("Content-Type") || "";
 
-  // Case 1: Client wants non-streaming, but got SSE (provider forced it, e.g., Codex)
-  if (!clientRequestedStreaming && contentType.includes("text/event-stream")) {
-    try {
-      const jsonResponse = await convertResponsesStreamToJson(response.body);
-
-      return {
-        success: true,
-        response: new Response(JSON.stringify(jsonResponse), {
-          status: 200,
-          headers: {
-            "Content-Type": "application/json",
-            "Cache-Control": "no-cache",
-            "Access-Control-Allow-Origin": "*"
-          }
-        })
-      };
-    } catch (error) {
-      console.error("[Responses API] Stream-to-JSON conversion failed:", error);
-      return {
-        success: false,
-        status: 500,
-        error: "Failed to convert streaming response to JSON"
-      };
-    }
+  // If not SSE or error, return as-is
+  if (!contentType.includes("text/event-stream") || response.status !== 200) {
+    return result;
   }
 
-  // Case 2: Client wants streaming, got SSE - transform it
-  if (clientRequestedStreaming && contentType.includes("text/event-stream")) {
-    const transformStream = createResponsesApiTransformStream(null);
-    const transformedBody = response.body.pipeThrough(transformStream);
-
-    return {
-      success: true,
-      response: new Response(transformedBody, {
-        status: 200,
-        headers: { ...SSE_HEADERS_CORS }
-      })
-    };
-  }
-
-  // Case 3: Non-SSE response (error or non-streaming from provider) - return as-is
-  return result;
+  // Transform SSE stream to Responses API format (no logging in worker)
+  const transformStream = createResponsesApiTransformStream(null);
+  const transformedBody = response.body.pipeThrough(transformStream).pipeThrough(createSseHeartbeatTransform({
+    signal,
+    intervalMs: SSE_HEARTBEAT_INTERVAL_MS,
+    shape: HEARTBEAT_SHAPES.OPENAI_RESPONSES_IN_PROGRESS
+  }));
+  return {
+    success: true,
+    response: new Response(transformedBody, {
+      status: 200,
+      headers: {
+        "Content-Type": "text/event-stream",
+        "Cache-Control": "no-cache",
+        Connection: "keep-alive"
+      }
+    })
+  };
 }
-

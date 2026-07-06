@@ -1,107 +1,78 @@
 /**
- * Codex (OpenAI) usage handler
+ * usage/codex.ts — Codex (OpenAI / ChatGPT backend) usage fetcher.
+ *
+ * Extracted from services/usage.ts (god-file decomposition): the Codex family — the ChatGPT
+ * backend usage-API config and the getCodexUsage fetcher that reads the persisted workspace
+ * binding and shapes quotas via buildCodexUsageQuotas. Depends only on the scalar leaf +
+ * codexUsageQuotas — no host coupling — so it lives as a co-located provider leaf. usage.ts
+ * imports getCodexUsage (dispatcher). Behavior-preserving move.
  */
 
-import { proxyAwareFetch } from "../../utils/proxyFetch.js";
-import { U, parseResetTime, toFiniteNumber } from "./shared.js";
+import { buildCodexUsageQuotas } from "../codexUsageQuotas";
+import { getFieldValue } from "./scalars";
+import { proxyAwareFetch } from "../../utils/proxyFetch";
+
+function toFiniteNumber(value, fallback = 0) {
+  if (typeof value === "number" && Number.isFinite(value)) return value;
+  if (typeof value === "string" && value.trim()) {
+    const parsed = Number(value);
+    if (Number.isFinite(parsed)) return parsed;
+  }
+  return fallback;
+}
 
 // Codex (OpenAI) API config
 const CODEX_CONFIG = {
-  usageUrl: U("codex").url,
-  resetCreditsConsumeUrl: U("codex").resetCreditsConsumeUrl,
+  usageUrl: "https://chatgpt.com/backend-api/wham/usage",
+  resetCreditsConsumeUrl: "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits/consume"
 };
 
-function getCodexRateLimitBody(snapshot) {
-  if (!snapshot || typeof snapshot !== "object" || Array.isArray(snapshot)) return null;
-  return snapshot.rate_limit && typeof snapshot.rate_limit === "object"
-    ? snapshot.rate_limit
-    : snapshot;
-}
-
-function formatCodexWindow(window) {
-  const used = Math.max(0, Math.min(100, toFiniteNumber(window?.used_percent ?? window?.percent_used, 0)));
-  return {
-    used,
-    total: 100,
-    remaining: Math.max(0, 100 - used),
-    resetAt: parseResetTime(window?.reset_at ?? window?.resets_at ?? window?.resetAt ?? null),
-    unlimited: false,
-  };
-}
-
-function appendCodexQuotaWindows(quotas, prefix, snapshot) {
-  const rateLimit = getCodexRateLimitBody(snapshot);
-  if (!rateLimit) return false;
-
-  const primary = rateLimit.primary_window || rateLimit.primary || snapshot.primary_window || snapshot.primary;
-  const secondary = rateLimit.secondary_window || rateLimit.secondary || snapshot.secondary_window || snapshot.secondary;
-  let added = false;
-
-  if (primary) {
-    quotas[prefix ? `${prefix}_session` : "session"] = formatCodexWindow(primary);
-    added = true;
-  }
-  if (secondary) {
-    quotas[prefix ? `${prefix}_weekly` : "weekly"] = formatCodexWindow(secondary);
-    added = true;
-  }
-
-  return added;
-}
-
-function getCodexReviewRateLimit(data) {
-  if (data.code_review_rate_limit || data.review_rate_limit) {
-    return data.code_review_rate_limit || data.review_rate_limit;
-  }
-
-  const byLimitId = data.rate_limits_by_limit_id;
-  if (byLimitId && typeof byLimitId === "object" && !Array.isArray(byLimitId)) {
-    return byLimitId.code_review || byLimitId.codex_review || byLimitId.review || null;
-  }
-
-  const additional = Array.isArray(data.additional_rate_limits) ? data.additional_rate_limits : [];
-  return additional.find((entry) => {
-    const id = String(entry?.limit_name || entry?.metered_feature || entry?.id || "").toLowerCase();
-    return id === "code_review" || id === "codex_review" || id === "review" || id.includes("review");
-  }) || null;
-}
-
-export async function getCodexUsage(accessToken, proxyOptions = null) {
+/**
+ * Codex (OpenAI) Usage - Fetch from ChatGPT backend API
+ * IMPORTANT: Uses persisted workspaceId from OAuth to ensure correct workspace binding.
+ * No fallback to other workspaces - strict binding to user's selected workspace.
+ */
+export async function getCodexUsage(accessToken, providerSpecificData = {}) {
   try {
-    const response = await proxyAwareFetch(CODEX_CONFIG.usageUrl, {
-      method: "GET",
-      headers: {
-        "Authorization": `Bearer ${accessToken}`,
-        "Accept": "application/json",
-      },
-    }, proxyOptions);
-
-    if (!response.ok) {
-      return { message: `Codex connected. Usage API temporarily unavailable (${response.status}).` };
+    // Use persisted workspace ID from OAuth - NO FALLBACK
+    const accountId = typeof providerSpecificData.workspaceId === "string" ? providerSpecificData.workspaceId : null;
+    const headers = {
+      Authorization: `Bearer ${accessToken}`,
+      "Content-Type": "application/json",
+      Accept: "application/json"
+    };
+    if (accountId) {
+      headers["chatgpt-account-id"] = accountId;
     }
-
+    const response = await fetch(CODEX_CONFIG.usageUrl, {
+      method: "GET",
+      headers
+    });
+    if (!response.ok) {
+      if (response.status === 401 || response.status === 403) {
+        return {
+          message: `Codex token expired or access denied. Please re-authenticate the connection.`
+        };
+      }
+      throw new Error(`Codex API error: ${response.status}`);
+    }
     const data = await response.json();
-    const normalRateLimit = data.rate_limit || data.rate_limits || data.rate_limits_by_limit_id?.codex || {};
-    const reviewRateLimit = getCodexReviewRateLimit(data);
-    const availableResetCredits = Math.max(0, toFiniteNumber(data.rate_limit_reset_credits?.available_count, 0));
-    const quotas = {};
-
-    appendCodexQuotaWindows(quotas, "", normalRateLimit);
-    appendCodexQuotaWindows(quotas, "review", reviewRateLimit);
-
+    const {
+      rateLimit,
+      quotas
+    } = buildCodexUsageQuotas(data);
     return {
-      plan: data.plan_type || data.summary?.plan || "unknown",
-      limitReached: getCodexRateLimitBody(normalRateLimit)?.limit_reached || false,
-      reviewLimitReached: getCodexRateLimitBody(reviewRateLimit)?.limit_reached || false,
-      resetCredits: { availableCount: availableResetCredits },
-      quotas,
+      plan: String(getFieldValue(data, "plan_type", "planType") || "unknown"),
+      limitReached: Boolean(getFieldValue(rateLimit, "limit_reached", "limitReached")),
+      quotas
     };
   } catch (error) {
-    throw new Error(`Failed to fetch Codex usage: ${error.message}`);
+    return {
+      message: `Failed to fetch Codex usage: ${error.message}`
+    };
   }
 }
 
-// Consume one Codex rate-limit reset credit (irreversible, spends 1 credit)
 export async function consumeCodexRateLimitResetCredit(accessToken, redeemRequestId, proxyOptions = null) {
   if (!accessToken) {
     throw new Error("No Codex access token available. Please re-authorize the connection.");

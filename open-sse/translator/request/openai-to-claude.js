@@ -1,185 +1,359 @@
-import { register } from "../index.js";
-import { FORMATS } from "../formats.js";
-import { CLAUDE_SYSTEM_PROMPT } from "../../config/appConstants.js";
-import { adjustMaxTokens } from "../formats/maxTokens.js";
-import { safeParseJSON } from "../concerns/json.js";
-import { parseDataUri } from "../concerns/image.js";
-import { extractTextContent } from "../formats/gemini.js";
-import { ROLE, OPENAI_BLOCK, CLAUDE_BLOCK } from "../schema/index.js";
+import { register } from "../registry";
+import { FORMATS } from "../formats";
+// CLAUDE_SYSTEM_PROMPT import removed — no longer injected unconditionally (#1966/#2130)
+import { supportsClaudeMaxEffort, supportsXHighEffort } from "../../config/providerModels";
+import { adjustMaxTokens } from "../helpers/maxTokensHelper";
+import { sanitizeToolId } from "../helpers/schemaCoercion";
+import { safeParseJSON } from "../helpers/jsonUtil";
+import { DEFAULT_THINKING_CLAUDE_SIGNATURE } from "../../config/defaultThinkingSignature";
+import { capMaxOutputTokens } from "../../stubs/lib/modelCapabilities";
+import { isAdaptiveThinkingOnly } from "../../stubs/shared/constants/modelSpecs";
 
-// Empty prefix matches real Claude Code behavior (no tool name prefix).
-// Previously "proxy_" was used but this is a detectable fingerprint difference.
-const CLAUDE_OAUTH_TOOL_PREFIX = "";
+// Reasoning-effort levels Anthropic accepts on `output_config.effort`. Used to steer
+// adaptive-only Claude models (Opus 4.7+/Fable 5) without ever emitting a manual budget.
+const ADAPTIVE_EFFORT_LEVELS = new Set(["low", "medium", "high", "xhigh", "max"]);
+
+// Prefix for Claude OAuth tool names to avoid conflicts
+// Can be disabled per-request via body._disableToolPrefix = true
+export const CLAUDE_OAUTH_TOOL_PREFIX = "proxy_";
+const CLAUDE_TOOL_CHOICE_REQUIRED = "an" + "y";
+const COPILOT_REASONING_SUMMARY_MARKER = "_omnirouteCopilotReasoningSummary";
+function wantsCopilotSummarizedThinking(body) {
+  return body?.[COPILOT_REASONING_SUMMARY_MARKER] === "summarized";
+}
+function applyCopilotSummarizedThinkingDisplay(thinking, body) {
+  if (!thinking || !wantsCopilotSummarizedThinking(body) || thinking.type === "disabled") {
+    return thinking;
+  }
+  return {
+    ...thinking,
+    display: "summarized"
+  };
+}
+
+// Anthropic constraints for the thinking + max_tokens contract:
+//   - thinking.budget_tokens must be >= 1024 when thinking is enabled
+//   - max_tokens must be > thinking.budget_tokens (covers thinking + response)
+//   - max_tokens must be <= model output cap (e.g. 128000 for Opus 4.7)
+const MIN_CLAUDE_THINKING_BUDGET = 1024;
+const MIN_RESPONSE_ROOM = 1024;
+function safeCapMaxOutputTokens(model) {
+  try {
+    const cap = capMaxOutputTokens(model);
+    return typeof cap === "number" && cap > 0 ? cap : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Fit Claude thinking budget within the model's max output cap.
+ *
+ * Replaces the previous unconditional `max_tokens = budget + 8192` inflation,
+ * which could exceed the model output cap (e.g. Opus 4.7's 128000 ceiling) and
+ * trigger HTTP 400 from Anthropic ("max_tokens > 128000").
+ *
+ * Strategy (preserves caller intent up to the model cap):
+ *   - Preserve caller's max_tokens as response room (floored to MIN_RESPONSE_ROOM)
+ *   - Target max_tokens = responseRoom + requestedBudget, capped at modelCap
+ *   - fittedBudget = max_tokens - responseRoom (the thinking budget actually used)
+ *   - If the cap squeezes fittedBudget below the Anthropic minimum, retry with
+ *     responseRoom shrunk to MIN_RESPONSE_ROOM; if still below MIN, disable
+ *     thinking entirely (cap too tight for any reasoning).
+ *
+ * Worked example (real-world Opus 4.7 case that previously 400'd):
+ *   caller max_tokens = 32000, reasoning_effort=high → budget = 131072,
+ *   model cap = 128000.
+ *   responseRoom = max(32000, 1024) = 32000
+ *   target       = min(32000 + 131072, 128000) = 128000
+ *   fittedBudget = 128000 - 32000 = 96000  (>= 1024, OK)
+ *   → max_tokens=128000, budget_tokens=96000 (vs. the old buggy 139264 / 131072).
+ */
+export function fitThinkingToMaxTokens(model, callerMaxTokens, thinking) {
+  const modelCap = safeCapMaxOutputTokens(model);
+  const requestedBudget = Number(thinking?.budget_tokens) || 0;
+
+  // No budgeted thinking — just cap max_tokens to the model output ceiling.
+  if (!thinking || requestedBudget <= 0) {
+    return {
+      maxTokens: modelCap === null ? Math.max(callerMaxTokens, 1) : Math.min(Math.max(callerMaxTokens, 1), modelCap),
+      thinking
+    };
+  }
+  let responseRoom = Math.max(callerMaxTokens, MIN_RESPONSE_ROOM);
+  let target = modelCap === null ? responseRoom + requestedBudget : Math.min(responseRoom + requestedBudget, modelCap);
+  let fittedBudget = target - responseRoom;
+
+  // If the cap squeezed thinking below Anthropic's floor, try shrinking
+  // response room to MIN_RESPONSE_ROOM to recover budget.
+  if (fittedBudget < MIN_CLAUDE_THINKING_BUDGET && responseRoom > MIN_RESPONSE_ROOM) {
+    responseRoom = MIN_RESPONSE_ROOM;
+    target = modelCap === null ? responseRoom + requestedBudget : Math.min(responseRoom + requestedBudget, modelCap);
+    fittedBudget = target - responseRoom;
+  }
+
+  // Cap too tight for any thinking — disable rather than send an invalid request.
+  if (fittedBudget < MIN_CLAUDE_THINKING_BUDGET) {
+    return {
+      maxTokens: modelCap ?? Math.max(callerMaxTokens, 1),
+      thinking: undefined
+    };
+  }
+  const adjustedThinking = {
+    ...thinking
+  };
+  if (fittedBudget < requestedBudget) {
+    adjustedThinking.budget_tokens = fittedBudget;
+  }
+  return {
+    maxTokens: target,
+    thinking: adjustedThinking
+  };
+}
+/**
+ * T02: Recursively strips empty text blocks from content arrays.
+ * Anthropic returns 400 "text content blocks must be non-empty" when a
+ * text block has text: "". Must also recurse into nested tool_result.content.
+ * Ref: sub2api PR #1212
+ */
+export function stripEmptyTextBlocks(content) {
+  if (!Array.isArray(content)) return content ?? [];
+  return content.filter(block => {
+    if (block && typeof block === "object" && block.type === "text") {
+      const text = block.text;
+      if (text === "" || text == null) return false;
+    }
+    return true;
+  }).map(block => {
+    if (block && typeof block === "object" && block.type === "tool_result" && Array.isArray(block.content)) {
+      // Recurse into nested tool_result.content
+      return {
+        ...block,
+        content: stripEmptyTextBlocks(block.content)
+      };
+    }
+    return block;
+  });
+}
+
+/**
+ * T15: Normalize content to string form.
+ * Handles both string and array-of-blocks forms (Cursor, Codex 2.x, etc.).
+ * Ref: sub2api PR #1197
+ */
+export function normalizeContentToString(content) {
+  if (!content) return "";
+  if (typeof content === "string") return content;
+  if (Array.isArray(content)) {
+    return content.filter(b => b.type === "text").map(b => String(b.text ?? "")).join("\n");
+  }
+  return "";
+}
 
 // Convert OpenAI request to Claude format
-export function openaiToClaudeRequest(model, body, stream, credentials, provider) {
+export function openaiToClaudeRequest(model, body, stream) {
+  // Check if tool prefix should be disabled (configured per-provider or global)
+  const disableToolPrefix = body?._disableToolPrefix === true;
+
   // Tool name mapping for Claude OAuth (capitalizedName → originalName)
   const toolNameMap = new Map();
   const result = {
     model: model,
     max_tokens: adjustMaxTokens(body),
-    stream: stream
+    stream: stream,
+    messages: []
   };
 
   // Temperature
-  if (body.temperature !== undefined) {
+  //
+  // Claude's Messages API rejects `temperature` when extended thinking is active.
+  // Two cases where thinking is on:
+  //   (a) Caller passes `body.thinking` or `body.reasoning_effort` (handled later —
+  //       `result.thinking` becomes truthy, and we strip temperature at the end).
+  //   (b) The request targets Claude OAuth (claude-code), which always sends
+  //       `Anthropic-Beta: ...,interleaved-thinking-2025-05-14,...` in headers.
+  //       The model is forced into thinking server-side, but neither `body.thinking`
+  //       nor `result.thinking` will be set, so we detect this by model name. This
+  //       affects claude-opus-4.x and claude-sonnet-4.x (the families that support
+  //       extended thinking).
+  //
+  // For models that don't force thinking (haiku, older sonnets), preserve temperature.
+  // Note: Opus 4.7+/Fable 5 already drop sampling params upstream of the translator via
+  // the registry `unsupportedParams` strip; this covers the remaining 4.x families.
+  const modelForcesThinking = /claude-(?:opus|sonnet)-4/i.test(String(model));
+  if (body.temperature !== undefined && !modelForcesThinking) {
     result.temperature = body.temperature;
+  }
+  if (body.temperature === undefined && body.top_p !== undefined) {
+    result.top_p = body.top_p;
+  }
+  if (body.stop !== undefined) {
+    result.stop_sequences = Array.isArray(body.stop) ? body.stop : [body.stop];
   }
 
   // Messages
-  result.messages = [];
   const systemParts = [];
-
   if (body.messages && Array.isArray(body.messages)) {
-    // Extract system messages
+    // Extract system messages (T15: handle both string and array content)
+    // Also treat "developer" role as system — OpenAI Responses API uses developer role
+    // for system-level instructions, and it must reach the Claude system field, not become an assistant turn.
     for (const msg of body.messages) {
-      if (msg.role === ROLE.SYSTEM) {
-        systemParts.push(typeof msg.content === "string" ? msg.content : extractTextContent(msg.content, "\n"));
+      if (msg.role === "system" || msg.role === "developer") {
+        systemParts.push(typeof msg.content === "string" ? msg.content : normalizeContentToString(msg.content));
       }
     }
 
-    // Filter out system messages for separate processing
-    const nonSystemMessages = body.messages.filter(m => m.role !== ROLE.SYSTEM);
+    // Filter out system/developer messages for separate processing
+    const nonSystemMessages = body.messages.filter(m => m.role !== "system" && m.role !== "developer");
 
     // Process messages with merging logic
     // CRITICAL: tool_result must be in separate message immediately after tool_use
     let currentRole = undefined;
     let currentParts = [];
-
     const flushCurrentMessage = () => {
       if (currentRole && currentParts.length > 0) {
-        result.messages.push({ role: currentRole, content: currentParts });
+        result.messages.push({
+          role: currentRole,
+          content: currentParts
+        });
         currentParts = [];
       }
     };
-
     for (const msg of nonSystemMessages) {
-      const newRole = (msg.role === ROLE.USER || msg.role === ROLE.TOOL) ? ROLE.USER : ROLE.ASSISTANT;
-      const blocks = getContentBlocksFromMessage(msg, toolNameMap);
-      const hasToolUse = blocks.some(b => b.type === CLAUDE_BLOCK.TOOL_USE);
-      const hasToolResult = blocks.some(b => b.type === CLAUDE_BLOCK.TOOL_RESULT);
+      const newRole = msg.role === "user" || msg.role === "tool" ? "user" : "assistant";
+      const blocks = getContentBlocksFromMessage(msg, toolNameMap, disableToolPrefix);
+      const hasToolUse = blocks.some(b => b.type === "tool_use");
+      const hasToolResult = blocks.some(b => b.type === "tool_result");
 
       // Separate tool_result from other content
       if (hasToolResult) {
-        const toolResultBlocks = blocks.filter(b => b.type === CLAUDE_BLOCK.TOOL_RESULT);
-        const otherBlocks = blocks.filter(b => b.type !== CLAUDE_BLOCK.TOOL_RESULT);
-
+        const toolResultBlocks = blocks.filter(b => b.type === "tool_result");
+        const otherBlocks = blocks.filter(b => b.type !== "tool_result");
         flushCurrentMessage();
-
         if (toolResultBlocks.length > 0) {
-          result.messages.push({ role: ROLE.USER, content: toolResultBlocks });
+          result.messages.push({
+            role: "user",
+            content: toolResultBlocks
+          });
         }
-
         if (otherBlocks.length > 0) {
           currentRole = newRole;
           currentParts.push(...otherBlocks);
         }
         continue;
       }
-
       if (currentRole !== newRole) {
         flushCurrentMessage();
         currentRole = newRole;
       }
-
       currentParts.push(...blocks);
-
       if (hasToolUse) {
         flushCurrentMessage();
       }
     }
-
     flushCurrentMessage();
+
+    // Remove assistant messages with empty content (can happen when all tool_use blocks were skipped)
+    result.messages = result.messages.filter(msg => {
+      if (msg.role === "assistant" && Array.isArray(msg.content) && msg.content.length === 0) {
+        return false;
+      }
+      return true;
+    });
+
+    // Filter orphaned tool_result blocks whose tool_use_id has no matching tool_use
+    const allToolUseIds = new Set();
+    for (const msg of result.messages) {
+      if (msg.role === "assistant" && Array.isArray(msg.content)) {
+        for (const block of msg.content) {
+          if (block.type === "tool_use" && block.id) {
+            allToolUseIds.add(String(block.id));
+          }
+        }
+      }
+    }
+    for (const msg of result.messages) {
+      if (msg.role === "user" && Array.isArray(msg.content)) {
+        msg.content = msg.content.filter(block => {
+          if (block.type === "tool_result" && block.tool_use_id) {
+            return allToolUseIds.has(String(block.tool_use_id));
+          }
+          return true;
+        });
+      }
+    }
+    // Remove user messages that became empty after orphan filtering
+    result.messages = result.messages.filter(msg => {
+      if (msg.role === "user" && Array.isArray(msg.content) && msg.content.length === 0) {
+        return false;
+      }
+      return true;
+    });
 
     // Add cache_control to last assistant message
     for (let i = result.messages.length - 1; i >= 0; i--) {
       const message = result.messages[i];
-      if (message.role === ROLE.ASSISTANT && Array.isArray(message.content) && message.content.length > 0) {
-        // Find the last block that can have cache_control (not thinking blocks)
-        const validBlockTypes = [CLAUDE_BLOCK.TEXT, CLAUDE_BLOCK.TOOL_USE, CLAUDE_BLOCK.TOOL_RESULT, CLAUDE_BLOCK.IMAGE];
-        for (let j = message.content.length - 1; j >= 0; j--) {
-          const block = message.content[j];
-          if (validBlockTypes.includes(block.type)) {
-            block.cache_control = { type: "ephemeral" };
-            break;
-          }
+      if (message.role === "assistant" && Array.isArray(message.content) && message.content.length > 0) {
+        const lastBlock = message.content[message.content.length - 1];
+        if (lastBlock) {
+          lastBlock.cache_control = {
+            type: "ephemeral"
+          };
+          break;
         }
-        break;
       }
     }
-  }
-
-  // Handle response_format for JSON mode
-  if (body.response_format) {
-    const responseFormat = body.response_format;
-    if (responseFormat.type === "json_schema" && responseFormat.json_schema?.schema) {
-      const schemaJson = JSON.stringify(responseFormat.json_schema.schema, null, 2);
-      systemParts.push(`You must respond with valid JSON that strictly follows this JSON schema:
-\`\`\`json
-${schemaJson}
-\`\`\`
-Respond ONLY with the JSON object, no other text.`);
-    } else if (responseFormat.type === "json_object") {
-      systemParts.push("You must respond with valid JSON. Respond ONLY with a JSON object, no other text.");
-    }
-  }
-
-  // System prompt assembly
-  // Only inject the Claude Code cloaking prompt for the native "claude" provider
-  // (real Anthropic API fingerprinting). anthropic-compatible-* providers are third-party
-  // APIs using the Anthropic format — injecting this prompt is meaningless and wastes tokens.
-  const isNativeClaude = !provider || provider === "claude";
-
-  if (systemParts.length > 0) {
-    const systemText = systemParts.join("\n");
-    if (isNativeClaude) {
-      const claudeCodePrompt = { type: CLAUDE_BLOCK.TEXT, text: CLAUDE_SYSTEM_PROMPT };
-      result.system = [
-        claudeCodePrompt,
-        { type: CLAUDE_BLOCK.TEXT, text: systemText, cache_control: { type: "ephemeral", ttl: "1h" } }
-      ];
-    } else {
-      result.system = [
-        { type: CLAUDE_BLOCK.TEXT, text: systemText, cache_control: { type: "ephemeral", ttl: "1h" } }
-      ];
-    }
-  } else {
-    if (isNativeClaude) {
-      const claudeCodePrompt = { type: CLAUDE_BLOCK.TEXT, text: CLAUDE_SYSTEM_PROMPT };
-      result.system = [claudeCodePrompt];
-    }
-    // anthropic-compatible-* with no system prompt: omit system entirely (let provider use its default)
   }
 
   // Tools - convert from OpenAI format to Claude format with prefix for OAuth
   if (body.tools && Array.isArray(body.tools)) {
-    result.tools = [];
-    for (const tool of body.tools) {
-      // Pass-through built-in tools (e.g. web_search_20250305) without prefix or conversion
-      const toolType = tool.type;
-      if (toolType && toolType !== OPENAI_BLOCK.FUNCTION) {
-        result.tools.push(tool);
-        continue;
+    result.tools = body.tools.map(tool => {
+      const toolData = tool.type === "function" && tool.function ? tool.function : tool;
+      const originalName = typeof toolData.name === "string" ? toolData.name.trim() : "";
+      if (!originalName) {
+        return null;
       }
 
-      const toolData = toolType === OPENAI_BLOCK.FUNCTION && tool.function ? tool.function : tool;
-      const originalName = toolData.name;
-
       // Claude OAuth requires prefixed tool names to avoid conflicts
-      const toolName = CLAUDE_OAUTH_TOOL_PREFIX + originalName;
+      // When prefix is disabled (non-Claude backends), use original name
+      const toolName = disableToolPrefix ? originalName : CLAUDE_OAUTH_TOOL_PREFIX + originalName;
 
       // Store mapping for response translation (prefixed → original)
-      toolNameMap.set(toolName, originalName);
+      if (!disableToolPrefix) {
+        toolNameMap.set(toolName, originalName);
+      }
 
-      result.tools.push({
+      // Normalize input_schema: Anthropic requires `properties` when type is "object" (#595).
+      // MCP tools (e.g. pencil, computer_use) may omit properties on object-type schemas.
+      const rawSchema = toolData.parameters || toolData.input_schema || {
+        type: "object",
+        properties: {},
+        required: []
+      };
+      const normalizedSchema = rawSchema.type === "object" && !rawSchema.properties ? {
+        ...rawSchema,
+        properties: {}
+      } : rawSchema;
+      return {
         name: toolName,
         description: toolData.description || "",
-        input_schema: toolData.parameters || toolData.input_schema || { type: "object", properties: {}, required: [] }
-      });
-    }
+        input_schema: normalizedSchema
+      };
+    }).filter(tool => Boolean(tool));
 
-    if (result.tools.length > 0) {
-      result.tools[result.tools.length - 1].cache_control = { type: "ephemeral", ttl: "1h" };
+    // Filter out tools with empty names (would cause Claude 400 error)
+    result.tools = result.tools.filter(tool => tool.name && tool.name?.trim());
+
+    // Cache breakpoint on the last non-defer-loading tool — Anthropic
+    // rejects cache_control on defer_loading tools.
+    for (let i = result.tools.length - 1; i >= 0; i--) {
+      if (!result.tools[i].defer_loading) {
+        result.tools[i].cache_control = {
+          type: "ephemeral",
+          ttl: "1h"
+        };
+        break;
+      }
     }
   }
 
@@ -188,156 +362,393 @@ Respond ONLY with the JSON object, no other text.`);
     result.tool_choice = convertOpenAIToolChoice(body.tool_choice);
   }
 
-  // Thinking is normalized centrally by applyThinking (thinkingUnified.js) after translation.
+  // response_format: inject JSON structured output instruction into system prompt.
+  // Claude doesn't natively support response_format, so we insert a system-level instruction.
+  // NOTE: systemParts are consumed later (after this block) — they're accumulated here.
+  if (body.response_format) {
+    const fmt = body.response_format;
+    if (fmt.type === "json_schema" && fmt.json_schema?.schema) {
+      const schemaJson = JSON.stringify(fmt.json_schema.schema, null, 2);
+      systemParts.push(`You must respond with valid JSON that strictly follows this JSON schema:\n\`\`\`json\n${schemaJson}\n\`\`\`\nRespond ONLY with the JSON object, no other text.`);
+    } else if (fmt.type === "json_object") {
+      systemParts.push("You must respond with valid JSON. Respond ONLY with a JSON object, no other text.");
+    }
+  }
+
+  // System messages and cache_control
+  // Fix #2130: Preserve body.system when present (Claude Code sends system as native
+  // Anthropic array through the /chat/completions endpoint). Without this, the system
+  // prompt is silently dropped when no role="system" messages exist in body.messages.
+  if (systemParts.length > 0) {
+    const systemText = systemParts.join("\n");
+    const systemBlock = {
+      type: "text",
+      text: systemText,
+      cache_control: {
+        type: "ephemeral",
+        ttl: "1h"
+      }
+    };
+    // Merge with existing body.system if present
+    if (Array.isArray(body.system)) {
+      result.system = [...body.system, systemBlock];
+    } else if (typeof body.system === "string" && body.system.length > 0) {
+      result.system = [{
+        type: "text",
+        text: body.system
+      }, systemBlock];
+    } else {
+      result.system = [systemBlock];
+    }
+  } else if (body.system) {
+    // No role="system" messages, but body.system exists — pass through as-is
+    result.system = Array.isArray(body.system) ? body.system : [{
+      type: "text",
+      text: String(body.system)
+    }];
+  }
+
+  // Thinking configuration
+  if (body.thinking) {
+    result.thinking = {
+      type: body.thinking.type || "enabled",
+      ...(body.thinking.budget_tokens && {
+        budget_tokens: body.thinking.budget_tokens
+      }),
+      ...(body.thinking.max_tokens && {
+        max_tokens: body.thinking.max_tokens
+      })
+    };
+  } else if (body.reasoning_effort) {
+    // Convert OpenAI reasoning_effort to Claude thinking format (#627)
+    // Clients like OpenCode send reasoning_effort via @ai-sdk/openai-compatible
+    const requestedEffort = String(body.reasoning_effort).toLowerCase();
+    const normalizedEffort = requestedEffort === "max" && !supportsClaudeMaxEffort(model) ? "high" : requestedEffort === "xhigh" && !supportsXHighEffort("claude", model) ? "high" : requestedEffort;
+    if (isAdaptiveThinkingOnly(model)) {
+      // Opus 4.7+/Fable 5 removed manual extended thinking: a fixed `budget_tokens`
+      // (or `type:"enabled"`) is a hard 400. Steer EVERY level via adaptive +
+      // output_config.effort instead of the budget buckets below. Unrecognized levels
+      // leave thinking unset so the model keeps its adaptive default rather than 400ing
+      // on an invalid effort value.
+      if (ADAPTIVE_EFFORT_LEVELS.has(normalizedEffort)) {
+        result.thinking = {
+          type: "adaptive"
+        };
+        result.output_config = {
+          ...(result.output_config || {}),
+          effort: normalizedEffort
+        };
+      }
+    } else if (normalizedEffort === "max" || normalizedEffort === "xhigh") {
+      result.thinking = {
+        type: "adaptive"
+      };
+      result.output_config = {
+        ...(result.output_config || {}),
+        effort: normalizedEffort
+      };
+    } else {
+      const effortBudgetMap = {
+        low: 1024,
+        medium: 10240,
+        high: 131072,
+        max: 131072
+      };
+      const budget = effortBudgetMap[normalizedEffort];
+      if (budget !== undefined && budget > 0) {
+        result.thinking = {
+          type: "enabled",
+          budget_tokens: budget
+        };
+      }
+    }
+  }
+
+  // Fit thinking budget within the model's output cap and ensure
+  // max_tokens > budget_tokens for all thinking configurations (#627).
+  // Replaces the previous unconditional `budget + 8192` inflation, which
+  // could exceed model caps (e.g. Opus 4.7's 128000 ceiling) and trigger
+  // HTTP 400 from Anthropic.
+  const fitted = fitThinkingToMaxTokens(model, Number(result.max_tokens) || 0, result.thinking);
+  result.max_tokens = fitted.maxTokens;
+  if (fitted.thinking === undefined) {
+    delete result.thinking;
+  } else {
+    result.thinking = applyCopilotSummarizedThinkingDisplay(fitted.thinking, body);
+  }
+  delete result[COPILOT_REASONING_SUMMARY_MARKER];
+
+  // Final guard: Claude rejects `temperature` whenever extended thinking is
+  // enabled. If `result.thinking` was set above from `body.thinking` or
+  // `body.reasoning_effort` (manual budget or adaptive effort), drop temperature
+  // defensively. The model-name strip earlier already covers Claude OAuth's
+  // forced-thinking case (claude-opus-4.x / claude-sonnet-4.x).
+  if (result.thinking && result.temperature !== undefined) {
+    delete result.temperature;
+  }
 
   // Attach toolNameMap to result for response translation
   if (toolNameMap.size > 0) {
     result._toolNameMap = toolNameMap;
   }
 
+  // Empty-messages guard. Claude's Messages API rejects an empty `messages`
+  // array with `400 messages: at least one message is required`. This happens
+  // when the incoming OpenAI request carried only `system`/`developer` turns
+  // (e.g. an all-system compaction or title-generation request from a client
+  // like OpenCode): those are hoisted into `result.system` above, leaving
+  // `messages` empty. Synthesize a minimal user turn so the request stays
+  // valid — the system instructions still drive the response. (#5245)
+  if (result.messages.length === 0) {
+    result.messages.push({
+      role: "user",
+      content: [{
+        type: "text",
+        text: "."
+      }]
+    });
+  }
   return result;
 }
 
 // Get content blocks from single message
-function getContentBlocksFromMessage(msg, toolNameMap = new Map()) {
+function getContentBlocksFromMessage(msg, toolNameMap = new Map(), disableToolPrefix = false) {
   const blocks = [];
-
-  if (msg.role === ROLE.TOOL) {
+  if (msg.role === "tool") {
+    // T02: Strip empty text blocks from nested tool_result content to avoid Anthropic 400
+    const toolContent = Array.isArray(msg.content) ? stripEmptyTextBlocks(msg.content) : msg.content;
     blocks.push({
-      type: CLAUDE_BLOCK.TOOL_RESULT,
+      type: "tool_result",
       tool_use_id: msg.tool_call_id,
-      content: msg.content
+      content: toolContent
     });
-  } else if (msg.role === ROLE.USER) {
+  } else if (msg.role === "user") {
     if (typeof msg.content === "string") {
       if (msg.content) {
-        blocks.push({ type: CLAUDE_BLOCK.TEXT, text: msg.content });
+        blocks.push({
+          type: "text",
+          text: msg.content
+        });
       }
     } else if (Array.isArray(msg.content)) {
       for (const part of msg.content) {
-        if (part.type === OPENAI_BLOCK.TEXT && part.text) {
-          blocks.push({ type: CLAUDE_BLOCK.TEXT, text: part.text });
-        } else if (part.type === CLAUDE_BLOCK.TOOL_RESULT) {
+        if (part.type === "text" && part.text) {
           blocks.push({
-            type: CLAUDE_BLOCK.TOOL_RESULT,
-            tool_use_id: part.tool_use_id,
-            content: part.content,
-            ...(part.is_error && { is_error: part.is_error })
+            type: "text",
+            text: part.text
           });
-        } else if (part.type === OPENAI_BLOCK.IMAGE_URL) {
+        } else if (part.type === "tool_result") {
+          // Skip tool_result with no tool_use_id (would be useless and may cause errors)
+          if (!part.tool_use_id) continue;
+          // T02: strip empty text blocks from nested content before passing to Anthropic
+          const resultContent = Array.isArray(part.content) ? stripEmptyTextBlocks(part.content) : part.content;
+          blocks.push({
+            type: "tool_result",
+            tool_use_id: part.tool_use_id,
+            content: resultContent,
+            ...(part.is_error && {
+              is_error: part.is_error
+            })
+          });
+        } else if (part.type === "image_url") {
           const url = part.image_url.url;
-          const parsed = parseDataUri(url);
-          if (parsed) {
+          const match = url.match(/^data:([^;]+);base64,(.+)$/);
+          if (match) {
             blocks.push({
-              type: CLAUDE_BLOCK.IMAGE,
-              source: { type: "base64", media_type: parsed.mimeType, data: parsed.base64 }
+              type: "image",
+              source: {
+                type: "base64",
+                media_type: match[1],
+                data: match[2]
+              }
             });
-          } else if (url.startsWith("http://") || url.startsWith("https://")) {
+          } else if (typeof url === "string" && url.trim()) {
             blocks.push({
-              type: CLAUDE_BLOCK.IMAGE,
-              source: { type: "url", url }
+              type: "image",
+              source: {
+                type: "url",
+                url
+              }
             });
           }
-        } else if (part.type === OPENAI_BLOCK.IMAGE && part.source) {
-          blocks.push({ type: CLAUDE_BLOCK.IMAGE, source: part.source });
-        } else if (part.type === OPENAI_BLOCK.FILE && part.file) {
-          // OpenAI file block -> Claude document (PDF only; Claude rejects other mimes).
-          const fileData = part.file.file_data;
-          const parsed = parseDataUri(fileData);
-          if (parsed && parsed.mimeType === "application/pdf") {
+        } else if (part.type === "image" && part.source) {
+          blocks.push({
+            type: "image",
+            source: part.source
+          });
+        } else if (part.type === "image" && typeof part.image === "string") {
+          // AI SDK-style image part: { type: "image", image: "data:...;base64,..." } (#1330)
+          const url = part.image;
+          const match = url.match(/^data:([^;]+);base64,(.+)$/);
+          if (match) {
             blocks.push({
-              type: CLAUDE_BLOCK.DOCUMENT,
-              source: { type: "base64", media_type: parsed.mimeType, data: parsed.base64 }
+              type: "image",
+              source: {
+                type: "base64",
+                media_type: match[1],
+                data: match[2]
+              }
+            });
+          } else if (url.trim()) {
+            blocks.push({
+              type: "image",
+              source: {
+                type: "url",
+                url
+              }
             });
           }
         }
       }
     }
-  } else if (msg.role === ROLE.ASSISTANT) {
+  } else if (msg.role === "assistant") {
+    // Add reasoning_content as a replay placeholder (OpenAI extended thinking format).
+    // #5312 RC-D: reasoning_content carries NO real Claude signature. Emitting a
+    // `thinking` block with the fabricated DEFAULT signature makes Anthropic reject the
+    // replay with 400 "Invalid signature in thinking block" — and claudeHelper's
+    // latest-assistant guard (prepareClaudeRequest) preserves it verbatim, so the fake
+    // signature leaks upstream. Emit a signature-less redacted_thinking block instead
+    // (the same shape prepareClaudeRequest produces for Anthropic-native replay);
+    // Anthropic accepts it without signature validation and non-Anthropic Claude-shape
+    // upstreams re-hydrate the real text downstream from reasoningCache.
+    if (msg.reasoning_content) {
+      blocks.push({
+        type: "redacted_thinking",
+        data: DEFAULT_THINKING_CLAUDE_SIGNATURE
+      });
+    }
     if (Array.isArray(msg.content)) {
       for (const part of msg.content) {
-        if (part.type === OPENAI_BLOCK.TEXT && part.text) {
-          blocks.push({ type: CLAUDE_BLOCK.TEXT, text: part.text });
-        } else if (part.type === CLAUDE_BLOCK.TOOL_USE) {
+        if (part.type === "text" && part.text) {
+          blocks.push({
+            type: "text",
+            text: part.text
+          });
+        } else if (part.type === "thinking" || part.type === "redacted_thinking") {
+          // Preserve thinking blocks with signature
+          blocks.push({
+            ...part,
+            signature: part.signature || DEFAULT_THINKING_CLAUDE_SIGNATURE
+          });
+        } else if (part.type === "tool_use") {
           // Tool name already has prefix from tool declarations, keep as-is
-          blocks.push({ type: CLAUDE_BLOCK.TOOL_USE, id: part.id, name: part.name, input: part.input });
-        } else if (part.type === CLAUDE_BLOCK.THINKING) {
-          // Include thinking block but strip cache_control (not allowed on thinking blocks)
-          const { cache_control, ...thinkingBlock } = part;
-          blocks.push(thinkingBlock);
+          // CRITICAL: Skip tool_use blocks with empty name (causes Claude 400 error)
+          if (part.name && part.name.trim()) {
+            blocks.push({
+              type: "tool_use",
+              id: sanitizeToolId(part.id),
+              name: part.name,
+              input: part.input
+            });
+          }
         }
       }
     } else if (msg.content) {
-      const text = typeof msg.content === "string" ? msg.content : extractTextContent(msg.content, "\n");
+      const text = typeof msg.content === "string" ? msg.content : extractTextContent(msg.content);
       if (text) {
-        blocks.push({ type: CLAUDE_BLOCK.TEXT, text });
+        blocks.push({
+          type: "text",
+          text
+        });
       }
     }
-
     if (msg.tool_calls && Array.isArray(msg.tool_calls)) {
       for (const tc of msg.tool_calls) {
-        if (tc.type === OPENAI_BLOCK.FUNCTION) {
-          // Apply prefix to tool name
-          const toolName = CLAUDE_OAUTH_TOOL_PREFIX + tc.function.name;
+        if (tc.type === "function") {
+          // CRITICAL: Skip tool_calls with empty function name (causes Claude 400 error)
+          const fnName = tc.function?.name;
+          if (!fnName || !fnName.trim()) continue;
+
+          // Apply prefix to tool name (skip if disabled)
+          const toolName = disableToolPrefix ? fnName : CLAUDE_OAUTH_TOOL_PREFIX + fnName;
           blocks.push({
-            type: CLAUDE_BLOCK.TOOL_USE,
-            id: tc.id,
+            type: "tool_use",
+            id: sanitizeToolId(tc.id),
             name: toolName,
-            input: safeParseJSON(tc.function.arguments, tc.function.arguments)
+            input: tryParseJSON(tc.function.arguments)
           });
         }
       }
     }
   }
-
   return blocks;
 }
 
-// Convert OpenAI tool choice to Claude format.
-// Claude only accepts tool_choice.type of "auto" | "any" | "tool" | "none";
-// anything else (e.g. OpenAI's "function") triggers a 400, so we never pass an
-// unrecognized type through.
-const CLAUDE_TOOL_CHOICE_TYPES = new Set(["auto", "any", "tool", "none"]);
-
+// Convert OpenAI tool choice to Claude format
 function convertOpenAIToolChoice(choice) {
-  if (!choice) return { type: "auto" };
-
-  // OpenAI string forms: "auto" | "none" | "required"
-  if (typeof choice === "string") {
-    if (choice === "required") return { type: "any" };
-    return { type: "auto" }; // "auto", "none", or anything unexpected
-  }
-
-  if (typeof choice === "object") {
-    // OpenAI forced tool: { type: "function", function: { name } }.
-    // Checked before the native pass-through below, because the OpenAI shape
-    // also carries a `.type` ("function") that Claude rejects.
-    if (choice.function?.name) {
-      return { type: "tool", name: choice.function.name };
+  if (!choice) return {
+    type: "auto"
+  };
+  if (typeof choice === "object" && choice.type) {
+    // OpenAI sends {type: "function", function: {name}} — convert to Claude {type: "tool", name}
+    if (choice.type === "function" && choice.function?.name) {
+      return {
+        type: "tool",
+        name: choice.function.name
+      };
     }
-    // Already Claude-native — only pass through types Claude actually accepts,
-    // so a malformed or unknown type can never leak into the upstream request.
-    if (CLAUDE_TOOL_CHOICE_TYPES.has(choice.type)) {
-      return choice;
-    }
+    // Map OpenAI string types to Claude equivalents
+    if (choice.type === "auto" || choice.type === "none") return {
+      type: "auto"
+    };
+    if (choice.type === "required" || choice.type === "any") return {
+      type: CLAUDE_TOOL_CHOICE_REQUIRED
+    };
+    // If type is "tool" already (Claude-native), pass through
+    if (choice.type === "tool" && choice.name) return choice;
+    // Fallback: unknown object type — default to auto to avoid 400 errors
+    return {
+      type: "auto"
+    };
   }
+  if (choice === "auto" || choice === "none") return {
+    type: "auto"
+  };
+  if (choice === "required") return {
+    type: CLAUDE_TOOL_CHOICE_REQUIRED
+  };
+  if (typeof choice === "object" && choice.function) {
+    return {
+      type: "tool",
+      name: choice.function.name
+    };
+  }
+  return {
+    type: "auto"
+  };
+}
 
-  return { type: "auto" };
+// Extract text from content
+function extractTextContent(content) {
+  if (typeof content === "string") return content;
+  if (Array.isArray(content)) {
+    return content.filter(c => c.type === "text").map(c => c.text).join("\n");
+  }
+  return "";
+}
+
+// Try parse JSON (passthrough fallback: return the raw input string on parse error).
+function tryParseJSON(str) {
+  return safeParseJSON(str, str);
+}
+function stripCacheControl(value) {
+  if (Array.isArray(value)) {
+    return value.map(item => stripCacheControl(item));
+  }
+  if (!value || typeof value !== "object") {
+    return value;
+  }
+  const cleaned = {};
+  for (const [key, child] of Object.entries(value)) {
+    if (key === "cache_control") continue;
+    cleaned[key] = stripCacheControl(child);
+  }
+  return cleaned;
 }
 
 // OpenAI -> Claude format for Antigravity (without system prompt modifications)
 function openaiToClaudeRequestForAntigravity(model, body, stream) {
-  const result = openaiToClaudeRequest(model, body, stream);
-
-  // Remove Claude Code system prompt, keep only user's system messages
-  if (result.system && Array.isArray(result.system)) {
-    result.system = result.system.filter(block =>
-      !block.text || !block.text.includes("You are Claude Code")
-    );
-    if (result.system.length === 0) {
-      delete result.system;
-    }
-  }
+  const result = stripCacheControl(openaiToClaudeRequest(model, body, stream));
 
   // Strip prefix from tool names for Antigravity (doesn't use Claude OAuth)
   if (result.tools && Array.isArray(result.tools)) {
@@ -358,21 +769,23 @@ function openaiToClaudeRequestForAntigravity(model, body, stream) {
       if (!msg.content || !Array.isArray(msg.content)) {
         return msg;
       }
-
       const updatedContent = msg.content.map(block => {
-        if (block.type === CLAUDE_BLOCK.TOOL_USE && block.name && block.name.startsWith(CLAUDE_OAUTH_TOOL_PREFIX)) {
+        const blockType = typeof block.type === "string" ? block.type : "";
+        const blockName = typeof block.name === "string" ? block.name : "";
+        if (blockType === "tool_use" && blockName && blockName.startsWith(CLAUDE_OAUTH_TOOL_PREFIX)) {
           return {
             ...block,
-            name: block.name.slice(CLAUDE_OAUTH_TOOL_PREFIX.length)
+            name: blockName.slice(CLAUDE_OAUTH_TOOL_PREFIX.length)
           };
         }
         return block;
       });
-
-      return { ...msg, content: updatedContent };
+      return {
+        ...msg,
+        content: updatedContent
+      };
     });
   }
-
   return result;
 }
 
@@ -381,4 +794,3 @@ export { openaiToClaudeRequestForAntigravity };
 
 // Register
 register(FORMATS.OPENAI, FORMATS.CLAUDE, openaiToClaudeRequest, null);
-

@@ -4,11 +4,12 @@ import { createSSETransformStreamWithLogger, createPassthroughStreamWithLogger }
 import { createNormalizedStream } from "../../streaming/createNormalizedStream.js";
 import { pipeWithDisconnect } from "../../utils/streamHandler.js";
 import { PROVIDERS } from "../../config/providers.js";
-import { STREAM_STALL_TIMEOUT_MS } from "../../config/runtimeConfig.js";
+import { STREAM_STALL_TIMEOUT_MS, SSE_HEARTBEAT_INTERVAL_MS } from "../../config/runtimeConfig.js";
 import { buildAbortedResponsesTerminalBytes } from "../../utils/responsesStreamHelpers.js";
 import { buildRequestDetail, extractRequestConfig, saveUsageStats } from "./requestDetail.js";
 import { saveRequestDetail, trackPendingRequest } from "@/lib/usageDb.js";
 import { SSE_HEADERS_CORS as SSE_HEADERS } from "../../utils/sseConstants.js";
+import { createSseHeartbeatTransform, HEARTBEAT_SHAPES } from "../../utils/sseHeartbeat.js";
 
 // Shared encoder for terminal byte synthesis
 const _sharedEncoder = new TextEncoder();
@@ -142,6 +143,19 @@ export function handleStreamingResponse({ providerResponse, provider, model, sou
   const stallTimeoutMs = PROVIDERS[provider]?.stallTimeoutMs || STREAM_STALL_TIMEOUT_MS;
   const transformedBody = pipeWithDisconnect(providerResponse, transformStream, streamController, onAbortTerminal, stallTimeoutMs, onStreamError);
 
+  // SSE heartbeat: emit keepalive events during idle periods (e.g. long reasoning)
+  // to prevent NAT/load balancers from dropping the client connection.
+  const heartbeatInterval = PROVIDERS[provider]?.heartbeatIntervalMs ?? SSE_HEARTBEAT_INTERVAL_MS;
+  const bodyWithHeartbeat = heartbeatInterval > 0
+    ? transformedBody.pipeThrough(
+        createSseHeartbeatTransform({
+          intervalMs: heartbeatInterval,
+          signal: streamController.signal,
+          shape: HEARTBEAT_SHAPES.COMMENT,
+        })
+      )
+    : transformedBody;
+
   const streamDetailId = `${Date.now()}-${Math.random().toString(36).slice(2, 11)}`;
   saveRequestDetail(buildRequestDetail({
     provider, model, connectionId,
@@ -164,7 +178,7 @@ export function handleStreamingResponse({ providerResponse, provider, model, sou
 
   return {
     success: true,
-    response: new Response(transformedBody, { headers })
+    response: new Response(bodyWithHeartbeat, { headers })
   };
 }
 

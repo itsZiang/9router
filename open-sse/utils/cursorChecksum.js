@@ -7,6 +7,8 @@
 
 import crypto from "crypto";
 import { v5 as uuidv5 } from "uuid";
+import { getCursorUserAgent } from "../config/providerHeaderProfiles";
+import { getCursorVersion } from "./cursorVersionDetector";
 
 /**
  * Generate SHA-256 hash like generateHashed64Hex
@@ -45,42 +47,31 @@ export function generateCursorChecksum(machineId) {
   const timestamp = Math.floor(Date.now() / 1000000);
 
   // Create byte array from timestamp (6 bytes, big-endian)
-  const byteArray = new Uint8Array([
-    (timestamp >> 40) & 0xFF,
-    (timestamp >> 32) & 0xFF,
-    (timestamp >> 24) & 0xFF,
-    (timestamp >> 16) & 0xFF,
-    (timestamp >> 8) & 0xFF,
-    timestamp & 0xFF
-  ]);
+  const byteArray = new Uint8Array([timestamp >> 40 & 0xff, timestamp >> 32 & 0xff, timestamp >> 24 & 0xff, timestamp >> 16 & 0xff, timestamp >> 8 & 0xff, timestamp & 0xff]);
 
   // Jyh cipher obfuscation
   let t = 165;
   for (let i = 0; i < byteArray.length; i++) {
-    byteArray[i] = ((byteArray[i] ^ t) + (i % 256)) & 0xFF;
+    byteArray[i] = (byteArray[i] ^ t) + i % 256 & 0xff;
     t = byteArray[i];
   }
 
   // URL-safe base64 encode (without padding)
   const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
   let encoded = "";
-
   for (let i = 0; i < byteArray.length; i += 3) {
     const a = byteArray[i];
     const b = i + 1 < byteArray.length ? byteArray[i + 1] : 0;
     const c = i + 2 < byteArray.length ? byteArray[i + 2] : 0;
-
     encoded += alphabet[a >> 2];
-    encoded += alphabet[((a & 3) << 4) | (b >> 4)];
-
+    encoded += alphabet[(a & 3) << 4 | b >> 4];
     if (i + 1 < byteArray.length) {
-      encoded += alphabet[((b & 15) << 2) | (c >> 6)];
+      encoded += alphabet[(b & 15) << 2 | c >> 6];
     }
     if (i + 2 < byteArray.length) {
       encoded += alphabet[c & 63];
     }
   }
-
   return `${encoded}${machineId}`;
 }
 
@@ -94,9 +85,7 @@ export function generateCursorChecksum(machineId) {
  */
 export function buildCursorHeaders(accessToken, machineId = null, ghostMode = true) {
   // Clean token if it has prefix
-  const cleanToken = accessToken.includes("::")
-    ? accessToken.split("::")[1]
-    : accessToken;
+  const cleanToken = accessToken.includes("::") ? accessToken.split("::")[1] : accessToken;
 
   // Generate machine ID if not provided
   const effectiveMachineId = machineId || generateHashed64Hex(cleanToken, "machineId");
@@ -105,45 +94,29 @@ export function buildCursorHeaders(accessToken, machineId = null, ghostMode = tr
   const sessionId = generateSessionId(cleanToken);
   const clientKey = generateHashed64Hex(cleanToken);
   const checksum = generateCursorChecksum(effectiveMachineId);
-
-  // Detect OS
-  let os = "linux";
-  if (typeof process !== "undefined") {
-    if (process.platform === "win32") os = "windows";
-    else if (process.platform === "darwin") os = "macos";
-  }
-
-  // Detect architecture
-  let arch = "x64";
-  if (typeof process !== "undefined") {
-    if (process.arch === "arm64") arch = "aarch64";
-  }
-
   return {
-    "authorization": `Bearer ${cleanToken}`,
+    Authorization: `Bearer ${cleanToken}`,
     "connect-accept-encoding": "gzip",
     "connect-protocol-version": "1",
-    "content-type": "application/connect+proto",
-    "user-agent": "connect-es/1.6.1",
+    "Content-Type": "application/connect+proto",
+    "User-Agent": getCursorUserAgent(getCursorVersion()),
     "x-amzn-trace-id": `Root=${crypto.randomUUID()}`,
     "x-client-key": clientKey,
     "x-cursor-checksum": checksum,
-    "x-cursor-client-version": "3.1.0",
-    "x-cursor-client-type": "ide",
-    "x-cursor-client-os": os,
-    "x-cursor-client-arch": arch,
-    "x-cursor-client-device-type": "desktop",
+    "x-cursor-client-version": getCursorVersion(),
+    "x-cursor-user-agent": getCursorUserAgent(getCursorVersion()),
     "x-cursor-config-version": crypto.randomUUID(),
     "x-cursor-timezone": Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC",
     "x-ghost-mode": ghostMode ? "true" : "false",
     "x-request-id": crypto.randomUUID(),
-    "x-session-id": sessionId
+    "x-session-id": sessionId,
+    Host: "api2.cursor.sh"
   };
 }
-
-export default {
+const cursorChecksumUtils = {
   generateCursorChecksum,
   buildCursorHeaders,
   generateHashed64Hex,
   generateSessionId
 };
+export default cursorChecksumUtils;

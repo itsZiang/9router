@@ -1,8 +1,11 @@
+// @ts-nocheck
 /**
  * Token Usage Tracking - Extract, normalize, estimate and log token usage
  */
 
-import { FORMATS } from "../translator/formats.js";
+import { appendRequestLog } from "@/lib/usageDb";
+import { getLoggedInputTokens, getLoggedOutputTokens, getPromptCacheCreationTokens, getPromptCacheReadTokens } from "../stubs/lib/usage/tokenAccounting";
+import { FORMATS } from "../translator/formats";
 
 // ANSI color codes
 export const COLORS = {
@@ -14,40 +17,108 @@ export const COLORS = {
   cyan: "\x1b[36m"
 };
 
-// Buffer tokens to prevent context errors when proxy injects hidden content.
-// Only applied for the native "claude" provider which injects decoy tools + system prompt
-// (~1000+ tokens with OAuth). All other providers pass through cleanly → buffer = 0.
-const BUFFER_TOKENS = 2000;
+/**
+ * Safety buffer added to reported token usage to prevent clients from hitting
+ * context window limits. Accounts for overhead from system prompts,
+ * tool definitions, and format translation that may not be reflected in raw usage.
+ *
+ * Configurable via:
+ *   - Settings API / Dashboard: `usageTokenBuffer` (persisted in DB)
+ *   - Environment variable: `USAGE_TOKEN_BUFFER`
+ *   - Defaults to 2000 if neither is set
+ *
+ * Set to 0 to disable the buffer entirely (raw provider token counts).
+ */
+const DEFAULT_BUFFER_TOKENS = 2000;
+let _cachedBuffer = null;
+let _cacheTimestamp = 0;
+const CACHE_TTL_MS = 30_000; // Re-read from DB/env every 30s
+
+function getBufferTokens() {
+  const now = Date.now();
+  const isExpired = _cachedBuffer !== null && now - _cacheTimestamp >= CACHE_TTL_MS;
+  if (_cachedBuffer !== null && !isExpired) {
+    return _cachedBuffer;
+  }
+
+  // Priority: env var > cached DB value > default
+  const envVal = process.env.USAGE_TOKEN_BUFFER;
+  if (envVal !== undefined) {
+    const parsed = parseInt(envVal, 10);
+    if (!isNaN(parsed) && parsed >= 0) {
+      _cachedBuffer = parsed;
+      _cacheTimestamp = now;
+      return parsed;
+    }
+  }
+
+  // Return cached value or default; kick off async DB read to update cache.
+  // On first call (_cachedBuffer is null), use the default.
+  // On TTL expiry (_cachedBuffer is stale), continue returning the stale value
+  // while refreshing asynchronously — prevents blocking the hot path.
+  if (_cachedBuffer === null || isExpired) {
+    if (_cachedBuffer === null) {
+      _cachedBuffer = DEFAULT_BUFFER_TOKENS;
+    }
+    _cacheTimestamp = now;
+    _loadBufferFromDb();
+  }
+  return _cachedBuffer;
+}
+async function _loadBufferFromDb() {
+  try {
+    const {
+      getSettings
+    } = await import("../stubs/lib/db/settings");
+    const settings = await getSettings();
+    const val = settings.usageTokenBuffer;
+    if (typeof val === "number" && val >= 0) {
+      _cachedBuffer = val;
+      _cacheTimestamp = Date.now();
+    }
+  } catch {
+    // DB not ready yet or settings unavailable — keep current value
+  }
+}
+
+/** Force-refresh the buffer from settings (e.g. after a settings update). */
+export function invalidateBufferTokensCache() {
+  _cachedBuffer = null;
+  _cacheTimestamp = 0;
+}
 
 /**
- * Returns the buffer token count for a given provider.
- * Only native "claude" provider needs a buffer (hidden injections: decoy tools, system prompt).
- * @param {string|null} provider
+ * Directly set the cached buffer value — called by runtimeSettings after a
+ * settings save so the new value is available synchronously on the next request
+ * (no race window between invalidation and the async DB re-read).
  */
-export function getBufferTokens(provider) {
-  return (!provider || provider === "claude") ? BUFFER_TOKENS : 0;
+export function setBufferTokensCache(value) {
+  _cachedBuffer = value;
+  _cacheTimestamp = Date.now();
 }
 
 // Get HH:MM:SS timestamp
 function getTimeString() {
-  const u = new Date(Date.now() + 7 * 60 * 60 * 1000);
-  return `${String(u.getUTCHours()).padStart(2,"0")}:${String(u.getUTCMinutes()).padStart(2,"0")}:${String(u.getUTCSeconds()).padStart(2,"0")}`;
+  return new Date().toLocaleTimeString("en-US", {
+    hour12: false,
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit"
+  });
 }
 
 /**
- * Add buffer tokens to usage to prevent context errors.
- * Pass provider so buffer is only applied where proxy actually injects hidden content.
- * @param {object} usage - Usage object (any format)
- * @param {string|null} provider - Provider name
+ * Add buffer tokens to usage to prevent context errors
+ * @param {object} usage - Usage object (supported format)
  * @returns {object} Usage with buffer added
  */
-export function addBufferToUsage(usage, provider = null) {
+export function addBufferToUsage(usage) {
   if (!usage || typeof usage !== "object") return usage;
-
-  const buffer = getBufferTokens(provider);
+  const buffer = getBufferTokens();
   if (buffer === 0) return usage;
-
-  const result = { ...usage };
+  const result = {
+    ...usage
+  };
 
   // Claude format
   if (result.input_tokens !== undefined) {
@@ -66,19 +137,44 @@ export function addBufferToUsage(usage, provider = null) {
     // Calculate total_tokens if not exists
     result.total_tokens = result.prompt_tokens + result.completion_tokens;
   }
-
   return result;
 }
-
 export function filterUsageForFormat(usage, targetFormat) {
   if (!usage || typeof usage !== "object") return usage;
 
+  // Cross-map between Claude-style and OpenAI-style field names before filtering.
+  // Some providers return input_tokens/output_tokens even when using OpenAI format.
+  const convertedUsage = {
+    ...usage
+  };
+  if (targetFormat === FORMATS.CLAUDE || targetFormat === FORMATS.OPENAI_RESPONSES) {
+    // OpenAI → Claude: prompt_tokens → input_tokens
+    if (convertedUsage.prompt_tokens !== undefined && convertedUsage.input_tokens === undefined) {
+      convertedUsage.input_tokens = convertedUsage.prompt_tokens;
+    }
+    if (convertedUsage.completion_tokens !== undefined && convertedUsage.output_tokens === undefined) {
+      convertedUsage.output_tokens = convertedUsage.completion_tokens;
+    }
+  } else {
+    // Claude → OpenAI: input_tokens → prompt_tokens
+    if (convertedUsage.input_tokens !== undefined && convertedUsage.prompt_tokens === undefined) {
+      convertedUsage.prompt_tokens = convertedUsage.input_tokens;
+    }
+    if (convertedUsage.output_tokens !== undefined && convertedUsage.completion_tokens === undefined) {
+      convertedUsage.completion_tokens = convertedUsage.output_tokens;
+    }
+    // Ensure total_tokens is set
+    if (convertedUsage.total_tokens === undefined && convertedUsage.prompt_tokens !== undefined && convertedUsage.completion_tokens !== undefined) {
+      convertedUsage.total_tokens = convertedUsage.prompt_tokens + convertedUsage.completion_tokens;
+    }
+  }
+
   // Helper to pick only defined fields from usage
-  const pickFields = (fields) => {
+  const pickFields = fields => {
     const filtered = {};
     for (const field of fields) {
-      if (usage[field] !== undefined) {
-        filtered[field] = usage[field];
+      if (convertedUsage[field] !== undefined) {
+        filtered[field] = convertedUsage[field];
       }
     }
     return filtered;
@@ -86,42 +182,24 @@ export function filterUsageForFormat(usage, targetFormat) {
 
   // Define allowed fields for each format
   const formatFields = {
-    [FORMATS.CLAUDE]: [
-      'input_tokens', 'output_tokens', 
-      'cache_read_input_tokens', 'cache_creation_input_tokens',
-      'estimated'
-    ],
-    [FORMATS.GEMINI]: [
-      'promptTokenCount', 'candidatesTokenCount', 'totalTokenCount',
-      'cachedContentTokenCount', 'thoughtsTokenCount',
-      'estimated'
-    ],
-    [FORMATS.OPENAI_RESPONSES]: [
-      'input_tokens', 'output_tokens',
-      'input_tokens_details', 'output_tokens_details',
-      'estimated'
-    ],
+    [FORMATS.CLAUDE]: ["input_tokens", "output_tokens", "cache_read_input_tokens", "cache_creation_input_tokens", "estimated"],
+    [FORMATS.GEMINI]: ["promptTokenCount", "candidatesTokenCount", "totalTokenCount", "cachedContentTokenCount", "thoughtsTokenCount", "estimated"],
+    [FORMATS.OPENAI_RESPONSES]: ["input_tokens", "output_tokens", "input_tokens_details", "output_tokens_details", "estimated"],
     // OpenAI format (default for OPENAI, CODEX, KIRO, etc.)
-    default: [
-      'prompt_tokens', 'completion_tokens', 'total_tokens',
-      'cached_tokens', 'reasoning_tokens',
-      'prompt_tokens_details', 'completion_tokens_details',
-      'estimated'
-    ]
+    default: ["prompt_tokens", "completion_tokens", "total_tokens", "cached_tokens", "reasoning_tokens", "prompt_tokens_details", "completion_tokens_details", "estimated"]
   };
 
   // Get fields for target format
   let fields = formatFields[targetFormat];
-  
+
   // Use same fields for similar formats
-  if (targetFormat === FORMATS.GEMINI_CLI || targetFormat === FORMATS.ANTIGRAVITY) {
+  if (targetFormat === FORMATS.ANTIGRAVITY) {
     fields = formatFields[FORMATS.GEMINI];
   } else if (targetFormat === FORMATS.OPENAI_RESPONSE) {
     fields = formatFields[FORMATS.OPENAI_RESPONSES];
   } else if (!fields) {
     fields = formatFields.default;
   }
-
   return pickFields(fields);
 }
 
@@ -130,30 +208,21 @@ export function filterUsageForFormat(usage, targetFormat) {
  */
 export function normalizeUsage(usage) {
   if (!usage || typeof usage !== "object" || Array.isArray(usage)) return null;
-
   const normalized = {};
   const assignNumber = (key, value) => {
     if (value === undefined || value === null) return;
     const numeric = Number(value);
     if (Number.isFinite(numeric)) normalized[key] = numeric;
   };
-
   assignNumber("prompt_tokens", usage?.prompt_tokens);
   assignNumber("completion_tokens", usage?.completion_tokens);
   assignNumber("total_tokens", usage?.total_tokens);
+  assignNumber("input_tokens", usage?.input_tokens);
+  assignNumber("output_tokens", usage?.output_tokens);
   assignNumber("cache_read_input_tokens", usage?.cache_read_input_tokens);
   assignNumber("cache_creation_input_tokens", usage?.cache_creation_input_tokens);
   assignNumber("cached_tokens", usage?.cached_tokens);
   assignNumber("reasoning_tokens", usage?.reasoning_tokens);
-
-  // Preserve nested details objects for OpenAI format forwarding
-  if (usage?.prompt_tokens_details && typeof usage.prompt_tokens_details === "object") {
-    normalized.prompt_tokens_details = usage.prompt_tokens_details;
-  }
-  if (usage?.completion_tokens_details && typeof usage.completion_tokens_details === "object") {
-    normalized.completion_tokens_details = usage.completion_tokens_details;
-  }
-
   if (Object.keys(normalized).length === 0) return null;
   return normalized;
 }
@@ -166,33 +235,61 @@ export function normalizeUsage(usage) {
 export function hasValidUsage(usage) {
   if (!usage || typeof usage !== "object") return false;
 
-  // Check for any known token field with value > 0
-  const tokenFields = [
-    "prompt_tokens", "completion_tokens", "total_tokens",  // OpenAI
-    "input_tokens", "output_tokens",                        // Claude
-    "promptTokenCount", "candidatesTokenCount"              // Gemini
+  // Check for known token fields with value > 0
+  const tokenFields = ["prompt_tokens", "completion_tokens", "total_tokens",
+  // OpenAI
+  "input_tokens", "output_tokens",
+  // Claude
+  "promptTokenCount", "candidatesTokenCount" // Gemini
   ];
-
   for (const field of tokenFields) {
     if (typeof usage[field] === "number" && usage[field] > 0) {
       return true;
     }
   }
-
   return false;
 }
 
 /**
- * Extract usage from any format (Claude, OpenAI, Gemini, Responses API)
+ * Extract usage from supported formats (Claude, OpenAI, Gemini, Responses API)
  */
 export function extractUsage(chunk) {
   if (!chunk || typeof chunk !== "object") return null;
 
-  // Claude format (message_delta event)
+  // Claude/Antigravity streaming: message_start event carries INPUT tokens
+  // FIX #74: This event was not handled — input_tokens were being dropped
+  // Structure: { type: "message_start", message: { usage: { input_tokens: N, output_tokens: 0 } } }
+  //
+  // Note: Claude's input_tokens is only the non-cached portion.
+  // Sum cache tokens into prompt_tokens for a correct total (consistent with
+  // extractUsageFromResponse in usageExtractor.ts for non-streaming).
+  if (chunk.type === "message_start" && chunk.message?.usage) {
+    const u = chunk.message.usage;
+    const inputTokens = u.input_tokens || u.prompt_tokens || 0;
+    const cacheRead = u.cache_read_input_tokens || 0;
+    const cacheCreation = u.cache_creation_input_tokens || 0;
+    if (inputTokens > 0 || cacheRead > 0 || cacheCreation > 0) {
+      return normalizeUsage({
+        prompt_tokens: inputTokens + cacheRead + cacheCreation,
+        completion_tokens: u.output_tokens || u.completion_tokens || 0,
+        input_tokens: inputTokens + cacheRead + cacheCreation,
+        output_tokens: u.output_tokens || u.completion_tokens || 0,
+        cache_read_input_tokens: u.cache_read_input_tokens,
+        cache_creation_input_tokens: u.cache_creation_input_tokens
+      });
+    }
+  }
+
+  // Claude format (message_delta event) — typically carries OUTPUT tokens
   if (chunk.type === "message_delta" && chunk.usage && typeof chunk.usage === "object") {
+    const deltaInput = chunk.usage.input_tokens || 0;
+    const deltaCacheRead = chunk.usage.cache_read_input_tokens || 0;
+    const deltaCacheCreation = chunk.usage.cache_creation_input_tokens || 0;
     return normalizeUsage({
-      prompt_tokens: chunk.usage.input_tokens || 0,
+      prompt_tokens: deltaInput + deltaCacheRead + deltaCacheCreation,
       completion_tokens: chunk.usage.output_tokens || 0,
+      input_tokens: deltaInput + deltaCacheRead + deltaCacheCreation,
+      output_tokens: chunk.usage.output_tokens || 0,
       cache_read_input_tokens: chunk.usage.cache_read_input_tokens,
       cache_creation_input_tokens: chunk.usage.cache_creation_input_tokens
     });
@@ -201,30 +298,29 @@ export function extractUsage(chunk) {
   // OpenAI Responses API format (response.completed or response.done)
   if ((chunk.type === "response.completed" || chunk.type === "response.done") && chunk.response?.usage && typeof chunk.response.usage === "object") {
     const usage = chunk.response.usage;
-    const cachedTokens = usage.input_tokens_details?.cached_tokens;
     return normalizeUsage({
       prompt_tokens: usage.input_tokens || usage.prompt_tokens || 0,
       completion_tokens: usage.output_tokens || usage.completion_tokens || 0,
-      cached_tokens: cachedTokens,
-      reasoning_tokens: usage.output_tokens_details?.reasoning_tokens,
-      prompt_tokens_details: cachedTokens ? { cached_tokens: cachedTokens } : undefined
+      cached_tokens: usage.input_tokens_details?.cached_tokens ?? usage.prompt_tokens_details?.cached_tokens ?? usage.cache_read_input_tokens,
+      cache_creation_input_tokens: usage.cache_creation_input_tokens,
+      reasoning_tokens: usage.output_tokens_details?.reasoning_tokens ?? usage.completion_tokens_details?.reasoning_tokens ?? usage.reasoning_tokens
     });
   }
 
-  // OpenAI format (also covers DeepSeek which uses prompt_cache_hit_tokens)
-  if (chunk.usage && typeof chunk.usage === "object" && chunk.usage.prompt_tokens !== undefined) {
+  // OpenAI format
+  if (chunk.usage && typeof chunk.usage === "object" && (chunk.usage.prompt_tokens !== undefined || chunk.usage.input_tokens !== undefined)) {
     return normalizeUsage({
-      prompt_tokens: chunk.usage.prompt_tokens,
-      completion_tokens: chunk.usage.completion_tokens || 0,
-      cached_tokens: chunk.usage.prompt_tokens_details?.cached_tokens || chunk.usage.prompt_cache_hit_tokens,
-      reasoning_tokens: chunk.usage.completion_tokens_details?.reasoning_tokens,
-      prompt_tokens_details: chunk.usage.prompt_tokens_details,
-      completion_tokens_details: chunk.usage.completion_tokens_details
+      prompt_tokens: chunk.usage.prompt_tokens ?? chunk.usage.input_tokens ?? 0,
+      completion_tokens: chunk.usage.completion_tokens ?? chunk.usage.output_tokens ?? 0,
+      cached_tokens: chunk.usage.prompt_tokens_details?.cached_tokens ?? chunk.usage.input_tokens_details?.cached_tokens ?? chunk.usage.prompt_cache_hit_tokens ?? chunk.usage.cached_tokens,
+      reasoning_tokens: chunk.usage.completion_tokens_details?.reasoning_tokens ?? chunk.usage.output_tokens_details?.reasoning_tokens ?? chunk.usage.reasoning_tokens
     });
   }
 
   // Gemini format (Antigravity)
-  // Antigravity wraps usageMetadata inside response: { response: { usageMetadata: {...} } }
+  // Antigravity wraps usageMetadata inside a `response` envelope:
+  // { response: { usageMetadata: {...} } } — fall back to it so AG-shaped
+  // chunks do not silently drop token usage.
   const usageMeta = chunk.usageMetadata || chunk.response?.usageMetadata;
   if (usageMeta && typeof usageMeta === "object") {
     return normalizeUsage({
@@ -237,32 +333,78 @@ export function extractUsage(chunk) {
   }
 
   // Ollama NDJSON format (raw from provider, before translation)
-  // Ollama sends: {"model":"...","done":true,"prompt_eval_count":N,"eval_count":M}
+  // Ollama sends: { "model": "...", "done": true, "prompt_eval_count": N, "eval_count": M }
   if (chunk.done === true && typeof chunk.prompt_eval_count === "number") {
+    const promptEvalCount = chunk.prompt_eval_count || 0;
+    const evalCount = chunk.eval_count || 0;
     return normalizeUsage({
-      prompt_tokens: chunk.prompt_eval_count || 0,
-      completion_tokens: chunk.eval_count || 0,
-      total_tokens: (chunk.prompt_eval_count || 0) + (chunk.eval_count || 0)
+      prompt_tokens: promptEvalCount,
+      completion_tokens: evalCount,
+      total_tokens: promptEvalCount + evalCount
     });
   }
-
   return null;
 }
 
+// Heuristic token estimation constants
+const CHARS_PER_TOKEN_SCHEMA = 6; // ~6 chars/token for JSON schemas (more verbose per token)
+
 /**
- * Estimate input tokens from request body
- * Calculate total body size for more accurate estimation
+ * Improved token estimation heuristic (no dependency).
+ * Splits text on common token boundaries (whitespace, punctuation, camelCase)
+ * and applies a sub-word correction factor. Better accuracy for:
+ * - English text (~4 chars/token)
+ * - CJK text (~1 char/token for ideographs)
+ * - Code (~3.5 chars/token, more punctuation-heavy)
+ *
+ * @param {string} text - Text to estimate tokens for
+ * @returns {number} Estimated token count
+ */
+function estimateTokenCount(text) {
+  if (!text || typeof text !== "string") return 0;
+
+  // Count CJK ideographs separately — each is roughly 1 token
+  const cjkMatches = text.match(/[\u3000-\u9fff\uf900-\ufaff\u{20000}-\u{2fa1f}]/gu);
+  const cjkCount = cjkMatches ? cjkMatches.length : 0;
+
+  // Remove CJK chars for the remaining estimation
+  const nonCJK = text.replace(/[\u3000-\u9fff\uf900-\ufaff]/g, " ");
+
+  // Split on token boundaries: whitespace, punctuation, camelCase transitions
+  const tokens = nonCJK.split(/(\s+|[^\w\s]|(?<=[a-z])(?=[A-Z]))/).filter(t => t && t.trim().length > 0);
+
+  // Apply sub-word correction: BPE tokenizers often split long words
+  // into sub-word pieces, so raw token count underestimates slightly
+  const estimatedNonCJK = Math.ceil(tokens.length * 1.3);
+  return cjkCount + estimatedNonCJK;
+}
+
+/**
+ * Estimate input tokens from request body.
+ * Separates tool definitions (JSON schemas) from message content
+ * for more accurate estimation since JSON schemas are more verbose but
+ * compress into fewer tokens than plain text.
  */
 export function estimateInputTokens(body) {
   if (!body || typeof body !== "object") return 0;
-
   try {
-    // Calculate total body size (includes messages, tools, system, thinking config, etc.)
-    const bodyStr = JSON.stringify(body);
-    const totalChars = bodyStr.length;
+    let toolTokens = 0;
+    let messageTokens = 0;
 
-    // Estimate: ~4 chars per token (rough average across all tokenizers)
-    return Math.ceil(totalChars / 4);
+    // Separate tool definitions from the rest of the body
+    if (body.tools && Array.isArray(body.tools)) {
+      const toolStr = JSON.stringify(body.tools);
+      toolTokens = Math.ceil(toolStr.length / CHARS_PER_TOKEN_SCHEMA);
+      // Estimate messages without tools
+      const {
+        tools,
+        ...bodyWithoutTools
+      } = body;
+      messageTokens = estimateTokenCount(JSON.stringify(bodyWithoutTools));
+    } else {
+      messageTokens = estimateTokenCount(JSON.stringify(body));
+    }
+    return messageTokens + toolTokens;
   } catch (err) {
     // Fallback if stringify fails
     return 0;
@@ -270,11 +412,13 @@ export function estimateInputTokens(body) {
 }
 
 /**
- * Estimate output tokens from content length
+ * Estimate output tokens from content length.
+ * Uses improved heuristic when possible, falls back to length-based estimation.
  */
 export function estimateOutputTokens(contentLength) {
   if (!contentLength || contentLength <= 0) return 0;
-  return Math.max(1, Math.floor(contentLength / 4));
+  // When we only have a character count, use 4 chars/token with sub-word correction
+  return Math.max(1, Math.ceil(contentLength / 3.5));
 }
 
 /**
@@ -282,16 +426,15 @@ export function estimateOutputTokens(contentLength) {
  * @param {number} inputTokens - Input/prompt tokens
  * @param {number} outputTokens - Output/completion tokens
  * @param {string} targetFormat - Target format from FORMATS
- * @param {string|null} provider - Provider name (determines buffer size)
  */
-export function formatUsage(inputTokens, outputTokens, targetFormat, provider = null) {
+export function formatUsage(inputTokens, outputTokens, targetFormat) {
   // Claude format uses input_tokens/output_tokens
   if (targetFormat === FORMATS.CLAUDE) {
     return addBufferToUsage({
       input_tokens: inputTokens,
       output_tokens: outputTokens,
       estimated: true
-    }, provider);
+    });
   }
 
   // Default: OpenAI format (works for openai, gemini, responses, etc.)
@@ -300,7 +443,7 @@ export function formatUsage(inputTokens, outputTokens, targetFormat, provider = 
     completion_tokens: outputTokens,
     total_tokens: inputTokens + outputTokens,
     estimated: true
-  }, provider);
+  });
 }
 
 /**
@@ -308,32 +451,26 @@ export function formatUsage(inputTokens, outputTokens, targetFormat, provider = 
  * @param {object} body - Request body for input token estimation
  * @param {number} contentLength - Content length for output token estimation
  * @param {string} targetFormat - Target format from FORMATS constant
- * @param {string|null} provider - Provider name (determines buffer size)
  */
-export function estimateUsage(body, contentLength, targetFormat = FORMATS.OPENAI, provider = null) {
-  return formatUsage(
-    estimateInputTokens(body),
-    estimateOutputTokens(contentLength),
-    targetFormat,
-    provider
-  );
+export function estimateUsage(body, contentLength, targetFormat = FORMATS.OPENAI) {
+  return formatUsage(estimateInputTokens(body), estimateOutputTokens(contentLength), targetFormat);
 }
 
 /**
  * Log usage with cache info (green color)
  */
-export function logUsage(provider, usage, model = null, connectionId = null, apiKey = null) {
+export function logUsage(provider, usage, model = null, connectionId = null, apiKeyInfo = null) {
   if (!usage || typeof usage !== "object") return;
-
   const p = provider?.toUpperCase() || "UNKNOWN";
 
   // Support both formats:
   // - OpenAI: prompt_tokens, completion_tokens
   // - Claude: input_tokens, output_tokens
-  const inTokens = usage?.prompt_tokens || usage?.input_tokens || 0;
-  const outTokens = usage?.completion_tokens || usage?.output_tokens || 0;
-  const accountPrefix = connectionId ? connectionId.slice(0, 8) + "..." : "unknown";
-
+  const inTokens = getLoggedInputTokens(usage);
+  const outTokens = getLoggedOutputTokens(usage);
+  void apiKeyInfo;
+  const normalizedConnectionId = typeof connectionId === "string" ? connectionId : undefined;
+  const accountPrefix = normalizedConnectionId ? normalizedConnectionId.slice(0, 8) + "..." : "unknown";
   let msg = `[${getTimeString()}] 📊 ${COLORS.green}[USAGE] ${p} | in=${inTokens} | out=${outTokens} | account=${accountPrefix}${COLORS.reset}`;
 
   // Add estimated flag if present
@@ -342,14 +479,28 @@ export function logUsage(provider, usage, model = null, connectionId = null, api
   }
 
   // Add cache info if present (unified from different formats)
-  const cacheRead = usage.cache_read_input_tokens || usage.cached_tokens || usage.prompt_tokens_details?.cached_tokens;
+  const cacheRead = getPromptCacheReadTokens(usage);
   if (cacheRead) msg += ` | cache_read=${cacheRead}`;
-
-  const cacheCreation = usage.cache_creation_input_tokens;
+  const cacheCreation = getPromptCacheCreationTokens(usage);
   if (cacheCreation) msg += ` | cache_create=${cacheCreation}`;
-
   const reasoning = usage.reasoning_tokens;
   if (reasoning) msg += ` | reasoning=${reasoning}`;
-
   console.log(msg);
+
+  // Streaming requests persist usage once in chatCore's completion callback.
+  // Keep this helper side-effect free apart from console visibility.
+  const tokens = {
+    input: inTokens,
+    output: outTokens,
+    cacheRead: cacheRead || 0,
+    cacheCreation: cacheCreation || 0,
+    reasoning: reasoning || 0
+  };
+  appendRequestLog({
+    model: typeof model === "string" ? model : undefined,
+    provider: typeof provider === "string" ? provider : undefined,
+    connectionId: normalizedConnectionId,
+    tokens,
+    status: "200 OK"
+  }).catch(() => {});
 }

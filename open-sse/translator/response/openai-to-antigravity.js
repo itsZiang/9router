@@ -1,14 +1,11 @@
-import { register } from "../index.js";
-import { FORMATS } from "../formats.js";
-import { GEMINI_ROLE, OPENAI_FINISH, GEMINI_FINISH } from "../schema/index.js";
-
+import { register } from "../registry";
+import { FORMATS } from "../formats";
 // Convert OpenAI SSE chunk to Antigravity SSE format
 // Real Antigravity format:
 //   data: {"response":{"candidates":[{"content":{"role":"model","parts":[...]}, "finishReason":"STOP"}], "usageMetadata":{...}, "modelVersion":"...", "responseId":"..."}}
 // Tool calls: OpenAI sends incremental args across chunks → accumulate and emit ONCE at finish
 export function openaiToAntigravityResponse(chunk, state) {
   if (!chunk) return null;
-
   const choice = chunk.choices?.[0];
   if (!choice) {
     if (chunk.usage) {
@@ -16,7 +13,6 @@ export function openaiToAntigravityResponse(chunk, state) {
     }
     return null;
   }
-
   const delta = choice.delta || {};
   const finishReason = choice.finish_reason;
 
@@ -24,17 +20,21 @@ export function openaiToAntigravityResponse(chunk, state) {
   if (!state._toolCallAccum) state._toolCallAccum = {};
   if (!state._responseId) state._responseId = chunk.id || `resp_${Date.now()}`;
   if (!state._modelVersion) state._modelVersion = chunk.model || "";
-
   const parts = [];
 
   // Thinking/reasoning → thought part
   if (delta.reasoning_content) {
-    parts.push({ thought: true, text: delta.reasoning_content });
+    parts.push({
+      thought: true,
+      text: delta.reasoning_content
+    });
   }
 
   // Text content
   if (delta.content) {
-    parts.push({ text: delta.content });
+    parts.push({
+      text: delta.content
+    });
   }
 
   // Accumulate tool calls silently (no emit until finish)
@@ -42,7 +42,11 @@ export function openaiToAntigravityResponse(chunk, state) {
     for (const tc of delta.tool_calls) {
       const idx = tc.index ?? 0;
       if (!state._toolCallAccum[idx]) {
-        state._toolCallAccum[idx] = { id: "", name: "", arguments: "" };
+        state._toolCallAccum[idx] = {
+          id: "",
+          name: "",
+          arguments: ""
+        };
       }
       const accum = state._toolCallAccum[idx];
       if (tc.id) accum.id = tc.id;
@@ -59,12 +63,14 @@ export function openaiToAntigravityResponse(chunk, state) {
     for (const idx of indices) {
       const accum = state._toolCallAccum[idx];
       let args = {};
-      try { args = JSON.parse(accum.arguments); } catch { /* empty */ }
-      // Restore original tool name if it was prefixed during cloaking
-      const originalName = state.toolNameMap?.get(accum.name) || accum.name;
+      try {
+        args = JSON.parse(accum.arguments);
+      } catch {
+        /* empty */
+      }
       parts.push({
         functionCall: {
-          name: originalName,
+          name: accum.name,
           args
         }
       });
@@ -76,21 +82,28 @@ export function openaiToAntigravityResponse(chunk, state) {
 
   // Ensure at least empty text part on finish with no content
   if (parts.length === 0 && finishReason) {
-    parts.push({ text: "" });
+    parts.push({
+      text: ""
+    });
   }
 
   // Build candidate
-  const candidate = { content: { role: GEMINI_ROLE.MODEL, parts } };
+  const candidate = {
+    content: {
+      role: "model",
+      parts
+    }
+  };
 
   // Finish reason mapping
   if (finishReason) {
     const reasonMap = {
-      [OPENAI_FINISH.STOP]: GEMINI_FINISH.STOP,
-      [OPENAI_FINISH.LENGTH]: GEMINI_FINISH.MAX_TOKENS,
-      [OPENAI_FINISH.TOOL_CALLS]: GEMINI_FINISH.STOP,
-      [OPENAI_FINISH.CONTENT_FILTER]: GEMINI_FINISH.SAFETY
+      stop: "STOP",
+      length: "MAX_TOKENS",
+      tool_calls: "STOP",
+      content_filter: "SAFETY"
     };
-    candidate.finishReason = reasonMap[finishReason] || GEMINI_FINISH.STOP;
+    candidate.finishReason = reasonMap[finishReason] || "STOP";
   }
 
   // Build response
@@ -115,8 +128,9 @@ export function openaiToAntigravityResponse(chunk, state) {
       response.usageMetadata.cachedContentTokenCount = usage.prompt_tokens_details.cached_tokens;
     }
   }
-
-  return { response };
+  return {
+    response
+  };
 }
 
 // Register

@@ -5,3 +5,7 @@ export {
   appendRequestLog, getRecentLogs,
   saveRequestDetail, getRequestDetails, getRequestDetailById,
 } from "@/lib/db/index.js";
+
+export async function saveCallLog(entry) {
+  return null;
+}

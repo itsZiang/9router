@@ -1,0 +1,21 @@
+model_list:
+  - model_name: kimi-k2.6
+    litellm_params:
+      model: nvidia_nim/moonshotai/kimi-k2.6
+      api_base: https://integrate.api.nvidia.com/v1
+      api_key: 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
+      allowed_openai_params: ["reasoning_effort"]
+      
+  - model_name: kimi-k2.7
+    litellm_params:
+      model: openai/kimi-k2.7
+      api_base: https://llm.kimchi.dev/openai/v1
+      api_key: castai_v1_c423fa97ea6a6147159f84dbae531345f27b672bcf358ced7725f7c85b593f22_c6168f31
+      allowed_openai_params: ["reasoning_effort"]
+      
+      extra_headers:
+        User-Agent: "kimchi/dev"
+        Accept: "text/event-stream"
+
+general_settings:
+  master_key: "sk-1DhMyiCsoc4wHijhas0D5aRBtHU_HsWemGpKp4hIKY4"

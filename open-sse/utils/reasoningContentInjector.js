@@ -1,76 +1,60 @@
-// Some thinking-mode providers (DeepSeek, Kimi, MiniMax, ...) require reasoning_content
-// to be echoed back on assistant messages. Clients in OpenAI format don't send it,
-// so we inject a non-empty placeholder to satisfy upstream validation.
-import { PROVIDERS } from "../config/providers.js";
+/**
+ * Thinking-mode upstreams (DeepSeek V4 Flash, Kimi, MiniMax, ...) require
+ * `reasoning_content` to be echoed back on every assistant message in the
+ * conversation history. Standard OpenAI clients do not preserve that field
+ * across turns, so we inject a non-empty placeholder before forwarding.
+ *
+ * Without the placeholder these upstreams return:
+ *   400 Bad Request — reasoning_content must be passed back
+ *
+ * Ported from decolua/9router#1099 (issue #1543). Pure helper — no I/O, no
+ * cross-module deps — kept narrow so it can be reused by other meta-providers
+ * that proxy to thinking-mode models.
+ */
 
 const PLACEHOLDER = " ";
-
-// Provider-level rules derive from registry transport.reasoningInject (single source)
-const providerRuleFor = (provider) => PROVIDERS[provider]?.reasoningInject;
-
-// Model-level rules: matched by predicate against model id
-const MODEL_RULES = [
-  { match: m => /^kimi-/i.test(m || ""), scope: "toolCalls" },
-  { match: m => /deepseek/i.test(m || ""), scope: "all" }
-];
-
-const DEEPSEEK_V4_PRO = "deepseek-v4-pro";
-const DEEPSEEK_V4_PRO_ALIASES = {
-  [`${DEEPSEEK_V4_PRO}-max`]: {
-    thinkingType: "enabled",
-    reasoningEffort: "max"
-  },
-  [`${DEEPSEEK_V4_PRO}-none`]: {
-    thinkingType: "disabled",
-    reasoningEffort: null
-  }
-};
-
-function shouldInject(message, scope) {
-  if (message?.role !== "assistant") return false;
-  const rc = message.reasoning_content;
-  if (typeof rc === "string" && rc.length > 0) return false;
-  if (scope === "toolCalls") return Array.isArray(message.tool_calls) && message.tool_calls.length > 0;
-  return true;
+/**
+ * Model-id predicates for thinking-mode families that need the echo.
+ * Matched case-insensitively against the resolved model id (post upstream
+ * routing, e.g. `oc/deepseek-v4-flash-free` for the OpenCode meta-provider).
+ */
+const THINKING_MODEL_PATTERNS = [/deepseek/i, /\bkimi\b/i, /\bk2\b/i,
+// moonshot kimi k2 family alias
+/\bminimax\b/i];
+export function isThinkingMessageModel(model) {
+  if (!model || typeof model !== "string") return false;
+  return THINKING_MODEL_PATTERNS.some(re => re.test(model));
+}
+function hasNonEmptyReasoningContent(message) {
+  return typeof message.reasoning_content === "string" && message.reasoning_content.trim().length > 0;
+}
+function isAssistantMessage(value) {
+  return !!value && typeof value === "object" && !Array.isArray(value) && value.role === "assistant";
 }
 
-function applyRule(body, rule) {
-  if (!rule || !body?.messages) return body;
-  const messages = body.messages.map(m =>
-    shouldInject(m, rule.scope) ? { ...m, reasoning_content: PLACEHOLDER } : m
-  );
-  return { ...body, messages };
-}
-
-function applyDeepSeekV4ProAlias({ provider, model, body }) {
-  const alias = DEEPSEEK_V4_PRO_ALIASES[model];
-  if (provider !== "deepseek" || !alias || !body) return body;
-
-  const nextBody = {
-    ...body,
-    model: DEEPSEEK_V4_PRO,
-    extra_body: {
-      ...(body.extra_body || {}),
-      thinking: {
-        ...(body.extra_body?.thinking || {}),
-        type: alias.thinkingType
-      }
-    }
-  };
-
-  if (alias.reasoningEffort) {
-    nextBody.reasoning_effort = alias.reasoningEffort;
-  } else {
-    delete nextBody.reasoning_effort;
-  }
-
-  return nextBody;
-}
-
-export function injectReasoningContent({ provider, model, body }) {
-  const providerRule = providerRuleFor(provider);
-  const modelRule = MODEL_RULES.find(r => r.match(model));
-  const rule = providerRule || modelRule;
-  const nextBody = applyDeepSeekV4ProAlias({ provider, model, body });
-  return applyRule(nextBody, rule);
+/**
+ * Inject a placeholder `reasoning_content` on every assistant message in
+ * `body.messages` that lacks one. Returns the original object if no mutation
+ * was needed, or a shallow-copied body with a new messages array otherwise.
+ *
+ * No-op when the body shape is unexpected (defensive).
+ */
+export function injectReasoningContentForThinkingModel(body) {
+  if (!body || typeof body !== "object" || Array.isArray(body)) return body;
+  const record = body;
+  if (!Array.isArray(record.messages)) return body;
+  let modified = false;
+  const messages = record.messages.map(message => {
+    if (!isAssistantMessage(message)) return message;
+    if (hasNonEmptyReasoningContent(message)) return message;
+    modified = true;
+    return {
+      ...message,
+      reasoning_content: PLACEHOLDER
+    };
+  });
+  return modified ? {
+    ...record,
+    messages
+  } : body;
 }

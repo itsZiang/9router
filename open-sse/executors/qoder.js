@@ -1,458 +1,347 @@
-/**
- * QoderExecutor — sends OpenAI-format chat requests to Qoder's COSY-signed
- * inference endpoint at api3.qoder.sh, then unwraps Qoder's `{statusCodeValue,
- * body}` SSE envelope back into plain OpenAI SSE for the rest of the pipeline.
- *
- * Differences vs the previous placeholder:
- *   - URL is api3.qoder.sh/algo/api/v2/service/pro/sse/agent_chat_generation
- *     with `&Encode=1` so we can ship the body through the WAF-bypass
- *     encoder.
- *   - Authentication is COSY (RSA + AES + MD5 + ~17 Cosy-* headers), not
- *     a static HMAC.
- *   - The request shape Qoder expects is non-trivial (chat_context with
- *     mirrored modelConfig, business block with stable IDs, system text
- *     hoisted out of the messages array). All ported from the reference.
- *   - Model identifier is one of the canonical Qoder keys (auto / ultimate /
- *     performance / efficient / lite + frontier "*model" ids); the
- *     translator layer feeds us "qoder/<key>" so we strip the prefix.
- *   - Per-model `model_config` is fetched live from /algo/api/v2/model/list
- *     and cached. Sending the wrong block silently downgrades to a
- *     different model upstream, so a missing entry is a hard error.
- */
-
-import { qoderEncodeBody } from "../shared/qoder/encoding.js";
-import { buildCosyHeaders } from "../shared/qoder/cosy.js";
-import { v4 as uuidv4 } from "uuid";
-import { createHash } from "crypto";
-
-import { BaseExecutor } from "./base.js";
-import { PROVIDERS } from "../config/providers.js";
-import { proxyAwareFetch } from "../utils/proxyFetch.js";
-import { SSE_DONE } from "../utils/sseConstants.js";
-import { FETCH_CONNECT_TIMEOUT_MS } from "../config/runtimeConfig.js";
-import {
-  QODER_CHAT_URL_ENCODED,
-  QODER_MODEL_MAP,
-} from "../shared/qoder/constants.js";
-import { getQoderModelConfig, resolveQoderModels } from "../services/qoderModels.js";
-
-/**
- * Hoist role:"system" messages out of the messages array (Qoder rejects
- * system in messages) and flatten any multipart content arrays.
- */
-function normalizeMessages(messages) {
-  if (!Array.isArray(messages) || messages.length === 0) {
-    return { messages: [], systemText: "" };
-  }
-  const systemParts = [];
-  const out = [];
-  for (const msg of messages) {
-    if (!msg || typeof msg !== "object") continue;
-    const text = extractText(msg.content);
-    if (msg.role === "system") {
-      if (text) systemParts.push(text);
-      continue;
-    }
-    const cloned = { ...msg };
-    cloned.content = text;
-    out.push(cloned);
-  }
-  return { messages: out, systemText: systemParts.join("\n\n") };
-}
-
-function extractText(content) {
-  if (typeof content === "string") return content;
-  if (content == null) return "";
-  if (Array.isArray(content)) {
-    const parts = [];
-    for (const item of content) {
-      if (item && typeof item === "object") {
-        if (item.type === "text" && typeof item.text === "string") {
-          parts.push(item.text);
-        } else if (typeof item.text === "string") {
-          parts.push(item.text);
-        }
-      }
-    }
-    return parts.join("\n");
-  }
-  return String(content);
-}
-
-function lastUserText(messages) {
-  for (let i = messages.length - 1; i >= 0; i--) {
-    const m = messages[i];
-    if (m?.role === "user" && typeof m.content === "string") {
-      return m.content;
-    }
-  }
-  return "";
-}
-
-function stableHash(prefix, ...parts) {
-  const h = createHash("sha256");
-  h.update(prefix);
-  for (const p of parts) {
-    h.update("\0");
-    h.update(String(p ?? ""));
-  }
-  return h.digest("hex").slice(0, 16);
-}
-
-function stableChatRecordId(model, messages, tools, maxTokens) {
-  const h = createHash("sha256");
-  h.update("qoder-record\0");
-  h.update(String(model));
-  for (const m of messages) {
-    if (!m || typeof m !== "object") continue;
-    if (m.role) { h.update("\0"); h.update(m.role); }
-    if (typeof m.content === "string" && m.content) {
-      h.update("\0"); h.update(m.content);
-    }
-  }
-  if (tools) {
-    h.update("\0");
-    try { h.update(JSON.stringify(tools)); } catch {}
-  }
-  h.update(`\0mt=${maxTokens}`);
-  return h.digest("hex").slice(0, 16);
-}
-
-function truncate(s, n) {
-  return s && s.length > n ? `${s.slice(0, n)}...` : s || "";
+import { BaseExecutor, mergeUpstreamExtraHeaders, setUserAgentHeader } from "./base";
+import { PROVIDERS } from "../config/constants";
+import { getQoderDashscopeCompatHeaders, QODER_DEFAULT_USER_AGENT } from "../config/providerHeaderProfiles";
+import { sanitizeQwenThinkingToolChoice } from "../services/qwenThinking";
+import { buildCosyHeadersForValidation, resolveQoderJobToken } from "../services/qoderCli";
+import { sanitizeErrorMessage } from "../utils/error";
+function truncate(text, max) {
+  if (text.length <= max) return text;
+  return `${text.slice(0, max)}…`;
 }
 
 /**
- * Map the OpenAI-style request body into the exact shape Qoder expects.
+ * Peek at the first SSE event from a Qoder response to detect upstream errors
+ * that Qoder wraps inside an HTTP 200 SSE envelope ({statusCodeValue, body}).
+ * Returns a proper HTTP error Response when found, so downstream fallback
+ * logic (combo routing, account fallback) can trigger. For success, re-creates
+ * the stream with the first chunk prepended so the body passes through
+ * transparently.
  */
-async function buildQoderRequestBody({ model, body, credentials, log, proxyOptions, signal }) {
-  const qoderKey = String(model || "").replace(/^qoder\//, "");
-  
-  // Fetch model config from dynamic API instead of relying on static QODER_MODEL_MAP.
-  // This allows support for new Qoder models (e.g., qmodel_latest) without code changes.
-  let modelConfig = await getQoderModelConfig(credentials, qoderKey, { log, proxyOptions, signal });
-  if (!modelConfig) {
-    // Try a forced refresh once before giving up — the cache may simply
-    // not be populated yet on first ever call for this credential.
-    const refreshed = await resolveQoderModels(credentials, { forceRefresh: true, log, proxyOptions, signal });
-    const retried = refreshed?.rawConfigs.get(qoderKey);
-    if (!retried) {
-      throw new Error(
-        `qoder: model_config for "${qoderKey}" not yet known (run a model list fetch or check upstream connectivity)`,
-      );
-    }
-    modelConfig = { ...retried, key: qoderKey };
+async function unwrapQoderEnvelope(response) {
+  if (!response.ok || !response.body) {
+    return response;
   }
-
-  const { messages, systemText } = normalizeMessages(body.messages || []);
-  const tools = body.tools;
-  const isReasoning = !!modelConfig.is_reasoning;
-  const maxOutputTokens = Number(modelConfig.max_output_tokens) || 0;
-
-  let maxTokens = 32_768;
-  if (maxOutputTokens > 0) maxTokens = maxOutputTokens;
-  if (typeof body.max_tokens === "number" && body.max_tokens > 0 && body.max_tokens < maxTokens) {
-    maxTokens = body.max_tokens;
-  }
-  if (typeof body.max_completion_tokens === "number" && body.max_completion_tokens > 0 && body.max_completion_tokens < maxTokens) {
-    maxTokens = body.max_completion_tokens;
-  }
-
-  const lastUser = lastUserText(messages);
-  const psd = credentials.providerSpecificData || {};
-  const sessionId = stableHash("qoder-session", psd.userId, qoderKey);
-  const recordId = stableChatRecordId(qoderKey, messages, tools, maxTokens);
-
-  return {
-    qoderKey,
-    payload: {
-      request_id: uuidv4(),
-      request_set_id: recordId,
-      chat_record_id: recordId,
-      session_id: sessionId,
-      stream: true,
-      chat_task: "FREE_INPUT",
-      is_reply: true,
-      is_retry: false,
-      source: 1,
-      version: "3",
-      session_type: "qodercli",
-      agent_id: "agent_common",
-      task_id: "common",
-      code_language: "",
-      chat_prompt: "",
-      image_urls: null,
-      aliyun_user_type: "",
-      system: systemText,
-      messages,
-      tools: Array.isArray(tools) ? tools : [],
-      parameters: { max_tokens: maxTokens },
-      chat_context: {
-        chatPrompt: "",
-        imageUrls: null,
-        extra: {
-          context: [],
-          modelConfig: { key: qoderKey, is_reasoning: isReasoning },
-          originalContent: lastUser,
-        },
-        features: [],
-        text: lastUser,
-      },
-      model_config: modelConfig,
-      business: {
-        product: "cli",
-        version: "1.0.0",
-        type: "agent",
-        stage: "start",
-        id: uuidv4(),
-        name: truncate(lastUser, 30),
-        begin_at: Date.now(),
-      },
-    },
-    modelConfig,
-  };
-}
-
-/**
- * Wrap the upstream's `{statusCodeValue, body}` SSE envelope into plain
- * OpenAI SSE chunks the rest of the chatCore pipeline understands.
- *
- * Each upstream line looks like:
- *   data: {"statusCodeValue":200,"body":"{\"choices\":[{\"delta\":{...}}]}"}
- * The inner body is an OpenAI streaming chunk (or "[DONE]"). We unwrap it
- * and re-emit as `data: <inner>\n\n`. Errors become `data: [DONE]\n\n` plus
- * a synthetic OpenAI error chunk.
- */
-function wrapQoderSSE(response, model) {
-  if (!response.ok || !response.body) return response;
-
+  const reader = response.body.getReader();
   const decoder = new TextDecoder();
-  const encoder = new TextEncoder();
-  let buffer = "";
-  let doneEmitted = false;
-
-  // Process one already-extracted SSE line (no trailing newline). Returns
-  // false when the line indicated end-of-stream so the caller can stop
-  // forwarding any remaining chunks after [DONE].
-  const processLine = (line, controller) => {
-    const trimmed = line.replace(/\r$/, "").trim();
-    if (!trimmed) return;
-    if (!trimmed.startsWith("data:")) return;
-    if (doneEmitted) return; // never forward chunks past stream end
-
-    const data = trimmed.slice(5).trimStart();
-    if (data === "[DONE]") {
-      controller.enqueue(encoder.encode(SSE_DONE));
-      doneEmitted = true;
-      return;
-    }
-
-    let envelope;
-    try { envelope = JSON.parse(data); } catch { return; }
-    const statusVal = typeof envelope.statusCodeValue === "number" ? envelope.statusCodeValue : 200;
-    const inner = typeof envelope.body === "string" ? envelope.body : "";
-    if (statusVal !== 200) {
-      const msg = inner || `upstream status ${statusVal}`;
-      const errChunk = JSON.stringify({
-        id: `qoder-error-${Date.now()}`,
-        object: "chat.completion.chunk",
-        created: Math.floor(Date.now() / 1000),
-        model,
-        choices: [{ index: 0, delta: { content: `\n[qoder error ${statusVal}: ${truncate(msg, 200)}]` }, finish_reason: "stop" }],
-      });
-      controller.enqueue(encoder.encode(`data: ${errChunk}\n\n`));
-      controller.enqueue(encoder.encode(SSE_DONE));
-      doneEmitted = true;
-      return;
-    }
-    if (!inner) return;
-    if (inner === "[DONE]") {
-      controller.enqueue(encoder.encode(SSE_DONE));
-      doneEmitted = true;
-      return;
-    }
-    // Inner is an OpenAI-shaped chunk. Strip any embedded newlines so the
-    // SSE frame stays a single event (a literal "\n" inside `inner` would
-    // otherwise split the frame across multiple data: lines and downstream
-    // parsers would reassemble them as separate events).
-    const sanitized = inner.replace(/\r?\n/g, "");
-    controller.enqueue(encoder.encode(`data: ${sanitized}\n\n`));
-  };
-
-  const transform = new TransformStream({
-    transform(chunk, controller) {
-      buffer += decoder.decode(chunk, { stream: true });
-      let nl;
-      while ((nl = buffer.indexOf("\n")) !== -1) {
-        const line = buffer.slice(0, nl);
-        buffer = buffer.slice(nl + 1);
-        processLine(line, controller);
+  const {
+    done,
+    value
+  } = await reader.read();
+  if (done) {
+    reader.cancel();
+    return new Response(JSON.stringify({
+      error: {
+        message: "[qoder] empty response",
+        type: "provider_error"
       }
-    },
-    flush(controller) {
-      // Finalize the decoder so any pending multi-byte sequence is
-      // released into `buffer` instead of being silently dropped.
-      buffer += decoder.decode();
-      // Drain any trailing line that arrived without a terminating newline
-      // (e.g. upstream closed the socket immediately after the last write,
-      // or a CDN stripped the final CRLF). Without this, the chunk that
-      // carries finish_reason is silently lost.
-      if (buffer.length > 0) {
-        processLine(buffer, controller);
-        buffer = "";
+    }), {
+      status: 502,
+      headers: {
+        "Content-Type": "application/json"
       }
-      if (!doneEmitted) {
-        controller.enqueue(encoder.encode(SSE_DONE));
-        doneEmitted = true;
-      }
-    },
+    });
+  }
+  const text = decoder.decode(value, {
+    stream: true
   });
+  let errorStatus = null;
+  let errorMsg = "";
+  for (const line of text.split("\n")) {
+    const trimmed = line.trim();
+    if (!trimmed.startsWith("data:")) continue;
+    const jsonStr = trimmed.slice(5).trim();
+    if (jsonStr === "[DONE]") break;
+    try {
+      const envelope = JSON.parse(jsonStr);
+      const statusVal = typeof envelope.statusCodeValue === "number" ? envelope.statusCodeValue : 200;
+      if (statusVal !== 200) {
+        errorStatus = statusVal >= 400 ? statusVal : 502;
+        errorMsg = typeof envelope.body === "string" ? envelope.body : `upstream status ${statusVal}`;
+      }
+    } catch {
+      // Malformed JSON — treat as non-error; downstream handling parses it.
+    }
+    break;
+  }
+  if (errorStatus) {
+    reader.cancel();
+    const errType = errorStatus === 401 || errorStatus === 403 ? "authentication_error" : "provider_error";
+    return new Response(JSON.stringify({
+      error: {
+        message: `[qoder error ${errorStatus}: ${sanitizeErrorMessage(truncate(errorMsg, 200))}]`,
+        type: errType
+      }
+    }), {
+      status: errorStatus,
+      headers: {
+        "Content-Type": "application/json"
+      }
+    });
+  }
 
-  const transformed = response.body.pipeThrough(transform);
-  // Build a Response with passable headers; the streaming handler reads
-  // `.body` as a ReadableStream regardless of Content-Type.
-  return new Response(transformed, {
+  // Re-create the stream with the first chunk prepended so the success body
+  // passes through unchanged.
+  const restStream = new ReadableStream({
+    start(controller) {
+      controller.enqueue(value);
+    },
+    pull(controller) {
+      return reader.read().then(({
+        done,
+        value
+      }) => {
+        if (done) {
+          controller.close();
+          return;
+        }
+        controller.enqueue(value);
+      });
+    },
+    cancel() {
+      reader.cancel();
+    }
+  });
+  return new Response(restStream, {
     status: response.status,
     statusText: response.statusText,
-    headers: {
-      "Content-Type": "text/event-stream",
-      "Cache-Control": "no-cache",
-    },
+    headers: new Headers(response.headers)
   });
 }
-
+function getAuthToken(credentials) {
+  if (typeof credentials.apiKey === "string" && credentials.apiKey.trim()) {
+    return credentials.apiKey.trim();
+  }
+  if (typeof credentials.accessToken === "string" && credentials.accessToken.trim()) {
+    return credentials.accessToken.trim();
+  }
+  if (typeof credentials.refreshToken === "string" && credentials.refreshToken.trim()) {
+    return credentials.refreshToken.trim();
+  }
+  // Fallback: QODER_PERSONAL_ACCESS_TOKEN env var (#966)
+  const envToken = String(process.env.QODER_PERSONAL_ACCESS_TOKEN || "").trim();
+  if (envToken) return envToken;
+  return "";
+}
 export class QoderExecutor extends BaseExecutor {
   constructor() {
     super("qoder", PROVIDERS.qoder);
   }
-
-  buildUrl() {
-    return QODER_CHAT_URL_ENCODED;
+  buildHeaders(credentials, stream = true, clientHeaders, model) {
+    const headers = super.buildHeaders(credentials, stream, clientHeaders, model);
+    setUserAgentHeader(headers, QODER_DEFAULT_USER_AGENT);
+    return headers;
   }
-
-  // Override execute entirely — Qoder needs:
-  //   - body built from translated chat completion payload
-  //   - body encoded with QoderEncodeBody before signing
-  //   - COSY headers built from the *encoded* body bytes
-  //   - response stream re-wrapped from {statusCodeValue, body} to OpenAI SSE
-  async execute({ model, body, stream, credentials, signal, log, proxyOptions = null }) {
-    const url = this.buildUrl();
-
-    const psd = credentials?.providerSpecificData || {};
-    if (!psd.userId) {
-      // No user id → no way to sign. Surface a 401 so the dashboard nudges
-      // the user back to OAuth.
-      const fakeResp = new Response(
-        JSON.stringify({ error: { message: "qoder credential is missing userId; reconnect the account" } }),
-        { status: 401, headers: { "Content-Type": "application/json" } },
-      );
-      return { response: fakeResp, url, headers: {}, transformedBody: body };
-    }
-    if (!credentials?.accessToken) {
-      // Same shape as the userId guard — clean 401 so chatCore reports
-      // "reconnect" rather than bubbling cosy.js's synchronous throw as 500.
-      const fakeResp = new Response(
-        JSON.stringify({ error: { message: "qoder credential is missing accessToken; reconnect the account" } }),
-        { status: 401, headers: { "Content-Type": "application/json" } },
-      );
-      return { response: fakeResp, url, headers: {}, transformedBody: body };
-    }
-
-    let qoderKey;
-    let payload;
-    try {
-      ({ qoderKey, payload } = await buildQoderRequestBody({ model, body, credentials, log, proxyOptions, signal }));
-    } catch (err) {
-      const fakeResp = new Response(
-        JSON.stringify({ error: { message: err.message } }),
-        { status: 400, headers: { "Content-Type": "application/json" } },
-      );
-      return { response: fakeResp, url, headers: {}, transformedBody: body };
-    }
-
-    const plainBody = Buffer.from(JSON.stringify(payload), "utf8");
-    const encodedBodyStr = qoderEncodeBody(plainBody);
-    const encodedBodyBuf = Buffer.from(encodedBodyStr, "latin1");
-
-    let cosyHeaders;
-    try {
-      cosyHeaders = buildCosyHeaders(
-        encodedBodyBuf,
-        url,
-        {
-          userId: psd.userId,
-          authToken: credentials.accessToken,
-          name: credentials.displayName || "",
-          email: credentials.email || "",
-          machineId: psd.machineId || "",
+  transformRequest(model, body) {
+    const payload = {
+      ...(typeof body === "object" && body !== null ? body : {}),
+      model
+    };
+    return sanitizeQwenThinkingToolChoice(payload, "QoderExecutor");
+  }
+  async execute({
+    model,
+    body,
+    stream,
+    credentials,
+    signal,
+    upstreamExtraHeaders
+  }) {
+    const token = getAuthToken(credentials);
+    if (!token) {
+      return {
+        response: new Response(JSON.stringify({
+          error: {
+            message: "Qoder access token or API Key is required. Please sign in or set a PAT.",
+            type: "authentication_error",
+            code: "token_required"
+          }
+        }), {
+          status: 401,
+          headers: {
+            "Content-Type": "application/json"
+          }
+        }),
+        url: "https://dashscope.aliyuncs.com",
+        headers: {
+          "Content-Type": "application/json"
         },
-      );
-    } catch (err) {
-      // cosy.js throws synchronously on missing userId/authToken — surface
-      // as 401 so chatCore prompts re-auth instead of returning a 500.
-      const fakeResp = new Response(
-        JSON.stringify({ error: { message: `qoder cosy signing failed: ${err.message}` } }),
-        { status: 401, headers: { "Content-Type": "application/json" } },
-      );
-      return { response: fakeResp, url, headers: {}, transformedBody: body };
+        transformedBody: body
+      };
+    }
+    const resolvedModel = model || "qwen3-coder-plus";
+
+    // Detect token type: PAT (Personal Access Token) starts with "pt-"
+    const isPatToken = token.startsWith("pt-");
+    let mappedModel = resolvedModel;
+    let endpointUrl;
+    if (isPatToken) {
+      endpointUrl = "https://api.qoder.com/v1/chat/completions";
+    } else {
+      if (resolvedModel === "qwen3.5-plus" || resolvedModel === "qwen3.6-plus") {
+        mappedModel = "coder-model";
+      } else if (resolvedModel === "vision-model") {
+        mappedModel = "qwen3-vl-plus";
+      }
+      endpointUrl = "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions";
     }
 
-    const modelSource = (payload.model_config && payload.model_config.source) || "system";
+    // Check for custom API base via credentials (overrides the default)
+    let credentialsApiBase;
+    if (typeof credentials === "object" && credentials !== null) {
+      const credsObj = credentials;
+      credentialsApiBase = credsObj.customApiBase || credsObj.resourceUrl;
+    }
+    if (typeof credentialsApiBase === "string" && credentialsApiBase.trim()) {
+      let base = credentialsApiBase.trim();
+      if (!base.startsWith("http")) base = `https://${base}`;
+      if (!base.endsWith("/v1")) base = base.endsWith("/") ? `${base}v1` : `${base}/v1`;
+      endpointUrl = `${base}/chat/completions`;
+    }
     const headers = {
       "Content-Type": "application/json",
-      Accept: "text/event-stream",
-      "Cache-Control": "no-cache",
-      "X-Model-Key": qoderKey,
-      "X-Model-Source": modelSource,
-      // gzip triggers signature validation on Qoder's CDN; force identity.
-      "Accept-Encoding": "identity",
-      ...cosyHeaders,
+      Authorization: `Bearer ${token}`,
+      ...(isPatToken ? {} : getQoderDashscopeCompatHeaders())
     };
-
-    // Abort if upstream doesn't return response headers within connect timeout.
-    const timeoutMs = this.config?.timeoutMs || FETCH_CONNECT_TIMEOUT_MS;
-    const connectCtrl = new AbortController();
-    const connectTimer = setTimeout(() => connectCtrl.abort(new Error("fetch connect timeout")), timeoutMs);
-    const mergedSignal = signal ? AbortSignal.any([signal, connectCtrl.signal]) : connectCtrl.signal;
-
-    let response;
+    mergeUpstreamExtraHeaders(headers, upstreamExtraHeaders);
+    const payload = this.transformRequest(mappedModel, body, stream, credentials);
+    const bodyStr = JSON.stringify(payload);
     try {
-      response = await proxyAwareFetch(
-        url,
-        { method: "POST", headers, body: encodedBodyBuf, signal: mergedSignal },
-        proxyOptions,
-      );
-    } finally {
-      clearTimeout(connectTimer);
+      let response = await fetch(endpointUrl, {
+        method: "POST",
+        headers,
+        body: bodyStr,
+        signal
+      });
+
+      // PAT tokens (pt-*) are not accepted as Bearer tokens by api.qoder.com/v1/chat/completions.
+      // They return 401 TOKEN_INVALID. Fallback to Cosy auth against api1.qoder.sh.
+      if (!response.ok && response.status === 401 && isPatToken) {
+        // #4683: exchange the PAT (pt-*) for a job token (jt-*) before the Cosy call;
+        // Cosy rejects a raw pt-* in security_oauth_token with a generic 500.
+        const cosyToken = await resolveQoderJobToken(token, {
+          signal
+        });
+        const cosyHeaders = buildCosyHeadersForValidation(bodyStr, cosyToken);
+        const cosyEndpoint = "https://api1.qoder.sh/algo/api/v2/service/pro/sse/agent_chat_generation?AgentId=agent_common";
+        const cosyRes = await fetch(cosyEndpoint, {
+          method: "POST",
+          headers: cosyHeaders,
+          body: bodyStr,
+          signal
+        });
+        if (cosyRes.ok || cosyRes.status === 200) {
+          // Cosy SSE response - read full body and parse
+          const rawText = await cosyRes.text();
+          const lines = rawText.split("\n").filter(l => l.startsWith("data: "));
+          let fullContent = "";
+          for (const line of lines) {
+            try {
+              const jsonData = JSON.parse(line.slice(6));
+              const {
+                extractTextFromQoderEnvelope
+              } = await import("../services/qoderCli");
+              const chunkText = extractTextFromQoderEnvelope(jsonData);
+              if (chunkText) fullContent += chunkText;
+            } catch {
+              // skip unparseable chunks
+            }
+          }
+          const {
+            buildQoderCompletionPayload
+          } = await import("../services/qoderCli");
+          const cosyPayload = buildQoderCompletionPayload({
+            model: mappedModel || resolvedModel,
+            text: fullContent
+          });
+          return {
+            response: new Response(JSON.stringify(cosyPayload), {
+              status: 200,
+              headers: {
+                "Content-Type": "application/json"
+              }
+            }),
+            url: cosyEndpoint,
+            headers: cosyHeaders,
+            transformedBody: payload
+          };
+        }
+
+        // Cosy also failed - return the original 401 error
+        let errText = await cosyRes.text();
+        return {
+          response: new Response(JSON.stringify({
+            error: {
+              message: `Qoder API (Cosy) failed with status ${cosyRes.status}: ${errText}. Your PAT token may not be valid for the chat API.` + " Try using an OAuth token or a different auth method.",
+              type: "authentication_error",
+              code: "token_invalid"
+            }
+          }), {
+            status: 401,
+            headers: {
+              "Content-Type": "application/json"
+            }
+          }),
+          url: cosyEndpoint,
+          headers: cosyHeaders,
+          transformedBody: payload
+        };
+      }
+      if (!response.ok) {
+        let errText = await response.text();
+        return {
+          response: new Response(JSON.stringify({
+            error: {
+              message: `Qoder API failed with status ${response.status}: ${errText}`,
+              type: response.status === 401 ? "authentication_error" : "provider_error"
+            }
+          }), {
+            status: response.status,
+            headers: {
+              "Content-Type": "application/json"
+            }
+          }),
+          url: endpointUrl,
+          headers,
+          transformedBody: payload
+        };
+      }
+
+      // Qoder wraps upstream errors inside an HTTP 200 SSE envelope
+      // ({statusCodeValue}). Peek at the first event to detect this and return
+      // a proper HTTP error so combo/account fallback logic can trigger.
+      const unwrapped = await unwrapQoderEnvelope(response);
+      return {
+        response: unwrapped,
+        url: endpointUrl,
+        headers,
+        transformedBody: payload
+      };
+    } catch (e) {
+      const error = e;
+      if (error.name === "AbortError") {
+        throw error;
+      }
+      return {
+        response: new Response(JSON.stringify({
+          error: {
+            message: `Qoder fetch error: ${sanitizeErrorMessage(error.message)}`,
+            type: "provider_error"
+          }
+        }), {
+          status: 502,
+          headers: {
+            "Content-Type": "application/json"
+          }
+        }),
+        url: endpointUrl,
+        headers,
+        transformedBody: payload
+      };
     }
-
-    if (!response.ok) {
-      // Pass error response through unchanged so chatCore can capture it.
-      return { response, url, headers, transformedBody: payload };
-    }
-
-    const wrapped = wrapQoderSSE(response, `qoder/${qoderKey}`);
-    return { response: wrapped, url, headers, transformedBody: payload };
-  }
-
-  // Qoder device tokens don't refresh through OAuth — the upstream returns
-  // 403 for our flow. Surfacing failure via 401-on-chat is enough; the
-  // dashboard tells users to re-login when their token expires (~30 days).
-  async refreshCredentials() {
-    return null;
-  }
-
-  needsRefresh() {
-    return false;
   }
 }
-
 export default QoderExecutor;
-
-// Internals exposed for unit tests. Not part of the public API — callers
-// should import QoderExecutor and use its public methods.
 export const __test__ = {
-  normalizeMessages,
-  wrapQoderSSE,
-  buildQoderRequestBody,
+  unwrapQoderEnvelope,
+  truncate
 };

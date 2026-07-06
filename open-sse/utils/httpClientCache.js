@@ -138,6 +138,34 @@ export class HttpClientCache {
   }
 
   /**
+   * Return a no-keep-alive dispatcher for retrying direct requests that just
+   * failed with a transient socket error (UND_ERR_SOCKET / ECONNRESET / etc.).
+   *
+   * The default pooled Agent reuses keep-alive sockets. Edges such as nvidia /
+   * opencode-zen silently close idle keep-alive sockets, so retrying on the
+   * SAME pooled dispatcher can grab ANOTHER stale socket. This retry dispatcher
+   * forces a fresh TCP connection on every request.
+   */
+  async getRetryDispatcher(opts = {}) {
+    const resolved = this._resolveOpts(opts);
+    const key = buildKey({ proxyUrl: "__retry_dispatcher__", ...resolved });
+
+    const { Agent } = await import("undici");
+    return this._getOrCreate(key, () => {
+      const agentOpts = {
+        keepAliveTimeout: 1,
+        keepAliveMaxTimeout: 1,
+        pipelining: 0,
+        connections: resolved.poolLimit,
+        bodyTimeout: 0,
+        headersTimeout: 0,
+        ...this._buildConnectOpts(resolved.connectTimeout),
+      };
+      return new Agent(agentOpts);
+    });
+  }
+
+  /**
    * Return a cached (or newly created) undici ProxyAgent for proxy fetches.
    * Returns null if proxyUrl is empty/invalid.
    */

@@ -1,16 +1,49 @@
 // OpenAI-compatible error types mapping (client-facing)
 export const ERROR_TYPES = {
-  400: { type: "invalid_request_error", code: "bad_request" },
-  401: { type: "authentication_error", code: "invalid_api_key" },
-  402: { type: "billing_error", code: "payment_required" },
-  403: { type: "permission_error", code: "insufficient_quota" },
-  404: { type: "invalid_request_error", code: "model_not_found" },
-  406: { type: "invalid_request_error", code: "model_not_supported" },
-  429: { type: "rate_limit_error", code: "rate_limit_exceeded" },
-  500: { type: "server_error", code: "internal_server_error" },
-  502: { type: "server_error", code: "bad_gateway" },
-  503: { type: "server_error", code: "service_unavailable" },
-  504: { type: "server_error", code: "gateway_timeout" }
+  400: {
+    type: "invalid_request_error",
+    code: "bad_request"
+  },
+  401: {
+    type: "authentication_error",
+    code: "invalid_api_key"
+  },
+  402: {
+    type: "billing_error",
+    code: "payment_required"
+  },
+  403: {
+    type: "permission_error",
+    code: "insufficient_quota"
+  },
+  404: {
+    type: "invalid_request_error",
+    code: "model_not_found"
+  },
+  406: {
+    type: "invalid_request_error",
+    code: "model_not_supported"
+  },
+  429: {
+    type: "rate_limit_error",
+    code: "rate_limit_exceeded"
+  },
+  500: {
+    type: "server_error",
+    code: "internal_server_error"
+  },
+  502: {
+    type: "server_error",
+    code: "bad_gateway"
+  },
+  503: {
+    type: "server_error",
+    code: "service_unavailable"
+  },
+  504: {
+    type: "server_error",
+    code: "gateway_timeout"
+  }
 };
 
 // Default error messages per status code (client-facing)
@@ -28,78 +61,203 @@ export const DEFAULT_ERROR_MESSAGES = {
   504: "Gateway timeout"
 };
 
-// Exponential backoff config for rate limits
+// Exponential backoff config for rate limits.
+// Preserve OmniRoute's existing 2-minute cap to avoid changing runtime behavior.
 export const BACKOFF_CONFIG = {
-  base: 2000,
-  max: 5 * 60 * 1000,
+  base: 1000,
+  max: 2 * 60 * 1000,
   maxLevel: 15
 };
-
-// Default cooldown for transient/unknown errors
-export const TRANSIENT_COOLDOWN_MS = 30 * 1000;
-
-// Hard cap for provider-reported rate limit cooldown (e.g. codex resets_at can be 5-6h)
-export const MAX_RATE_LIMIT_COOLDOWN_MS = 30 * 60 * 1000;
+export const TRANSIENT_COOLDOWN_MS = 5 * 1000;
 
 // Cooldown durations (ms)
-const COOLDOWN = {
-  long: 2 * 60 * 1000,
-  short: 5 * 1000,
-};
-
-/**
- * Unified error classification rules.
- * Checked top-to-bottom: text rules first (by order), then status rules.
- * Each rule: { text?, status?, cooldownMs?, backoff? }
- *   - text: substring match (case-insensitive) on error message
- *   - status: HTTP status code match
- *   - cooldownMs: fixed cooldown duration
- *   - backoff: true = use exponential backoff (rate limit)
- */
-export const ERROR_RULES = [
-  // --- Text-based rules (checked first, order = priority) ---
-  { text: "no credentials",           cooldownMs: COOLDOWN.long },
-  { text: "request not allowed",      cooldownMs: COOLDOWN.short },
-  { text: "improperly formed request", cooldownMs: COOLDOWN.long },
-  { text: "rate limit",               backoff: true },
-  { text: "too many requests",        backoff: true },
-  { text: "quota exceeded",           backoff: true },
-  { text: "capacity",                 backoff: true },
-  { text: "overloaded",               backoff: true },
-
-  // --- Status-based rules (fallback when text doesn't match) ---
-  { status: 401, cooldownMs: COOLDOWN.long },
-  { status: 402, cooldownMs: COOLDOWN.long },
-  { status: 403, cooldownMs: COOLDOWN.long },
-  { status: 404, cooldownMs: COOLDOWN.long },
-  { status: 429, backoff: true },
-];
-
-// Backward compat: COOLDOWN_MS object (used by index.js re-export)
 export const COOLDOWN_MS = {
-  unauthorized: COOLDOWN.long,
-  paymentRequired: COOLDOWN.long,
-  notFound: COOLDOWN.long,
+  unauthorized: 2 * 60 * 1000,
+  paymentRequired: 2 * 60 * 1000,
+  notFound: 2 * 60 * 1000,
+  notFoundLocal: 5 * 1000,
+  transientInitial: TRANSIENT_COOLDOWN_MS,
+  transientMax: 60 * 1000,
   transient: TRANSIENT_COOLDOWN_MS,
-  requestNotAllowed: COOLDOWN.short,
+  requestNotAllowed: 5 * 1000,
+  rateLimit: 2 * 60 * 1000,
+  serviceUnavailable: 2 * 1000,
+  authExpired: 2 * 60 * 1000
 };
 
-// Error text patterns that indicate quota exhaustion → trigger auto-replace from pool
+export const MAX_RATE_LIMIT_COOLDOWN_MS = 30 * 60 * 1000;
+
 export const QUOTA_POOL_PATTERNS = [
   "quota failed",
   "insufficient_quota",
   "exceeded quota",
   "quota exceeded",
   "exceeded your current quota",
-  "exceeded your quota",
-  "out of quota",
-  "quota limit",
-  "credits exhausted",
-  "insufficient balance",
-  "insufficient credits",
-  "balance insufficient",
-  "no balance",
-  "out of balance",
-  "out of credits",
-  "account balance is insufficient",
 ];
+
+/**
+ * Shared rules for account fallback classification.
+ * Checked top-to-bottom: text rules first, then status rules.
+ */
+export const ERROR_RULES = [{
+  id: "no_credentials",
+  text: "no credentials",
+  cooldownMs: COOLDOWN_MS.notFound,
+  reason: "auth_error"
+}, {
+  id: "request_not_allowed",
+  text: "request not allowed",
+  cooldownMs: COOLDOWN_MS.requestNotAllowed,
+  reason: "rate_limit_exceeded"
+}, {
+  id: "improperly_formed_request",
+  text: "improperly formed request",
+  cooldownMs: 0,
+  reason: "model_capacity"
+}, {
+  id: "rate_limit",
+  text: "rate limit",
+  backoff: true,
+  reason: "rate_limit_exceeded"
+}, {
+  id: "too_many_requests",
+  text: "too many requests",
+  backoff: true,
+  reason: "rate_limit_exceeded"
+}, {
+  id: "hour_quota_exceeded",
+  text: "hour quota",
+  backoff: true,
+  reason: "quota_exhausted"
+}, {
+  id: "quota_has_been_exceeded",
+  text: "quota has been exceeded",
+  backoff: true,
+  reason: "quota_exhausted"
+}, {
+  id: "quota_exceeded",
+  text: "quota exceeded",
+  backoff: true,
+  reason: "quota_exhausted"
+}, {
+  id: "quota_will_reset",
+  text: "quota will reset",
+  backoff: true,
+  reason: "quota_exhausted"
+}, {
+  id: "capacity_exhausted",
+  text: "exhausted your capacity",
+  backoff: true,
+  reason: "quota_exhausted"
+}, {
+  id: "quota_exhausted",
+  text: "quota exhausted",
+  backoff: true,
+  reason: "quota_exhausted"
+}, {
+  id: "free_tier_exhausted",
+  text: "free tier of the model has been exhausted",
+  backoff: true,
+  reason: "quota_exhausted"
+}, {
+  id: "capacity",
+  text: "capacity",
+  backoff: true,
+  reason: "model_capacity"
+}, {
+  id: "overloaded",
+  text: "overloaded",
+  backoff: true,
+  reason: "model_capacity"
+}, {
+  id: "high_demand",
+  text: "high demand",
+  backoff: true,
+  reason: "model_capacity"
+}, {
+  id: "status_401",
+  status: 401,
+  cooldownMs: 0,
+  reason: "auth_error"
+}, {
+  id: "status_402",
+  status: 402,
+  cooldownMs: 0,
+  reason: "quota_exhausted"
+}, {
+  id: "status_403",
+  status: 403,
+  cooldownMs: 0,
+  reason: "quota_exhausted"
+}, {
+  id: "status_404",
+  status: 404,
+  cooldownMs: COOLDOWN_MS.notFound,
+  reason: "unknown"
+}, {
+  id: "status_406",
+  status: 406,
+  backoff: true,
+  reason: "server_error"
+}, {
+  id: "status_408",
+  status: 408,
+  backoff: true,
+  reason: "server_error"
+}, {
+  id: "status_429",
+  status: 429,
+  backoff: true,
+  reason: "rate_limit_exceeded"
+}, {
+  id: "status_500",
+  status: 500,
+  backoff: true,
+  reason: "server_error"
+}, {
+  id: "status_502",
+  status: 502,
+  backoff: true,
+  reason: "server_error"
+}, {
+  id: "status_503",
+  status: 503,
+  backoff: true,
+  reason: "server_error"
+}, {
+  id: "status_504",
+  status: 504,
+  backoff: true,
+  reason: "server_error"
+}];
+function normalizeErrorMessage(message) {
+  return String(message || "").toLowerCase();
+}
+export function getErrorInfo(statusCode) {
+  return ERROR_TYPES[statusCode] || (statusCode >= 500 ? {
+    type: "server_error",
+    code: "internal_server_error"
+  } : {
+    type: "invalid_request_error",
+    code: ""
+  });
+}
+export function getDefaultErrorMessage(statusCode) {
+  return DEFAULT_ERROR_MESSAGES[statusCode] || "An error occurred";
+}
+export function calculateBackoffCooldown(level = 0) {
+  const safeLevel = Math.max(0, Math.floor(level));
+  const cooldown = BACKOFF_CONFIG.base * Math.pow(2, safeLevel);
+  return Math.min(cooldown, BACKOFF_CONFIG.max);
+}
+export function matchErrorRuleByText(message) {
+  const lower = normalizeErrorMessage(message);
+  if (!lower) return null;
+  return ERROR_RULES.find(rule => rule.text && lower.includes(rule.text)) || null;
+}
+export function matchErrorRuleByStatus(statusCode) {
+  return ERROR_RULES.find(rule => rule.status === statusCode) || null;
+}
+export function findMatchingErrorRule(statusCode, message) {
+  return matchErrorRuleByText(message) || matchErrorRuleByStatus(statusCode);
+}

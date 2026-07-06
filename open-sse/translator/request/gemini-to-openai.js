@@ -1,9 +1,6 @@
-import { register } from "../index.js";
-import { FORMATS } from "../formats.js";
-import { adjustMaxTokens } from "../formats/maxTokens.js";
-import { encodeDataUri } from "../concerns/image.js";
-import { collapseTextParts } from "../concerns/message.js";
-import { ROLE, GEMINI_ROLE, OPENAI_BLOCK } from "../schema/index.js";
+import { register } from "../registry";
+import { FORMATS } from "../formats";
+import { adjustMaxTokens } from "../helpers/maxTokensHelper";
 
 // Convert Gemini request to OpenAI format
 export function geminiToOpenAIRequest(model, body, stream) {
@@ -17,7 +14,10 @@ export function geminiToOpenAIRequest(model, body, stream) {
   if (body.generationConfig) {
     const config = body.generationConfig;
     if (config.maxOutputTokens) {
-      const tempBody = { max_tokens: config.maxOutputTokens, tools: body.tools };
+      const tempBody = {
+        max_tokens: config.maxOutputTokens,
+        tools: body.tools
+      };
       result.max_tokens = adjustMaxTokens(tempBody);
     }
     if (config.temperature !== undefined) {
@@ -33,7 +33,7 @@ export function geminiToOpenAIRequest(model, body, stream) {
     const systemText = extractGeminiText(body.systemInstruction);
     if (systemText) {
       result.messages.push({
-        role: ROLE.SYSTEM,
+        role: "system",
         content: systemText
       });
     }
@@ -56,84 +56,82 @@ export function geminiToOpenAIRequest(model, body, stream) {
       if (tool.functionDeclarations) {
         for (const func of tool.functionDeclarations) {
           result.tools.push({
-            type: OPENAI_BLOCK.FUNCTION,
+            type: "function",
             function: {
               name: func.name,
               description: func.description || "",
-              parameters: func.parameters || { type: "object", properties: {} }
+              parameters: func.parameters || {
+                type: "object",
+                properties: {}
+              }
             }
           });
         }
       }
     }
   }
-
   return result;
 }
 
 // Convert Gemini content to OpenAI message
 function convertGeminiContent(content) {
-  const role = content.role === GEMINI_ROLE.USER ? ROLE.USER : ROLE.ASSISTANT;
-  
+  const role = content.role === "user" ? "user" : "assistant";
   if (!content.parts || !Array.isArray(content.parts)) {
     return null;
   }
-
   const parts = [];
   const toolCalls = [];
-
   for (const part of content.parts) {
     if (part.text !== undefined) {
-      parts.push({ type: OPENAI_BLOCK.TEXT, text: part.text });
-    }
-
-    if (part.inlineData) {
       parts.push({
-        type: OPENAI_BLOCK.IMAGE_URL,
+        type: "text",
+        text: part.text
+      });
+    }
+    if (part.inlineData || part.inline_data) {
+      const data = part.inlineData || part.inline_data;
+      const mimeType = data.mimeType || data.mime_type || "image/png";
+      parts.push({
+        type: "image_url",
         image_url: {
-          url: encodeDataUri(part.inlineData.mimeType, part.inlineData.data)
+          url: `data:${mimeType};base64,${data.data}`
         }
       });
     }
-
     if (part.functionCall) {
-      // Gemini lacks a native call id; derive a deterministic one from the name so the
-      // matching functionResponse maps to the same tool_call_id (providers require pairing).
       toolCalls.push({
-        id: part.functionCall.id || `call_${part.functionCall.name}`,
-        type: OPENAI_BLOCK.FUNCTION,
+        id: `call_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+        type: "function",
         function: {
           name: part.functionCall.name,
           arguments: JSON.stringify(part.functionCall.args || {})
         }
       });
     }
-
     if (part.functionResponse) {
       return {
-        role: ROLE.TOOL,
-        tool_call_id: part.functionResponse.id || `call_${part.functionResponse.name}`,
+        role: "tool",
+        tool_call_id: part.functionResponse.id || part.functionResponse.name,
         content: JSON.stringify(part.functionResponse.response?.result || part.functionResponse.response || {})
       };
     }
   }
-
   if (toolCalls.length > 0) {
-    const result = { role: ROLE.ASSISTANT };
+    const result = {
+      role: "assistant"
+    };
     if (parts.length > 0) {
       result.content = parts.length === 1 ? parts[0].text : parts;
     }
     result.tool_calls = toolCalls;
     return result;
   }
-
   if (parts.length > 0) {
     return {
       role,
-      content: collapseTextParts(parts)
+      content: parts.length === 1 && parts[0].type === "text" ? parts[0].text : parts
     };
   }
-
   return null;
 }
 
@@ -148,5 +146,3 @@ function extractGeminiText(content) {
 
 // Register
 register(FORMATS.GEMINI, FORMATS.OPENAI, geminiToOpenAIRequest, null);
-register(FORMATS.GEMINI_CLI, FORMATS.OPENAI, geminiToOpenAIRequest, null);
-

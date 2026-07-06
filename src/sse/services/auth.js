@@ -1,8 +1,9 @@
 import { getProviderConnections, validateApiKey, updateProviderConnection, getSettings, pullKeysFromPool, getAutoReplace, batchCreatePoolConnections } from "@/lib/localDb";
 import { resolveConnectionProxyConfig } from "@/lib/network/connectionProxy";
-import { formatRetryAfter, checkFallbackError, isModelLockActive, buildModelLockUpdate, getEarliestModelLockUntil } from "open-sse/services/accountFallback.js";
+import { formatRetryAfter, checkFallbackError } from "open-sse/services/accountFallback.js";
 import { MAX_RATE_LIMIT_COOLDOWN_MS, QUOTA_POOL_PATTERNS } from "open-sse/config/errorConfig.js";
 import { resolveProviderId, FREE_PROVIDERS } from "@/shared/constants/providers.js";
+import { createHash } from "node:crypto";
 import * as log from "../utils/logger.js";
 
 // Per-provider mutex: concurrent requests to different providers don't block each other
@@ -18,6 +19,32 @@ const CLOUDFLARE_DAILY_QUOTA_PATTERN = "used up your daily free allocation";
 // Siliconflow server busy pattern (503)
 const SILICONFLOW_BUSY_PATTERN = "system is really busy";
 const SILICONFLOW_BUSY_COOLDOWN_MS = 10 * 60 * 1000; // 10 minutes
+
+// Legacy model lock helpers (connection-level modelLock_* fields)
+const MODEL_LOCK_PREFIX = "modelLock_";
+const MODEL_LOCK_ALL = "modelLock___all";
+function isModelLockActive(connection, model) {
+  const key = model ? `${MODEL_LOCK_PREFIX}${model}` : MODEL_LOCK_ALL;
+  const expiry = connection[key] || connection[MODEL_LOCK_ALL];
+  if (!expiry) return false;
+  return new Date(expiry).getTime() > Date.now();
+}
+function getEarliestModelLockUntil(connection) {
+  if (!connection) return null;
+  let earliest = null;
+  const now = Date.now();
+  for (const [key, val] of Object.entries(connection)) {
+    if (!key.startsWith(MODEL_LOCK_PREFIX) || !val) continue;
+    const t = new Date(val).getTime();
+    if (t <= now) continue;
+    if (!earliest || t < earliest) earliest = t;
+  }
+  return earliest ? new Date(earliest).toISOString() : null;
+}
+function buildModelLockUpdate(model, cooldownMs) {
+  const key = model ? `${MODEL_LOCK_PREFIX}${model}` : MODEL_LOCK_ALL;
+  return { [key]: new Date(Date.now() + cooldownMs).toISOString() };
+}
 
 /**
  * Get the next 00:10 UTC timestamp for re-enabling Cloudflare connections.
@@ -566,4 +593,103 @@ export function extractApiKey(request) {
 export async function isValidApiKey(apiKey) {
   if (!apiKey) return false;
   return await validateApiKey(apiKey);
+}
+
+// ==================== SESSION AFFINITY STUFF (OmniRoute) ====================
+
+function asRecord(value) {
+  return value && typeof value === "object" && !Array.isArray(value) ? value : {};
+}
+
+function readHeaderValue(headers, name) {
+  if (!headers) return null;
+
+  if (typeof headers.get === "function") {
+    const value = headers.get(name) || headers.get(name.toLowerCase());
+    return typeof value === "string" && value.trim().length > 0 ? value.trim() : null;
+  }
+
+  const value = headers[name] || headers[name.toLowerCase()] || headers[name.toUpperCase()];
+
+  if (Array.isArray(value)) {
+    return typeof value[0] === "string" && value[0].trim().length > 0 ? value[0].trim() : null;
+  }
+
+  return typeof value === "string" && value.trim().length > 0 ? value.trim() : null;
+}
+
+function normalizeSessionKey(value, prefix) {
+  if (typeof value !== "string" || value.trim().length === 0) return null;
+  const trimmed = value.trim();
+  if (trimmed.length <= 180 && /^[A-Za-z0-9._:-]+$/.test(trimmed)) {
+    return `${prefix}:${trimmed}`;
+  }
+  return `${prefix}:sha256:${createHash("sha256").update(trimmed).digest("hex")}`;
+}
+
+function extractTextForSessionHash(value) {
+  if (typeof value === "string") return value;
+  if (Array.isArray(value)) {
+    const parts = value
+      .map((item) => {
+        if (typeof item === "string") return item;
+        const record = asRecord(item);
+        if (typeof record.text === "string") return record.text;
+        if (typeof record.content === "string") return record.content;
+        return null;
+      })
+      .filter(Boolean);
+    return parts.length > 0 ? parts.join("\n") : JSON.stringify(value);
+  }
+  if (value && typeof value === "object") return JSON.stringify(value);
+  return null;
+}
+
+function getFirstInputText(body) {
+  const record = asRecord(body);
+  if (record.input !== undefined) {
+    if (typeof record.input === "string") return record.input;
+    if (Array.isArray(record.input)) {
+      for (const item of record.input) {
+        const itemRecord = asRecord(item);
+        const text = extractTextForSessionHash(itemRecord.content ?? item);
+        if (text && text.trim().length > 0) return text;
+      }
+    }
+    const text = extractTextForSessionHash(record.input);
+    if (text && text.trim().length > 0) return text;
+  }
+
+  if (Array.isArray(record.messages)) {
+    const userMessage = record.messages.find((message) => asRecord(message).role === "user");
+    const firstMessage = userMessage ?? record.messages[0];
+    const text = extractTextForSessionHash(asRecord(firstMessage).content ?? firstMessage);
+    if (text && text.trim().length > 0) return text;
+  }
+
+  return null;
+}
+
+export function extractSessionAffinityKey(body, headers) {
+  const headerKey = normalizeSessionKey(
+    readHeaderValue(headers, "x-codex-session-id") ??
+      readHeaderValue(headers, "x-session-id") ??
+      readHeaderValue(headers, "x-omniroute-session"),
+    "header"
+  );
+  if (headerKey) return headerKey;
+
+  const record = asRecord(body);
+  const metadata = asRecord(record.metadata);
+  const explicitKey =
+    normalizeSessionKey(metadata.session_id, "metadata") ??
+    normalizeSessionKey(metadata.sessionId, "metadata") ??
+    normalizeSessionKey(record.conversation_id, "conversation") ??
+    normalizeSessionKey(record.session_id, "session") ??
+    normalizeSessionKey(record.prompt_cache_key, "prompt-cache");
+  if (explicitKey) return explicitKey;
+
+  const inputText = getFirstInputText(body);
+  if (!inputText || inputText.trim().length === 0) return null;
+  return `input:sha256:${createHash("sha256").update(inputText.slice(0, 4096)).digest("hex")}`;
 }

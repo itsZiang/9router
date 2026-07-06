@@ -2,15 +2,15 @@
  * Cursor to OpenAI Response Translator
  * CursorExecutor already emits OpenAI format - this is a passthrough
  */
-import { register } from "../index.js";
-import { FORMATS } from "../formats.js";
+import { register } from "../registry";
+import { FORMATS } from "../formats";
 
 /**
  * Convert Cursor response to OpenAI format
  * Since CursorExecutor.transformProtobufToSSE/JSON already emits OpenAI chunks,
  * this is a passthrough translator (similar to Kiro pattern)
  */
-export function cursorToOpenAIResponse(chunk, state) {
+export function convertCursorToOpenAI(chunk, state) {
   if (!chunk) return null;
 
   // If chunk is already in OpenAI format (from executor transform), return as-is
@@ -26,5 +26,4 @@ export function cursorToOpenAIResponse(chunk, state) {
   // Fallback: return chunk as-is (should not reach here)
   return chunk;
 }
-
-register(FORMATS.CURSOR, FORMATS.OPENAI, null, cursorToOpenAIResponse);
+register(FORMATS.CURSOR, FORMATS.OPENAI, null, convertCursorToOpenAI);

@@ -1,234 +1,226 @@
 /**
- * MiniMax usage handler
+ * usage/minimax.ts — MiniMax (minimax / minimax-cn) usage fetcher + quota helpers.
+ *
+ * Extracted from services/usage.ts (god-file decomposition): the full MiniMax family —
+ * plan-label inference, per-window quota assembly, and the getMiniMaxUsage fetcher that
+ * probes the coding-plan remains endpoints. Depends only on the sibling scalar/quota
+ * leaves — no host coupling — so it lives as a co-located provider leaf. usage.ts imports
+ * getMiniMaxUsage (dispatcher) + getMiniMaxPlanLabel/getMiniMaxSessionTotal (__testing).
+ * Behavior-preserving move.
  */
 
-import { proxyAwareFetch } from "../../utils/proxyFetch.js";
-import { U, parseResetTime } from "./shared.js";
-
-// MiniMax usage endpoints (try in order, fallback on transient errors)
-const MINIMAX_USAGE_URLS = {
-  minimax: U("minimax").urls,
-  "minimax-cn": U("minimax-cn").urls,
+import { toRecord, toNumber, getFieldValue, pickFirstNonEmptyString } from "./scalars";
+import { parseResetTime, createQuotaFromUsage } from "./quota";
+const MINIMAX_USAGE_CONFIG = {
+  minimax: {
+    usageUrls: ["https://www.minimax.io/v1/token_plan/remains", "https://api.minimax.io/v1/api/openplatform/coding_plan/remains"]
+  },
+  "minimax-cn": {
+    usageUrls: ["https://www.minimaxi.com/v1/api/openplatform/coding_plan/remains", "https://api.minimaxi.com/v1/api/openplatform/coding_plan/remains"]
+  }
 };
-
-// ── MiniMax helpers ──────────────────────────────────────────────────────
-function getMiniMaxField(model, snakeKey, camelKey) {
-  if (!model || typeof model !== "object") return null;
-  return model[snakeKey] ?? model[camelKey] ?? null;
+export function inferMiniMaxPlanLabelFromTotals(models) {
+  const maxSessionTotal = models.reduce((maxTotal, model) => Math.max(maxTotal, getMiniMaxSessionTotal(model)), 0);
+  if (maxSessionTotal >= 15_000) return "Max";
+  if (maxSessionTotal >= 4_500) return "Plus";
+  if (maxSessionTotal >= 1_500) return "Starter";
+  return null;
 }
-
-function getMiniMaxModelName(model) {
-  return String(getMiniMaxField(model, "model_name", "modelName") || "").trim();
+export function getMiniMaxPlanLabel(payload, models = []) {
+  const raw = pickFirstNonEmptyString(getFieldValue(payload, "current_subscribe_title", "currentSubscribeTitle"), getFieldValue(payload, "plan_name", "planName"), getFieldValue(payload, "plan", "plan"), getFieldValue(payload, "current_plan_title", "currentPlanTitle"), getFieldValue(payload, "combo_title", "comboTitle"));
+  if (!raw) return inferMiniMaxPlanLabelFromTotals(models) || "Coding Plan";
+  const cleaned = raw.replace(/^minimax\s+/i, "").replace(/\bcoding\s+plan\b/gi, "").replace(/\s{2,}/g, " ").trim();
+  return cleaned || inferMiniMaxPlanLabelFromTotals(models) || "Coding Plan";
 }
-
-function formatMiniMaxQuotaName(model) {
-  const rawName = getMiniMaxModelName(model);
-  if (!rawName) return "MiniMax";
-
-  // M3+ shared quota pool: MiniMax reports M-series as a single wildcard
-  // bucket ("MiniMax-M*"). Newer responses rename it to plain "general".
-  // Render both as a friendly series label rather than leaking the
-  // asterisk or the vague "general" word to the UI.
-  if (rawName === "MiniMax-M*" || rawName === "general") return "M-series";
-
-  return rawName
-    .replace(/[_-]+/g, " ")
-    .replace(/\s+/g, " ")
-    .trim()
-    .replace(/\b\w/g, (ch) => ch.toUpperCase())
-    .replace(/\bTo\b/g, "to")
-    .replace(/\bTts\b/g, "TTS")
-    .replace(/\bHd\b/g, "HD");
-}
-
-function getMiniMaxProvidedPercent(model, snakeKey, camelKey) {
-  if (!model || typeof model !== "object") return null;
-  const raw = model[snakeKey] ?? model[camelKey];
-  if (raw === null || raw === undefined) return null;
-  const num = Number(raw);
-  if (!Number.isFinite(num)) return null;
-  return Math.max(0, Math.min(100, num));
-}
-
-function getMiniMaxSessionTotal(model) {
-  return Math.max(0, Number(getMiniMaxField(model, "current_interval_total_count", "currentIntervalTotalCount")) || 0);
-}
-
-function getMiniMaxWeeklyTotal(model) {
-  return Math.max(0, Number(getMiniMaxField(model, "current_weekly_total_count", "currentWeeklyTotalCount")) || 0);
-}
-
-function hasMiniMaxQuota(model) {
-  // Old format has real count totals; M3-era M-series buckets ship percent-only
-  // (count fields are 0) so accept those too.
-  if (getMiniMaxSessionTotal(model) > 0 || getMiniMaxWeeklyTotal(model) > 0) return true;
-  if (getMiniMaxProvidedPercent(model, "current_interval_remaining_percent", "currentIntervalRemainingPercent") !== null) return true;
-  if (getMiniMaxProvidedPercent(model, "current_weekly_remaining_percent", "currentWeeklyRemainingPercent") !== null) return true;
-  return false;
-}
-
-function getMiniMaxResetAt(model, capturedAtMs, remainsSnake, remainsCamel, endSnake, endCamel) {
-  const remainsMs = Number(getMiniMaxField(model, remainsSnake, remainsCamel)) || 0;
-  if (remainsMs > 0) return new Date(capturedAtMs + remainsMs).toISOString();
-  return parseResetTime(getMiniMaxField(model, endSnake, endCamel));
-}
-
-function buildMiniMaxQuota(total, count, resetAt, countMeansRemaining, providedPercent = null) {
-  const safeTotal = Math.max(0, total);
-  const used = countMeansRemaining ? Math.max(safeTotal - count, 0) : Math.min(Math.max(0, count), safeTotal);
-  const remaining = Math.max(safeTotal - used, 0);
-  // M-series buckets ship percent-only (count = 0). Prefer the upstream value
-  // when present, otherwise fall back to the computed percentage. When the
-  // quota is unbounded (no count) and no upstream percent is available, surface
-  // the percent anyway as long as it is defined.
-  const remainingPercentage = providedPercentage(providedPercent, remaining, safeTotal);
-  return {
-    used,
-    total: safeTotal,
-    remaining,
-    remainingPercentage,
-    resetAt,
-    unlimited: false,
-  };
-}
-
-function providedPercentage(provided, remaining, total) {
-  if (provided !== null && provided !== undefined && Number.isFinite(provided)) {
-    return Math.max(0, Math.min(100, provided));
+export function getMiniMaxQuotaResetAt(model, capturedAtMs, remainsTimeSnakeKey, remainsTimeCamelKey, endTimeSnakeKey, endTimeCamelKey) {
+  const remainsMs = toNumber(getFieldValue(model, remainsTimeSnakeKey, remainsTimeCamelKey), 0);
+  if (remainsMs > 0) {
+    return new Date(capturedAtMs + remainsMs).toISOString();
   }
-  return total > 0 ? Math.max(0, Math.min(100, (remaining / total) * 100)) : 0;
+  return parseResetTime(getFieldValue(model, endTimeSnakeKey, endTimeCamelKey));
 }
-
-function addMiniMaxQuota(quotas, key, model, getTotal, countSnake, countCamel, percentSnake, percentCamel, resetArgs, countMeansRemaining) {
-  const total = getTotal(model);
-  const providedPercent = getMiniMaxProvidedPercent(model, percentSnake, percentCamel);
-  if (total <= 0 && providedPercent === null) return;
-
-  const count = Math.max(0, Number(getMiniMaxField(model, countSnake, countCamel)) || 0);
-  let effectiveTotal = total;
-  let effectiveCount = count;
-  if (total <= 0) {
-    // M-series bucket: API only ships *_remaining_percent (count = 0). Normalize
-    // to total=100. The downstream buildMiniMaxQuota treats the count as
-    // "used" or "remaining" depending on countMeansRemaining, so the synthetic
-    // count has to match that semantic — otherwise the UI flips the percentage.
-    effectiveTotal = 100;
-    const pct = providedPercent;
-    effectiveCount = countMeansRemaining
-      ? Math.round(effectiveTotal * (pct / 100))
-      : Math.round(effectiveTotal * (1 - pct / 100));
-  }
-  quotas[key] = buildMiniMaxQuota(
-    effectiveTotal,
-    effectiveCount,
-    getMiniMaxResetAt(model, ...resetArgs),
-    countMeansRemaining,
-    providedPercent
-  );
+export function isMiniMaxTextQuotaModel(modelName) {
+  const normalized = modelName.trim().toLowerCase();
+  return normalized.startsWith("minimax-m") || normalized.startsWith("coding-plan") ||
+  // MiniMax Coding Plan surfaces the text/coding quota under model "general"
+  // (media buckets like "video"/"image"/"music" are excluded).
+  normalized === "general";
+}
+export function getMiniMaxSessionTotal(model) {
+  return Math.max(0, toNumber(getFieldValue(model, "current_interval_total_count", "currentIntervalTotalCount"), 0));
+}
+export function getMiniMaxWeeklyTotal(model) {
+  return Math.max(0, toNumber(getFieldValue(model, "current_weekly_total_count", "currentWeeklyTotalCount"), 0));
+}
+function pickMiniMaxRepresentativeModel(models, getTotal) {
+  const withQuota = models.filter(model => getTotal(model) > 0);
+  const pool = withQuota.length > 0 ? withQuota : models;
+  if (pool.length === 0) return null;
+  return pool.reduce((best, current) => getTotal(current) > getTotal(best) ? current : best);
+}
+export function createMiniMaxQuotaFromCount(total, count, resetAt, countMeansRemaining) {
+  const used = countMeansRemaining ? Math.max(total - count, 0) : count;
+  return createQuotaFromUsage(used, total, resetAt);
 }
 
 /**
- * MiniMax Token Plan / Coding Plan usage
+ * MiniMax Coding Plan exposes per-window remaining as a 0–100 percent
+ * (`current_interval_remaining_percent` / `current_weekly_remaining_percent`)
+ * with zero request counts. Read it defensively (string-encoded numbers ok).
  */
-export async function getMiniMaxUsage(apiKey, provider, proxyOptions = null) {
-  if (!apiKey) {
-    return { message: "MiniMax API key not available." };
+export function getMiniMaxRemainingPercent(model, snakeKey, camelKey) {
+  const raw = getFieldValue(model, snakeKey, camelKey);
+  if (raw === null || raw === undefined || raw === "") return null;
+  const parsed = toNumber(raw, NaN);
+  return Number.isFinite(parsed) ? Math.max(0, Math.min(100, parsed)) : null;
+}
+
+/** Build a 0–100 percent-based window quota (used = 100 − remaining). */
+export function createMiniMaxQuotaFromPercent(remainingPercent, resetAt) {
+  const clamped = Math.max(0, Math.min(100, remainingPercent));
+  return createQuotaFromUsage(100 - clamped, 100, resetAt);
+}
+
+/**
+ * Build one MiniMax usage window (session or weekly) from the representative
+ * model. Token Plan keys report request counts (`*_total_count`); Coding Plan
+ * keys report zero counts and a `*_remaining_percent` instead — fall back to
+ * that so the Coding Plan still surfaces a quota. The percent signal is keyed
+ * off "counts == 0 + percent present", NOT the endpoint URL, because the
+ * `token_plan/remains` and `coding_plan/remains` endpoints return identical
+ * Coding-Plan payloads for a Coding Plan key.
+ */
+function buildMiniMaxWindow(models, getTotal, usageCountKeys, percentKeys, resetKeys, capturedAtMs, countMeansRemaining) {
+  const model = pickMiniMaxRepresentativeModel(models, getTotal);
+  if (!model) return null;
+  const resetAt = getMiniMaxQuotaResetAt(model, capturedAtMs, ...resetKeys);
+  const total = getTotal(model);
+  if (total > 0) {
+    const count = Math.max(0, toNumber(getFieldValue(model, ...usageCountKeys), 0));
+    return createMiniMaxQuotaFromCount(total, count, resetAt, countMeansRemaining);
   }
-
-  const usageUrls = MINIMAX_USAGE_URLS[provider] || [];
+  const remainingPercent = getMiniMaxRemainingPercent(model, ...percentKeys);
+  return remainingPercent !== null ? createMiniMaxQuotaFromPercent(remainingPercent, resetAt) : null;
+}
+export function getMiniMaxAuthErrorMessage(message) {
+  const normalized = message.toLowerCase();
+  if (normalized.includes("token plan") || normalized.includes("coding plan") || normalized.includes("active period") || normalized.includes("invalid api key") || normalized.includes("invalid key") || normalized.includes("subscription")) {
+    return "MiniMax Token Plan API key invalid or inactive. Use an active Token Plan key.";
+  }
+  return "MiniMax access denied. Confirm the key is an active Token Plan API key.";
+}
+export function getMiniMaxErrorSummary(status, message) {
+  const compact = message.replace(/\s+/g, " ").trim();
+  if (!compact) {
+    return `MiniMax usage endpoint error (${status}).`;
+  }
+  if (compact.length <= 160) {
+    return `MiniMax usage endpoint error (${status}): ${compact}`;
+  }
+  return `MiniMax usage endpoint error (${status}): ${compact.slice(0, 157)}...`;
+}
+export async function getMiniMaxUsage(apiKey, provider) {
+  if (!apiKey) {
+    return {
+      message: "MiniMax API key not available. Add a Token Plan API key."
+    };
+  }
+  const usageUrls = MINIMAX_USAGE_CONFIG[provider].usageUrls;
   let lastErrorMessage = "";
-
   for (let index = 0; index < usageUrls.length; index += 1) {
     const usageUrl = usageUrls[index];
     const canFallback = index < usageUrls.length - 1;
-
     try {
-      const response = await proxyAwareFetch(usageUrl, {
+      const response = await fetch(usageUrl, {
         method: "GET",
         headers: {
           Authorization: `Bearer ${apiKey}`,
           Accept: "application/json",
-          "Content-Type": "application/json",
-        },
-      }, proxyOptions);
-
+          "Content-Type": "application/json"
+        }
+      });
       const rawText = await response.text();
       let payload = {};
       if (rawText) {
-        try { payload = JSON.parse(rawText); } catch { payload = {}; }
+        try {
+          payload = toRecord(JSON.parse(rawText));
+        } catch {
+          payload = {};
+        }
       }
-
-      const baseResp = (payload?.base_resp ?? payload?.baseResp) || {};
-      const apiStatusCode = Number(baseResp.status_code ?? baseResp.statusCode) || 0;
-      const apiStatusMessage = String(baseResp.status_msg ?? baseResp.statusMsg ?? "").trim();
-      const combined = `${apiStatusMessage} ${rawText}`.trim();
-      const authLike = /token plan|coding plan|invalid api key|invalid key|unauthorized|inactive/i;
-
-      if (response.status === 401 || response.status === 403 || apiStatusCode === 1004 || authLike.test(combined)) {
-        return { message: "MiniMax API key invalid or inactive. Use an active Token/Coding Plan key." };
+      const baseResp = toRecord(getFieldValue(payload, "base_resp", "baseResp"));
+      const apiStatusCode = toNumber(getFieldValue(baseResp, "status_code", "statusCode"), 0);
+      const apiStatusMessage = String(getFieldValue(baseResp, "status_msg", "statusMsg") ?? "").trim();
+      const combinedMessage = `${apiStatusMessage} ${rawText}`.trim();
+      const authLikeStatusMessage = /token plan|coding plan|invalid api key|invalid key|unauthorized|inactive/i;
+      if (response.status === 401 || response.status === 403 || apiStatusCode === 1004 || authLikeStatusMessage.test(apiStatusMessage)) {
+        return {
+          message: getMiniMaxAuthErrorMessage(apiStatusMessage || combinedMessage)
+        };
       }
-
       if (!response.ok) {
-        lastErrorMessage = `MiniMax usage endpoint error (${response.status})`;
-        if ((response.status === 404 || response.status === 405 || response.status >= 500) && canFallback) continue;
-        return { message: `MiniMax connected. ${lastErrorMessage}` };
+        lastErrorMessage = getMiniMaxErrorSummary(response.status, combinedMessage);
+        if ((response.status === 404 || response.status === 405 || response.status >= 500) && canFallback) {
+          continue;
+        }
+        return {
+          message: `MiniMax connected. ${lastErrorMessage}`
+        };
       }
-
+      if (rawText && Object.keys(payload).length === 0) {
+        return {
+          message: "MiniMax connected. Unable to parse usage response."
+        };
+      }
       if (apiStatusCode !== 0) {
-        return { message: `MiniMax connected. ${apiStatusMessage || "Upstream quota API error"}` };
+        if (apiStatusMessage) {
+          return {
+            message: `MiniMax connected. ${apiStatusMessage}`
+          };
+        }
+        return {
+          message: "MiniMax connected. Upstream quota API returned an error."
+        };
       }
-
-      const modelRemains = payload?.model_remains ?? payload?.modelRemains;
-      const allModels = Array.isArray(modelRemains) ? modelRemains : [];
-      const quotaModels = allModels.filter(hasMiniMaxQuota);
-
-      if (quotaModels.length === 0) {
-        return { message: "MiniMax connected. No quota data was returned." };
-      }
-
       const capturedAtMs = Date.now();
+      const modelRemains = getFieldValue(payload, "model_remains", "modelRemains");
+      const allModels = Array.isArray(modelRemains) ? modelRemains.map(item => toRecord(item)) : [];
+      const textModels = allModels.filter(model => {
+        const modelName = String(getFieldValue(model, "model_name", "modelName") ?? "");
+        return isMiniMaxTextQuotaModel(modelName);
+      });
+      if (textModels.length === 0) {
+        return {
+          message: "MiniMax connected. No text quota data was returned."
+        };
+      }
       const countMeansRemaining = usageUrl.includes("/coding_plan/remains");
       const quotas = {};
-
-      for (const model of quotaModels) {
-        const displayName = formatMiniMaxQuotaName(model);
-        addMiniMaxQuota(
-          quotas,
-          `${displayName} (5h)`,
-          model,
-          getMiniMaxSessionTotal,
-          "current_interval_usage_count",
-          "currentIntervalUsageCount",
-          "current_interval_remaining_percent",
-          "currentIntervalRemainingPercent",
-          [capturedAtMs, "remains_time", "remainsTime", "end_time", "endTime"],
-          countMeansRemaining
-        );
-
-        addMiniMaxQuota(
-          quotas,
-          `${displayName} (7d)`,
-          model,
-          getMiniMaxWeeklyTotal,
-          "current_weekly_usage_count",
-          "currentWeeklyUsageCount",
-          "current_weekly_remaining_percent",
-          "currentWeeklyRemainingPercent",
-          [capturedAtMs, "weekly_remains_time", "weeklyRemainsTime", "weekly_end_time", "weeklyEndTime"],
-          countMeansRemaining
-        );
+      const sessionQuota = buildMiniMaxWindow(textModels, getMiniMaxSessionTotal, ["current_interval_usage_count", "currentIntervalUsageCount"], ["current_interval_remaining_percent", "currentIntervalRemainingPercent"], ["remains_time", "remainsTime", "end_time", "endTime"], capturedAtMs, countMeansRemaining);
+      if (sessionQuota) {
+        quotas["session (5h)"] = sessionQuota;
       }
-
+      const weeklyQuota = buildMiniMaxWindow(textModels, getMiniMaxWeeklyTotal, ["current_weekly_usage_count", "currentWeeklyUsageCount"], ["current_weekly_remaining_percent", "currentWeeklyRemainingPercent"], ["weekly_remains_time", "weeklyRemainsTime", "weekly_end_time", "weeklyEndTime"], capturedAtMs, countMeansRemaining);
+      if (weeklyQuota) {
+        quotas["weekly (7d)"] = weeklyQuota;
+      }
       if (Object.keys(quotas).length === 0) {
-        return { message: "MiniMax connected. Unable to extract quota usage." };
+        return {
+          message: "MiniMax connected. Unable to extract text quota usage."
+        };
       }
-
-      return { quotas };
+      return {
+        plan: getMiniMaxPlanLabel(payload, textModels),
+        quotas
+      };
     } catch (error) {
       lastErrorMessage = error.message;
-      if (!canFallback) break;
+      if (!canFallback) {
+        break;
+      }
     }
   }
-
-  return { message: lastErrorMessage ? `MiniMax connected. Unable to fetch usage: ${lastErrorMessage}` : "MiniMax connected. Unable to fetch usage." };
+  return {
+    message: lastErrorMessage ? `MiniMax connected. Unable to fetch usage: ${lastErrorMessage}` : "MiniMax connected. Unable to fetch usage."
+  };
 }

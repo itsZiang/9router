@@ -163,3 +163,9 @@ export const USAGE_SUPPORTED_PROVIDERS = REGISTRY
 export const USAGE_APIKEY_PROVIDERS = REGISTRY
   .filter(r => r.features?.usageApikey)
   .map(r => r.id);
+
+export const LOCAL_PROVIDERS = {};
+
+export const NOAUTH_PROVIDERS = Object.fromEntries(
+  REGISTRY.filter(r => r.noAuth).map(r => [r.id, buildProviderEntry(r)])
+);

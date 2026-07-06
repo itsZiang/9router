@@ -1,0 +1,62 @@
+function asRecord(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return null;
+  }
+  return value;
+}
+function toPositiveInteger(value) {
+  if (typeof value !== "number" || !Number.isFinite(value)) return null;
+  const normalized = Math.floor(value);
+  return normalized > 0 ? normalized : null;
+}
+function toFiniteNumber(value) {
+  if (typeof value !== "number" || !Number.isFinite(value)) return null;
+  return value;
+}
+function getExistingMaxTokens(body) {
+  return toPositiveInteger(body.max_tokens) || toPositiveInteger(body.max_completion_tokens) || toPositiveInteger(body.max_output_tokens);
+}
+export function applyProviderRequestDefaults(body, defaults) {
+  const record = asRecord(body);
+  if (!record || !defaults) return body;
+  let changed = false;
+  const next = {
+    ...record
+  };
+  const defaultTemperature = toFiniteNumber(defaults.temperature);
+  if (next.temperature === undefined && defaultTemperature !== null) {
+    next.temperature = defaultTemperature;
+    changed = true;
+  }
+  const defaultMaxTokens = toPositiveInteger(defaults.maxTokens);
+  const explicitMaxTokens = getExistingMaxTokens(next);
+  let effectiveMaxTokens = explicitMaxTokens;
+  if (next.max_tokens === undefined && explicitMaxTokens === null && defaultMaxTokens !== null) {
+    next.max_tokens = defaultMaxTokens;
+    effectiveMaxTokens = defaultMaxTokens;
+    changed = true;
+  }
+  const defaultThinkingBudget = toPositiveInteger(defaults.thinkingBudgetTokens);
+  const thinking = asRecord(next.thinking);
+  const thinkingAlreadyEnabled = thinking?.type === "enabled";
+  const thinkingBudgetSet = toPositiveInteger(thinking?.budget_tokens) !== null;
+  if (defaultThinkingBudget !== null && effectiveMaxTokens !== null && effectiveMaxTokens > 1) {
+    const safeBudget = Math.min(defaultThinkingBudget, effectiveMaxTokens - 1);
+    if (safeBudget > 0) {
+      if (next.thinking === undefined) {
+        next.thinking = {
+          type: "enabled",
+          budget_tokens: safeBudget
+        };
+        changed = true;
+      } else if (thinkingAlreadyEnabled && !thinkingBudgetSet) {
+        next.thinking = {
+          ...thinking,
+          budget_tokens: safeBudget
+        };
+        changed = true;
+      }
+    }
+  }
+  return changed ? next : body;
+}

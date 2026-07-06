@@ -1,11 +1,6 @@
-import { register } from "../index.js";
-import { FORMATS } from "../formats.js";
-import { adjustMaxTokens } from "../formats/maxTokens.js";
-import { encodeDataUri } from "../concerns/image.js";
-import { ROLE, GEMINI_ROLE, OPENAI_BLOCK } from "../schema/index.js";
-import { budgetToEffort } from "../concerns/thinking.js";
-import { collapseTextParts } from "../concerns/message.js";
-
+import { register } from "../registry";
+import { FORMATS } from "../formats";
+import { adjustMaxTokens } from "../helpers/maxTokensHelper";
 // Convert Antigravity request to OpenAI format
 // Antigravity body: { project, model, userAgent, requestType, requestId, request: { contents, systemInstruction, tools, toolConfig, generationConfig, sessionId } }
 export function antigravityToOpenAIRequest(model, body, stream) {
@@ -20,7 +15,10 @@ export function antigravityToOpenAIRequest(model, body, stream) {
   if (req.generationConfig) {
     const config = req.generationConfig;
     if (config.maxOutputTokens) {
-      const tempBody = { max_tokens: config.maxOutputTokens, tools: req.tools };
+      const tempBody = {
+        max_tokens: config.maxOutputTokens,
+        tools: req.tools
+      };
       result.max_tokens = adjustMaxTokens(tempBody);
     }
     if (config.temperature !== undefined) {
@@ -35,8 +33,16 @@ export function antigravityToOpenAIRequest(model, body, stream) {
 
     // Thinking config → reasoning_effort
     if (config.thinkingConfig) {
-      const effort = budgetToEffort(config.thinkingConfig.thinkingBudget || 0);
-      if (effort) result.reasoning_effort = effort;
+      const budget = config.thinkingConfig.thinkingBudget || 0;
+      if (budget > 0) {
+        if (budget <= 2048) {
+          result.reasoning_effort = "low";
+        } else if (budget <= 16384) {
+          result.reasoning_effort = "medium";
+        } else {
+          result.reasoning_effort = "high";
+        }
+      }
     }
   }
 
@@ -44,7 +50,10 @@ export function antigravityToOpenAIRequest(model, body, stream) {
   if (req.systemInstruction) {
     const systemText = extractText(req.systemInstruction);
     if (systemText) {
-      result.messages.push({ role: ROLE.SYSTEM, content: systemText });
+      result.messages.push({
+        role: "system",
+        content: systemText
+      });
     }
   }
 
@@ -69,66 +78,121 @@ export function antigravityToOpenAIRequest(model, body, stream) {
       if (tool.functionDeclarations) {
         for (const func of tool.functionDeclarations) {
           result.tools.push({
-            type: OPENAI_BLOCK.FUNCTION,
+            type: "function",
             function: {
               name: func.name,
               description: func.description || "",
-              parameters: normalizeSchemaTypes(func.parameters) || { type: "object", properties: {} }
+              parameters: cleanSchemaPreservingRequired(func.parameters) || {
+                type: "object",
+                properties: {}
+              }
             }
           });
         }
       }
     }
   }
-
   return result;
 }
 
 // Recursively convert Antigravity schema types (OBJECT, STRING, etc.) to lowercase
-// and strip unsupported fields like enumDescriptions
+// and strip unsupported fields like enumDescriptions.
 function normalizeSchemaTypes(schema) {
   if (!schema || typeof schema !== "object") return schema;
-
-  const result = Array.isArray(schema) ? [...schema] : { ...schema };
-
-
+  const result = Array.isArray(schema) ? [...schema] : {
+    ...schema
+  };
   if (typeof result.type === "string") {
     result.type = result.type.toLowerCase();
   }
 
   // Strip enumDescriptions — not supported by upstream APIs
   delete result.enumDescriptions;
-
-
-  if (result.properties) {
+  if (result.properties && typeof result.properties === "object") {
     const normalized = {};
     for (const [key, val] of Object.entries(result.properties)) {
       normalized[key] = normalizeSchemaTypes(val);
     }
     result.properties = normalized;
   }
-
   if (result.items) {
     result.items = normalizeSchemaTypes(result.items);
   }
-
   return result;
+}
+
+// Clean a JSON Schema for Antigravity while PRESERVING the `required` array at every level.
+// Unlike the type-lowering pass alone, this strips JSON Schema Draft 2020-12 meta keywords
+// ($schema, $defs, $ref, additionalProperties, patternProperties, title, x-*, ...) that the
+// Antigravity upstream does not accept, yet keeps `required` so the model still treats
+// mandatory tool arguments as mandatory. Clients such as OpenCode send full Draft 2020-12
+// tool schemas; dropping `required` lets the model call tools without their required args.
+function cleanSchemaPreservingRequired(schema) {
+  if (!schema || typeof schema !== "object") return schema;
+
+  // Reuse the existing recursion to lowercase types + strip enumDescriptions, then
+  // remove draft-meta keywords and reconcile `required` against the surviving properties.
+  const normalized = normalizeSchemaTypes(structuredClone(schema));
+  stripDraftMeta(normalized);
+  preserveRequired(normalized);
+  return normalized;
+}
+
+// Draft 2020-12 / JSON Schema meta keywords the Antigravity upstream does not accept.
+const DRAFT_META_KEYS = new Set(["$schema", "$defs", "definitions", "$ref", "$comment", "const", "additionalProperties", "propertyNames", "patternProperties", "title"]);
+function stripDraftMeta(obj) {
+  if (!obj || typeof obj !== "object") return;
+  if (Array.isArray(obj)) {
+    for (const item of obj) stripDraftMeta(item);
+    return;
+  }
+  const record = obj;
+  for (const key of Object.keys(record)) {
+    if (DRAFT_META_KEYS.has(key) || key.startsWith("x-")) {
+      delete record[key];
+    }
+  }
+  for (const value of Object.values(record)) {
+    if (value && typeof value === "object") stripDraftMeta(value);
+  }
+}
+
+// Preserve `required` even when referenced fields were stripped from constraint blocks.
+// At each node where both `required` and `properties` are present, keep only the entries
+// that still exist in `properties`; drop `required` entirely if none survive. This avoids
+// emitting a `required` array that references fields removed by stripDraftMeta.
+function preserveRequired(obj) {
+  if (!obj || typeof obj !== "object") return;
+  if (Array.isArray(obj)) {
+    for (const item of obj) preserveRequired(item);
+    return;
+  }
+  const record = obj;
+  if (Array.isArray(record.required) && record.properties && typeof record.properties === "object") {
+    const properties = record.properties;
+    const valid = record.required.filter(field => typeof field === "string" && Object.prototype.hasOwnProperty.call(properties, field));
+    if (valid.length === 0) {
+      delete record.required;
+    } else {
+      record.required = valid;
+    }
+  }
+  for (const value of Object.values(record)) {
+    if (value && typeof value === "object") preserveRequired(value);
+  }
 }
 
 // Convert Antigravity content to OpenAI message
 // Handles: text, thought, thoughtSignature, functionCall, functionResponse, inlineData
 function convertContent(content) {
-  const role = content.role === GEMINI_ROLE.MODEL ? ROLE.ASSISTANT : content.role === GEMINI_ROLE.USER ? ROLE.USER : content.role;
-
+  const role = content.role === "model" ? "assistant" : content.role === "user" ? "user" : content.role;
   if (!content.parts || !Array.isArray(content.parts)) {
     return null;
   }
-
   const textParts = [];
   const toolCalls = [];
   const toolResults = [];
   let reasoningContent = "";
-
   for (const part of content.parts) {
     // Thinking content (thought: true)
     if (part.thought === true && part.text) {
@@ -138,21 +202,27 @@ function convertContent(content) {
 
     // Text with thoughtSignature = regular text after thinking
     if (part.thoughtSignature && part.text !== undefined) {
-      textParts.push({ type: OPENAI_BLOCK.TEXT, text: part.text });
+      textParts.push({
+        type: "text",
+        text: part.text
+      });
       continue;
     }
 
     // Regular text
     if (part.text !== undefined) {
-      textParts.push({ type: OPENAI_BLOCK.TEXT, text: part.text });
+      textParts.push({
+        type: "text",
+        text: part.text
+      });
     }
 
     // Inline data (images)
     if (part.inlineData) {
       textParts.push({
-        type: OPENAI_BLOCK.IMAGE_URL,
+        type: "image_url",
         image_url: {
-          url: encodeDataUri(part.inlineData.mimeType, part.inlineData.data)
+          url: `data:${part.inlineData.mimeType};base64,${part.inlineData.data}`
         }
       });
     }
@@ -160,9 +230,8 @@ function convertContent(content) {
     // Function call
     if (part.functionCall) {
       toolCalls.push({
-        // Deterministic id from name so the matching functionResponse pairs correctly.
-        id: part.functionCall.id || `call_${part.functionCall.name}`,
-        type: OPENAI_BLOCK.FUNCTION,
+        id: part.functionCall.id || `call_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+        type: "function",
         function: {
           name: part.functionCall.name,
           arguments: JSON.stringify(part.functionCall.args || {})
@@ -173,8 +242,8 @@ function convertContent(content) {
     // Function response → collect all, each becomes a separate tool message
     if (part.functionResponse) {
       toolResults.push({
-        role: ROLE.TOOL,
-        tool_call_id: part.functionResponse.id || `call_${part.functionResponse.name}`,
+        role: "tool",
+        tool_call_id: part.functionResponse.id || part.functionResponse.name,
         content: JSON.stringify(part.functionResponse.response?.result || part.functionResponse.response || {})
       });
     }
@@ -187,9 +256,11 @@ function convertContent(content) {
 
   // Assistant with tool calls
   if (toolCalls.length > 0) {
-    const msg = { role: ROLE.ASSISTANT };
+    const msg = {
+      role: "assistant"
+    };
     if (textParts.length > 0) {
-      msg.content = collapseTextParts(textParts);
+      msg.content = textParts.length === 1 && textParts[0].type === "text" ? textParts[0].text : textParts;
     }
     if (reasoningContent) {
       msg.reasoning_content = reasoningContent;
@@ -200,16 +271,17 @@ function convertContent(content) {
 
   // Regular message
   if (textParts.length > 0 || reasoningContent) {
-    const msg = { role };
+    const msg = {
+      role
+    };
     if (textParts.length > 0) {
-      msg.content = collapseTextParts(textParts);
+      msg.content = textParts.length === 1 && textParts[0].type === "text" ? textParts[0].text : textParts;
     }
     if (reasoningContent) {
       msg.reasoning_content = reasoningContent;
     }
     return msg;
   }
-
   return null;
 }
 

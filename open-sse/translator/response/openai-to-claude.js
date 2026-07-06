@@ -1,50 +1,8 @@
-import { register } from "../index.js";
-import { FORMATS } from "../formats.js";
-import { ROLE, CLAUDE_BLOCK, MODEL_FALLBACK } from "../schema/index.js";
-import { fromOpenAIFinish } from "../concerns/finishReason.js";
-import { extractReasoningText } from "../concerns/reasoning.js";
-
-// Legacy "proxy_" prefix used by older request translators. Response strips it
-// defensively so tool names from such turns resolve back (e.g. proxy_Read → Read
-// for arg sanitization). Current request translator emits no prefix ("") — strip
-// is then a no-op. Kept intentionally; do NOT couple to request's empty prefix.
-const CLAUDE_OAUTH_TOOL_PREFIX = "proxy_";
-
-// Sanitize tool call arguments to fix bad params from non-Anthropic models
-function sanitizeToolArgs(toolName, argsJson) {
-  try {
-    const args = JSON.parse(argsJson);
-    const name = toolName.startsWith(CLAUDE_OAUTH_TOOL_PREFIX)
-      ? toolName.slice(CLAUDE_OAUTH_TOOL_PREFIX.length)
-      : toolName;
-    if (name === "Read") sanitizeReadArgs(args);
-    return JSON.stringify(args);
-  } catch {
-    return argsJson;
-  }
-}
-
-function sanitizeReadArgs(args) {
-  if (typeof args.limit === "string" && /^\d+$/.test(args.limit)) args.limit = Number(args.limit);
-  if (typeof args.offset === "string" && /^-?\d+$/.test(args.offset)) args.offset = Number(args.offset);
-
-  if (typeof args.limit === "number") {
-    if (args.limit > 2000) args.limit = 2000;
-    if (args.limit < 1) delete args.limit;
-  }
-  if (typeof args.offset === "number" && args.offset < 0) args.offset = 0;
-
-  if ("pages" in args && !isValidPdfPagesArg(args.file_path, args.pages)) {
-    delete args.pages;
-  }
-}
-
-function isValidPdfPagesArg(filePath, pages) {
-  return typeof filePath === "string" &&
-    filePath.toLowerCase().endsWith(".pdf") &&
-    typeof pages === "string" &&
-    /^\d+(?:-\d+)?$/.test(pages);
-}
+import { register } from "../registry";
+import { FORMATS } from "../formats";
+import { CLAUDE_OAUTH_TOOL_PREFIX } from "../request/openai-to-claude";
+import { hasToolCallShim, applyToolCallShimToBuffer } from "../helpers/toolCallShim";
+import { appendToolCallArgumentDelta } from "../../utils/toolCallArguments";
 
 // Helper: stop thinking block if started
 function stopThinkingBlock(state, results) {
@@ -69,40 +27,7 @@ function stopTextBlock(state, results) {
 
 // Convert OpenAI stream chunk to Claude format
 export function openaiToClaudeResponse(chunk, state) {
-  // Flush/EOF call (chunk === null): synthesize terminal events if the stream
-  // ended prematurely (upstream closed without sending a finish_reason chunk).
-  // This prevents "thinking content then nothing" — the client gets a clean
-  // termination with message_delta + message_stop instead of an unterminated stream.
-  if (!chunk) {
-    if (state.finishReason || !state.messageStartSent) return null;
-    const results = [];
-    stopThinkingBlock(state, results);
-    stopTextBlock(state, results);
-    for (const [idx, toolInfo] of state.toolCalls) {
-      const buffered = state.toolArgBuffers?.get(idx);
-      if (buffered) {
-        const sanitized = sanitizeToolArgs(toolInfo.name, buffered);
-        results.push({
-          type: "content_block_delta",
-          index: toolInfo.blockIndex,
-          delta: { type: "input_json_delta", partial_json: sanitized }
-        });
-      }
-      results.push({ type: "content_block_stop", index: toolInfo.blockIndex });
-    }
-    state.finishReason = "stop";
-    const finalUsage = state.usage || { input_tokens: 0, output_tokens: 0 };
-    results.push({
-      type: "message_delta",
-      delta: { stop_reason: "end_turn" },
-      usage: finalUsage
-    });
-    results.push({ type: "message_stop" });
-    return results.length > 0 ? results : null;
-  }
-
-  if (!chunk.choices?.[0]) return null;
-
+  if (!chunk || !chunk.choices?.[0]) return null;
   const results = [];
   const choice = chunk.choices[0];
   const delta = choice.delta;
@@ -121,7 +46,6 @@ export function openaiToClaudeResponse(chunk, state) {
     // input_tokens = prompt_tokens - cached_tokens - cache_creation_tokens
     // Because OpenAI's prompt_tokens includes all prompt-side tokens
     const inputTokens = promptTokens - cacheReadTokens - cacheCreateTokens;
-
     state.usage = {
       input_tokens: inputTokens,
       output_tokens: outputTokens
@@ -146,53 +70,68 @@ export function openaiToClaudeResponse(chunk, state) {
     state.messageStartSent = true;
     state.messageId = chunk.id?.replace("chatcmpl-", "") || `msg_${Date.now()}`;
     if (!state.messageId || state.messageId === "chat" || state.messageId.length < 8) {
-      state.messageId = chunk.extend_fields?.requestId ||
-        chunk.extend_fields?.traceId ||
-        `msg_${Date.now()}`;
+      state.messageId = chunk.extend_fields?.requestId || chunk.extend_fields?.traceId || `msg_${Date.now()}`;
     }
-    state.model = chunk.model || MODEL_FALLBACK;
+    state.model = chunk.model || "unknown";
     state.nextBlockIndex = 0;
     results.push({
       type: "message_start",
       message: {
         id: state.messageId,
         type: "message",
-        role: ROLE.ASSISTANT,
+        role: "assistant",
         model: state.model,
         content: [],
         stop_reason: null,
         stop_sequence: null,
-        usage: { input_tokens: 0, output_tokens: 0 }
+        usage: {
+          input_tokens: 0,
+          output_tokens: 0
+        }
       }
     });
   }
 
-  // Handle reasoning (thinking) across vendor shapes - GLM/DeepSeek/Qwen/MiniMax/etc.
-  const reasoningContent = extractReasoningText(delta);
+  // Handle reasoning_content (thinking) - GLM, DeepSeek, etc.
+  // Also supports 'reasoning' field alias and reasoning_details[] (StepFun/OpenRouter)
+  let reasoningContent = delta?.reasoning_content || delta?.reasoning;
+  if (!reasoningContent && Array.isArray(delta?.reasoning_details)) {
+    const parts = [];
+    for (const detail of delta.reasoning_details) {
+      if (detail && typeof detail === "object") {
+        const text = detail.text || detail.content;
+        if (typeof text === "string" && text) parts.push(text);
+      }
+    }
+    if (parts.length > 0) reasoningContent = parts.join("");
+  }
   if (reasoningContent) {
     stopTextBlock(state, results);
-
     if (!state.thinkingBlockStarted) {
       state.thinkingBlockIndex = state.nextBlockIndex++;
       state.thinkingBlockStarted = true;
       results.push({
         type: "content_block_start",
         index: state.thinkingBlockIndex,
-        content_block: { type: CLAUDE_BLOCK.THINKING, thinking: "" }
+        content_block: {
+          type: "thinking",
+          thinking: ""
+        }
       });
     }
-
     results.push({
       type: "content_block_delta",
       index: state.thinkingBlockIndex,
-      delta: { type: "thinking_delta", thinking: reasoningContent }
+      delta: {
+        type: "thinking_delta",
+        thinking: reasoningContent
+      }
     });
   }
 
   // Handle regular content
   if (delta?.content) {
     stopThinkingBlock(state, results);
-
     if (!state.textBlockStarted) {
       state.textBlockIndex = state.nextBlockIndex++;
       state.textBlockStarted = true;
@@ -200,14 +139,19 @@ export function openaiToClaudeResponse(chunk, state) {
       results.push({
         type: "content_block_start",
         index: state.textBlockIndex,
-        content_block: { type: CLAUDE_BLOCK.TEXT, text: "" }
+        content_block: {
+          type: "text",
+          text: ""
+        }
       });
     }
-
     results.push({
       type: "content_block_delta",
       index: state.textBlockIndex,
-      delta: { type: "text_delta", text: delta.content }
+      delta: {
+        type: "text_delta",
+        text: delta.content
+      }
     });
   }
 
@@ -215,58 +159,98 @@ export function openaiToClaudeResponse(chunk, state) {
   if (delta?.tool_calls) {
     for (const tc of delta.tool_calls) {
       const idx = tc.index ?? 0;
-
-      // GLM/fireworks repeats id+null-name on every arg chunk; open block once per idx
-      if (tc.id && !state.toolCalls.has(idx)) {
+      if (tc.id) {
         stopThinkingBlock(state, results);
         stopTextBlock(state, results);
-
         const toolBlockIndex = state.nextBlockIndex++;
-        state.toolCalls.set(idx, { id: tc.id, name: tc.function?.name || "", blockIndex: toolBlockIndex });
 
         // Strip prefix from tool name for response
         let toolName = tc.function?.name || "";
         if (toolName.startsWith(CLAUDE_OAUTH_TOOL_PREFIX)) {
           toolName = toolName.slice(CLAUDE_OAUTH_TOOL_PREFIX.length);
         }
-
+        state.toolCalls.set(idx, {
+          id: tc.id,
+          name: toolName,
+          blockIndex: toolBlockIndex,
+          // Shimmed tools buffer their raw args and emit a single corrected
+          // input_json_delta at content_block_stop time (see finish handler).
+          shimmed: hasToolCallShim(toolName),
+          argBuffer: ""
+        });
         results.push({
           type: "content_block_start",
           index: toolBlockIndex,
           content_block: {
-            type: CLAUDE_BLOCK.TOOL_USE,
+            type: "tool_use",
             id: tc.id,
             name: toolName,
             input: {}
           }
         });
       }
-
       if (tc.function?.arguments) {
         const toolInfo = state.toolCalls.get(idx);
         if (toolInfo) {
-          // Buffer args instead of streaming — sanitize at finish to fix bad params
-          if (!state.toolArgBuffers) state.toolArgBuffers = new Map();
-          state.toolArgBuffers.set(idx, (state.toolArgBuffers.get(idx) || "") + tc.function.arguments);
+          // Always buffer the raw stream so shimmed tools can re-emit a
+          // corrected JSON at stop time.
+          const existingArgs = toolInfo.argBuffer || "";
+          const nextArgs = appendToolCallArgumentDelta(existingArgs, tc.function.arguments);
+          let deltaStr = nextArgs.slice(existingArgs.length);
+          toolInfo.argBuffer = nextArgs;
+          if (toolInfo.shimmed || !deltaStr) {
+            // Suppress passthrough for shimmed tools; emit one corrective delta at finish.
+            continue;
+          }
+
+          // NOTE: The regex-based "Fix #1852" strip that previously ran here was
+          // removed in #4951. That strip matched patterns like `"key":""` and
+          // `"key":[]` to remove spurious placeholder fields that some models emit
+          // as noise. However, since #3762 the snapshot-dedup logic in
+          // appendToolCallArgumentDelta already collapses repeated/growing snapshots
+          // into a single delta, so noise-only chunks are naturally suppressed.
+          // More critically, the regex unconditionally deleted any field whose value
+          // happened to be "" or [], silently corrupting intentional empty-string or
+          // empty-array arguments (e.g. {"file_path":"","content":"text"} →
+          // {"content":"text"}). Emit deltaStr as-is; the Claude client parses the
+          // assembled partial_json fragments and tolerates unknown extra fields.
+
+          results.push({
+            type: "content_block_delta",
+            index: toolInfo.blockIndex,
+            delta: {
+              type: "input_json_delta",
+              partial_json: deltaStr
+            }
+          });
         }
       }
     }
   }
 
-  // Finish
-  if (choice.finish_reason) {
+  // Finish — guard against duplicate finish_reason chunks (common with OpenAI-compatible models).
+  // Use a dedicated `claudeFinishEmitted` flag rather than `state.finishReason`: in the
+  // Responses→Claude hub path the shared `state` object is also written by the
+  // openai-responses→openai translator, which sets `state.finishReason` on
+  // `response.completed` BEFORE this openai→claude step runs. Reusing `finishReason` as the
+  // guard therefore misfired and silently dropped the terminal message_delta/message_stop
+  // for Responses→Claude streams (#5828 regression).
+  if (choice.finish_reason && !state.claudeFinishEmitted) {
+    state.claudeFinishEmitted = true;
     stopThinkingBlock(state, results);
     stopTextBlock(state, results);
-
-    for (const [idx, toolInfo] of state.toolCalls) {
-      // Emit buffered + sanitized args as single delta before stop
-      const buffered = state.toolArgBuffers?.get(idx);
-      if (buffered) {
-        const sanitized = sanitizeToolArgs(toolInfo.name, buffered);
+    for (const [, toolInfo] of state.toolCalls) {
+      // For shimmed tools, emit one corrective input_json_delta with the
+      // fully patched JSON before closing the block.
+      if (toolInfo.shimmed) {
+        const patched = applyToolCallShimToBuffer(toolInfo.name, toolInfo.argBuffer || "");
         results.push({
           type: "content_block_delta",
           index: toolInfo.blockIndex,
-          delta: { type: "input_json_delta", partial_json: sanitized }
+          delta: {
+            type: "input_json_delta",
+            partial_json: patched
+          }
         });
       }
       results.push({
@@ -279,19 +263,37 @@ export function openaiToClaudeResponse(chunk, state) {
     state.finishReason = choice.finish_reason;
 
     // Use tracked usage (will be estimated in stream.js if not valid)
-    const finalUsage = state.usage || { input_tokens: 0, output_tokens: 0 };
+    const finalUsage = state.usage || {
+      input_tokens: 0,
+      output_tokens: 0
+    };
     results.push({
       type: "message_delta",
-      delta: { stop_reason: convertFinishReason(choice.finish_reason) },
+      delta: {
+        stop_reason: convertFinishReason(choice.finish_reason)
+      },
       usage: finalUsage
     });
-    results.push({ type: "message_stop" });
+    results.push({
+      type: "message_stop"
+    });
   }
-
   return results.length > 0 ? results : null;
 }
 
-const convertFinishReason = (reason) => fromOpenAIFinish(reason, "claude");
+// Convert OpenAI finish_reason to Claude stop_reason
+function convertFinishReason(reason) {
+  switch (reason) {
+    case "stop":
+      return "end_turn";
+    case "length":
+      return "max_tokens";
+    case "tool_calls":
+      return "tool_use";
+    default:
+      return "end_turn";
+  }
+}
 
 // Register
 register(FORMATS.OPENAI, FORMATS.CLAUDE, null, openaiToClaudeResponse);

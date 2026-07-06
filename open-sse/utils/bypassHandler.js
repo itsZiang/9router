@@ -1,28 +1,36 @@
-import { detectFormat } from "../services/provider.js";
-import { translateResponse, initState } from "../translator/index.js";
-import { FORMATS } from "../translator/formats.js";
-import { SKIP_PATTERNS } from "../config/runtimeConfig.js";
-import { formatSSE } from "./stream.js";
+import { detectFormat } from "../services/provider";
+import { translateResponse, initState } from "../translator/index";
+import { FORMATS } from "../translator/formats";
+import { SKIP_PATTERNS } from "../config/constants";
+import { formatSSE } from "./stream";
 
 /**
- * Check for bypass patterns - return fake response without calling provider
- * Only works for Claude CLI requests
+ * Check for bypass patterns — return fake response without calling provider.
+ *
+ * Intentionally limited to Claude CLI requests only because:
+ * 1. The bypass patterns (title extraction, warmup, count) are specific to
+ *    Claude CLI's internal protocol — other clients don't send these patterns.
+ * 2. False-positive bypasses would silently break real requests.
+ * 3. The SKIP_PATTERNS config allows user-defined patterns for every client.
+ *
+ * @param {object} body - Request body
+ * @param {string} model - Model name
+ * @param {string} userAgent - User-Agent header
+ * @returns {object|null} Bypass response or null to proceed normally
  */
-export function handleBypassRequest(body, model, userAgent = "", ccFilterNaming = false) {
-  if (!userAgent.includes("claude-cli")) return null;
+export function handleBypassRequest(body, model, userAgent = "") {
+  const normalizedUserAgent = typeof userAgent === "string" ? userAgent : "";
+  if (!normalizedUserAgent.includes("claude-cli")) return null;
   if (!body.messages?.length) return null;
-
   const messages = body.messages;
-  const getText = (content) => {
+  const getText = content => {
     if (typeof content === "string") return content;
     if (Array.isArray(content)) {
       return content.filter(c => c.type === "text").map(c => c.text).join(" ");
     }
     return "";
   };
-
   let shouldBypass = false;
-  let namingBypass = false;
 
   // Pattern 1: Title extraction (assistant message = "{")
   const lastMsg = messages[messages.length - 1];
@@ -55,51 +63,26 @@ export function handleBypassRequest(body, model, userAgent = "", ccFilterNaming 
     }
   }
 
-  // Pattern 5: CC naming request (topic title extraction by Claude Code CLI)
-  // Claude format: system is top-level body.system field, not inside messages
-  if (!shouldBypass && ccFilterNaming) {
-    const systemMsg = messages.find(m => m.role === "system");
-    const systemFromMessages = getText(systemMsg?.content);
-    const systemFromBody = Array.isArray(body.system)
-      ? body.system.filter(s => s.type === "text").map(s => s.text).join(" ")
-      : (typeof body.system === "string" ? body.system : "");
-    const systemText = systemFromMessages || systemFromBody;
-    if (systemText.includes("isNewTopic")) {
+  // Pattern 5: Quota probe — max_tokens=1 + "quota" keyword (FCC try_quota_mock).
+  if (!shouldBypass && body.max_tokens === 1) {
+    const userText = messages.filter(m => m.role === "user").map(m => getText(m.content)).join(" ").toLowerCase();
+    if (userText.includes("quota")) {
       shouldBypass = true;
-      namingBypass = true;
     }
   }
-
   if (!shouldBypass) return null;
-
   const sourceFormat = detectFormat(body);
   const stream = body.stream !== false;
-
-  // For naming bypass, generate title from user message
-  if (namingBypass) {
-    const userMsg = messages.find(m => m.role === "user");
-    const userText = getText(userMsg?.content);
-    const title = userText.trim().split(/\s+/).slice(0, 3).join(" ");
-    const namingText = JSON.stringify({ isNewTopic: true, title });
-    return stream
-      ? createStreamingResponse(sourceFormat, model, namingText)
-      : createNonStreamingResponse(sourceFormat, model, namingText);
-  }
-
-  return stream 
-    ? createStreamingResponse(sourceFormat, model)
-    : createNonStreamingResponse(sourceFormat, model);
+  return stream ? createStreamingResponse(sourceFormat, model) : createNonStreamingResponse(sourceFormat, model);
 }
-
-const DEFAULT_BYPASS_TEXT = "CLI Command Execution: Clear Terminal";
 
 /**
  * Create OpenAI standard format response
  */
-function createOpenAIResponse(model, text = DEFAULT_BYPASS_TEXT) {
+function createOpenAIResponse(model) {
   const id = `chatcmpl-${Date.now()}`;
   const created = Math.floor(Date.now() / 1000);
-
+  const text = "CLI Command Execution: Clear Terminal";
   return {
     id,
     object: "chat.completion",
@@ -125,8 +108,8 @@ function createOpenAIResponse(model, text = DEFAULT_BYPASS_TEXT) {
  * Create non-streaming response with translation
  * Use translator to convert OpenAI → sourceFormat
  */
-function createNonStreamingResponse(sourceFormat, model, text) {
-  const openaiResponse = createOpenAIResponse(model, text);
+function createNonStreamingResponse(sourceFormat, model) {
+  const openaiResponse = createOpenAIResponse(model);
 
   // If sourceFormat is OpenAI, return directly
   if (sourceFormat === FORMATS.OPENAI) {
@@ -134,8 +117,7 @@ function createNonStreamingResponse(sourceFormat, model, text) {
       success: true,
       response: new Response(JSON.stringify(openaiResponse), {
         headers: {
-          "Content-Type": "application/json",
-          "Access-Control-Allow-Origin": "*"
+          "Content-Type": "application/json"
         }
       })
     };
@@ -144,10 +126,8 @@ function createNonStreamingResponse(sourceFormat, model, text) {
   // Use translator to convert: simulate streaming then collect all chunks
   const state = initState(sourceFormat);
   state.model = model;
-
   const openaiChunks = createOpenAIStreamingChunks(openaiResponse);
   const allTranslated = [];
-
   for (const chunk of openaiChunks) {
     const translated = translateResponse(FORMATS.OPENAI, sourceFormat, chunk, state);
     if (translated?.length > 0) {
@@ -163,13 +143,11 @@ function createNonStreamingResponse(sourceFormat, model, text) {
 
   // For non-streaming, merge all chunks into final response
   const finalResponse = mergeChunksToResponse(allTranslated, sourceFormat);
-
   return {
     success: true,
     response: new Response(JSON.stringify(finalResponse), {
       headers: {
-        "Content-Type": "application/json",
-        "Access-Control-Allow-Origin": "*"
+        "Content-Type": "application/json"
       }
     })
   };
@@ -179,8 +157,8 @@ function createNonStreamingResponse(sourceFormat, model, text) {
  * Create streaming response with translation
  * Use translator to convert OpenAI chunks → sourceFormat
  */
-function createStreamingResponse(sourceFormat, model, text) {
-  const openaiResponse = createOpenAIResponse(model, text);
+function createStreamingResponse(sourceFormat, model) {
+  const openaiResponse = createOpenAIResponse(model);
   const state = initState(sourceFormat);
   state.model = model;
 
@@ -189,7 +167,6 @@ function createStreamingResponse(sourceFormat, model, text) {
 
   // Translate each chunk to sourceFormat using translator
   const translatedChunks = [];
-
   for (const chunk of openaiChunks) {
     const translated = translateResponse(FORMATS.OPENAI, sourceFormat, chunk, state);
     if (translated?.length > 0) {
@@ -209,15 +186,13 @@ function createStreamingResponse(sourceFormat, model, text) {
 
   // Add [DONE]
   translatedChunks.push("data: [DONE]\n\n");
-
   return {
     success: true,
     response: new Response(translatedChunks.join(""), {
       headers: {
         "Content-Type": "text/event-stream",
         "Cache-Control": "no-cache",
-        "Connection": "keep-alive",
-        "Access-Control-Allow-Origin": "*"
+        Connection: "keep-alive"
       }
     })
   };
@@ -244,7 +219,6 @@ function mergeChunksToResponse(chunks, sourceFormat) {
       const contentDelta = chunks.find(c => c.type === "content_block_delta");
       const messageDelta = chunks.find(c => c.type === "message_delta");
       const messageStart = chunks.find(c => c.type === "message_start");
-
       if (messageStart?.message) {
         finalChunk = messageStart.message;
         // Merge usage if available
@@ -254,7 +228,6 @@ function mergeChunksToResponse(chunks, sourceFormat) {
       }
     }
   }
-
   return finalChunk;
 }
 
@@ -262,37 +235,40 @@ function mergeChunksToResponse(chunks, sourceFormat) {
  * Create OpenAI streaming chunks from complete response
  */
 function createOpenAIStreamingChunks(completeResponse) {
-  const { id, created, model, choices } = completeResponse;
+  const {
+    id,
+    created,
+    model,
+    choices
+  } = completeResponse;
   const content = choices[0].message.content;
-
   return [
-    // Chunk with content
-    {
-      id,
-      object: "chat.completion.chunk",
-      created,
-      model,
-      choices: [{
-        index: 0,
-        delta: {
-          role: "assistant",
-          content
-        },
-        finish_reason: null
-      }]
-    },
-    // Final chunk with finish_reason
-    {
-      id,
-      object: "chat.completion.chunk",
-      created,
-      model,
-      choices: [{
-        index: 0,
-        delta: {},
-        finish_reason: "stop"
-      }],
-      usage: completeResponse.usage
-    }
-  ];
+  // Chunk with content
+  {
+    id,
+    object: "chat.completion.chunk",
+    created,
+    model,
+    choices: [{
+      index: 0,
+      delta: {
+        role: "assistant",
+        content
+      },
+      finish_reason: null
+    }]
+  },
+  // Final chunk with finish_reason
+  {
+    id,
+    object: "chat.completion.chunk",
+    created,
+    model,
+    choices: [{
+      index: 0,
+      delta: {},
+      finish_reason: "stop"
+    }],
+    usage: completeResponse.usage
+  }];
 }

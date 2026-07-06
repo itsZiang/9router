@@ -1,177 +1,164 @@
-import { BaseExecutor } from "./base.js";
-import { PROVIDERS } from "../config/providers.js";
-import { parseVertexSaJson, refreshVertexToken, refreshGoogleToken } from "../services/tokenRefresh.js";
-import { proxyAwareFetch } from "../utils/proxyFetch.js";
+import { SignJWT, importPKCS8 } from "jose";
+import { BaseExecutor } from "./base";
+import { PROVIDERS } from "../config/constants";
+const TOKEN_CACHE = new Map();
 
-// Cache project IDs resolved from raw API keys { apiKey → projectId }
-const projectIdCache = new Map();
+// OAuth scopes minted into the Vertex SA access token.
+//   - cloud-platform authorizes Vertex AI (aiplatform.googleapis.com) for chat/image execution.
+//   - generative-language.retriever is ADDITIONALLY required so model discovery can list the live
+//     catalog from generativelanguage.googleapis.com/v1beta/models — without it that listing returns
+//     403 ACCESS_TOKEN_SCOPE_INSUFFICIENT and discovery silently falls back to the static ~10-model
+//     registry list. The extra scope is harmless for execution (cloud-platform still present) and for
+//     projects where it isn't needed (the mint never validates scope availability).
+export const VERTEX_OAUTH_SCOPES = ["https://www.googleapis.com/auth/cloud-platform", "https://www.googleapis.com/auth/generative-language.retriever"];
+export function parseSAFromApiKey(apiKey) {
+  try {
+    return JSON.parse(apiKey);
+  } catch {
+    throw new Error("Vertex AI requires a valid Service Account JSON as the API key");
+  }
+}
 
 /**
- * Parse Google ADC user credential JSON from apiKey string.
- * This is the format produced by `gcloud auth application-default login`.
+ * A Service Account credential is a JSON object (type/client_email/private_key). A Vertex AI
+ * Express-mode API key is an opaque non-JSON string. Distinguishing them lets the executor
+ * support BOTH: Service Account JSON (JWT → OAuth → project-scoped endpoint + Bearer auth) and
+ * Express keys (project-less publisher endpoint + x-goog-api-key auth), instead of failing every
+ * Express key with "requires a valid Service Account JSON".
  */
-function parseVertexAdcJson(apiKey) {
-  if (typeof apiKey !== "string") return null;
+export function looksLikeServiceAccountJson(apiKey) {
+  if (!apiKey || typeof apiKey !== "string") return false;
   try {
     const parsed = JSON.parse(apiKey);
-    if (
-      parsed.type === "authorized_user" &&
-      parsed.client_id &&
-      parsed.client_secret &&
-      parsed.refresh_token
-    ) {
-      return parsed;
-    }
-    return null;
+    return !!parsed && typeof parsed === "object" && !Array.isArray(parsed);
   } catch {
-    return null;
+    return false;
   }
 }
 
-/**
- * Resolve GCP project ID from a raw Vertex API key.
- * Sends a dummy 404 request and parses "projects/{id}" from the error message.
- */
-async function resolveProjectId(apiKey) {
-  if (projectIdCache.has(apiKey)) return projectIdCache.get(apiKey);
-
-  const res = await fetch(
-    `https://aiplatform.googleapis.com/v1/publishers/google/models/__probe__:generateContent?key=${apiKey}`,
-    { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" }
-  );
-  const json = await res.json().catch(() => null);
-  const msg = json?.[0]?.error?.message || json?.error?.message || "";
-  const match = msg.match(/projects\/([^/]+)\//);
-  const projectId = match?.[1] || null;
-
-  if (projectId) projectIdCache.set(apiKey, projectId);
-  return projectId;
+/** True for a Vertex AI Express-mode API key (a non-empty, non-JSON, non-OAuth credential). */
+export function isExpressApiKey(apiKey) {
+  return typeof apiKey === "string" && apiKey.trim().length > 0 && !looksLikeServiceAccountJson(apiKey);
 }
+export async function getAccessToken(sa) {
+  if (!sa.client_email || !sa.private_key) {
+    throw new Error("Service Account JSON is missing required fields (client_email or private_key)");
+  }
+  const cacheKey = sa.client_email;
+  const cached = TOKEN_CACHE.get(cacheKey);
 
-/**
- * VertexExecutor - Google Cloud Vertex AI
- *
- * "vertex"         → Gemini models via regional/global Vertex endpoint
- * "vertex-partner" → Partner models (Llama, Mistral, GLM, DeepSeek, Qwen)
- *                    via global OpenAI-compatible endpoint
- *
- * Auth: SA JSON (stored as apiKey) → JWT assertion → Bearer token (via jose)
- * Token is minted/cached in tokenRefresh.js, not here.
- */
+  // Buffer of 60 seconds
+  if (cached && Date.now() < cached.expiresAt - 60_000) {
+    return cached.token;
+  }
+  const privateKey = await importPKCS8(sa.private_key, "RS256");
+  const now = Math.floor(Date.now() / 1000);
+  const jwt = await new SignJWT({
+    iss: sa.client_email,
+    sub: sa.client_email,
+    aud: "https://oauth2.googleapis.com/token",
+    iat: now,
+    exp: now + 3600,
+    scope: VERTEX_OAUTH_SCOPES.join(" ")
+  }).setProtectedHeader({
+    alg: "RS256",
+    kid: sa.private_key_id
+  }).sign(privateKey);
+  const tokenRes = await fetch("https://oauth2.googleapis.com/token", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/x-www-form-urlencoded"
+    },
+    body: new URLSearchParams({
+      grant_type: "urn:ietf:params:oauth:grant-type:jwt-bearer",
+      assertion: jwt
+    })
+  });
+  if (!tokenRes.ok) {
+    const errorText = await tokenRes.text();
+    throw new Error(`Failed to exchange JWT for Vertex access token: ${tokenRes.status} ${errorText}`);
+  }
+  const tokenData = await tokenRes.json();
+  const accessToken = tokenData.access_token;
+  if (!accessToken) {
+    throw new Error("Vertex AI token exchange succeeded but no access_token found");
+  }
+  TOKEN_CACHE.set(cacheKey, {
+    token: accessToken,
+    expiresAt: (now + 3600) * 1000
+  });
+  return accessToken;
+}
+const PARTNER_MODELS = new Set(["claude-3-5-sonnet", "claude-3-opus", "claude-3-haiku", "deepseek-v3", "deepseek-v3.2", "deepseek-v4", "deepseek-deepseek-r1", "qwen3-next-80b", "qwen3.6-", "llama-3.1", "mistral-", "glm-5", "glm-5.1", "meta/llama"]);
+function isPartnerModel(model) {
+  const normalizedModel = model.toLowerCase();
+  return [...PARTNER_MODELS].some(prefix => normalizedModel.startsWith(prefix));
+}
 export class VertexExecutor extends BaseExecutor {
-  constructor(providerId = "vertex") {
-    super(providerId, PROVIDERS[providerId] || {});
+  constructor() {
+    super("vertex", PROVIDERS.vertex);
   }
-
-  buildUrl(model, stream, urlIndex = 0, credentials = null) {
-    const saJson = parseVertexSaJson(credentials?.apiKey);
-    const adcJson = parseVertexAdcJson(credentials?.apiKey);
-    const usesOAuth = !!saJson || !!adcJson || !!credentials?.accessToken;
-    const rawKey = !usesOAuth ? credentials?.apiKey : null;
-    const projectId =
-      saJson?.project_id ||
-      adcJson?.quota_project_id ||
-      credentials?.providerSpecificData?.projectId;
-
-    if (this.provider === "vertex-partner") {
-      // Partner models require project_id in path regardless of auth method
-      if (!projectId) throw new Error("Vertex partner models require a project_id. Add it in providerSpecificData or use Service Account JSON.");
-      const url = `https://aiplatform.googleapis.com/v1/projects/${projectId}/locations/global/endpoints/openapi/chat/completions`;
-      return rawKey ? `${url}?key=${rawKey}` : url;
+  async execute(input) {
+    const {
+      credentials,
+      log
+    } = input;
+    // Defensive: trim stray surrounding whitespace from a pasted credential.
+    if (typeof credentials.apiKey === "string") {
+      credentials.apiKey = credentials.apiKey.trim();
     }
-
-    // Gemini on Vertex
-    const action = stream ? "streamGenerateContent" : "generateContent";
-
-    if (usesOAuth) {
-      // SA JSON / ADC / pre-set accessToken: must use project-scoped path to avoid RESOURCE_PROJECT_INVALID
-      if (!projectId) {
-        throw new Error(
-          "Vertex OAuth/ADC requires a project_id. " +
-          "Add quota_project_id to your ADC JSON or set providerSpecificData.projectId."
-        );
+    // Service Account JSON → mint a short-lived OAuth token (Bearer). An Express-mode API key is
+    // sent as-is via x-goog-api-key (see buildHeaders), so no token exchange is needed for it.
+    if (credentials.apiKey && !credentials.accessToken && looksLikeServiceAccountJson(credentials.apiKey)) {
+      try {
+        const sa = parseSAFromApiKey(credentials.apiKey);
+        credentials.accessToken = await getAccessToken(sa);
+      } catch (err) {
+        log?.error?.("VERTEX", `Failed to generate JWT token: ${err.message}`);
+        throw err;
       }
-      const location = credentials?.providerSpecificData?.location || "us-central1";
-      let url = `https://aiplatform.googleapis.com/v1/projects/${projectId}/locations/${location}/publishers/google/models/${model}:${action}`;
-      if (stream) url += "?alt=sse";
-      return url;
     }
-
-    // Raw API key: use global publishers endpoint with ?key= param
-    // ?alt=sse is required for proper SSE streaming (matches every other Gemini executor)
-    let url = `https://aiplatform.googleapis.com/v1/publishers/google/models/${model}:${action}`;
-    if (stream) url += "?alt=sse";
-    if (rawKey) url += stream ? `&key=${rawKey}` : `?key=${rawKey}`;
-    return url;
+    return super.execute(input);
   }
-
+  buildUrl(model, stream, urlIndex = 0, credentials = null) {
+    // Vertex AI Express mode: project-less v1 publisher endpoint with the API key passed as a
+    // ?key= query parameter (verified working contract — same as the CaptionAI GeminiClient). The
+    // Express key is NOT accepted as a Bearer/OAuth credential or via x-goog-api-key on this API.
+    if (isExpressApiKey(credentials?.apiKey) && !credentials?.accessToken) {
+      const expressKey = encodeURIComponent(String(credentials.apiKey).trim());
+      if (isPartnerModel(model)) {
+        // Partner (Anthropic/etc.) models are not available via Express keys; best-effort.
+        return `https://aiplatform.googleapis.com/v1/publishers/openapi/chat/completions?key=${expressKey}`;
+      }
+      const op = stream ? "streamGenerateContent?alt=sse&" : "generateContent?";
+      return `https://aiplatform.googleapis.com/v1/publishers/google/models/${model}:${op}key=${expressKey}`;
+    }
+    const region = credentials?.providerSpecificData?.region || "us-central1";
+    let project = "unknown-project";
+    if (credentials?.apiKey) {
+      try {
+        const sa = parseSAFromApiKey(credentials.apiKey);
+        if (sa.project_id) project = sa.project_id;
+      } catch {
+        // Ignored, handled in execute
+      }
+    }
+    if (isPartnerModel(model)) {
+      return `https://aiplatform.googleapis.com/v1/projects/${project}/locations/global/endpoints/openapi/chat/completions`;
+    }
+    return `https://aiplatform.googleapis.com/v1/projects/${project}/locations/${region}/publishers/google/models/${model}:${stream ? "streamGenerateContent?alt=sse" : "generateContent"}`;
+  }
   buildHeaders(credentials, stream = true) {
-    const headers = { "Content-Type": "application/json" };
-
-    // Only set Bearer token if using SA JSON flow (raw key goes in URL ?key=)
+    const headers = {
+      "Content-Type": "application/json"
+    };
     if (credentials.accessToken) {
       headers["Authorization"] = `Bearer ${credentials.accessToken}`;
     }
-
-    if (stream) headers["Accept"] = "text/event-stream";
-
+    // Express-mode keys are carried in the ?key= query parameter (see buildUrl), not a header.
+    if (stream) {
+      headers["Accept"] = "text/event-stream";
+    }
     return headers;
   }
-
-  async refreshCredentials(credentials, log) {
-    const saJson = parseVertexSaJson(credentials?.apiKey);
-    if (!saJson) return null;
-
-    const result = await refreshVertexToken(saJson, log);
-    if (!result) return null;
-
-    return { accessToken: result.accessToken, expiresAt: result.expiresAt };
-  }
-
-  async execute({ model, body, stream, credentials, signal, log, proxyOptions = null }) {
-    const saJson = parseVertexSaJson(credentials?.apiKey);
-    const adcJson = parseVertexAdcJson(credentials?.apiKey);
-
-    // SA JSON flow: mint Bearer token via JWT assertion (cached)
-    if (saJson) {
-      const result = await refreshVertexToken(saJson, log);
-      if (!result?.accessToken) throw new Error("Vertex: failed to mint access token from Service Account JSON");
-      credentials.accessToken = result.accessToken;
-    }
-
-    // ADC user credential flow: refresh Bearer token via Google OAuth2 token endpoint
-    if (adcJson) {
-      const result = await refreshGoogleToken(
-        adcJson.refresh_token,
-        adcJson.client_id,
-        adcJson.client_secret,
-        log
-      );
-      if (!result?.accessToken) throw new Error("Vertex: failed to refresh access token from ADC JSON (authorized_user)");
-      credentials.accessToken = result.accessToken;
-    }
-
-    // vertex-partner with raw key: auto-resolve project_id if not provided
-    if (this.provider === "vertex-partner" && !saJson && !adcJson && !credentials?.providerSpecificData?.projectId) {
-      const projectId = await resolveProjectId(credentials.apiKey);
-      if (!projectId) throw new Error("Vertex: could not resolve project_id from API key. Please add it manually in provider settings.");
-      log?.debug?.("VERTEX", `Resolved project_id: ${projectId}`);
-      credentials.providerSpecificData = { ...credentials.providerSpecificData, projectId };
-    }
-
-    const url = this.buildUrl(model, stream, 0, credentials);
-    const headers = this.buildHeaders(credentials, stream);
-    const transformedBody = this.transformRequest(model, body, stream, credentials);
-
-    const response = await proxyAwareFetch(url, {
-      method: "POST",
-      headers,
-      body: JSON.stringify(transformedBody),
-      signal,
-    }, proxyOptions);
-
-    return { response, url, headers, transformedBody };
-  }
 }
-
-export default VertexExecutor;

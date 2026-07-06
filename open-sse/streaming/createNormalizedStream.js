@@ -61,6 +61,21 @@ export function createNormalizedStream(options) {
       return;
     }
 
+    // Normalize reasoning field variants to reasoning_content so OpenAI-compatible
+    // clients can display thinking consistently.
+    const rawDelta = parsed.choices?.[0]?.delta;
+    if (rawDelta) {
+      if (rawDelta.reasoning_content === undefined || rawDelta.reasoning_content === null) {
+        if (rawDelta.reasoning !== undefined && rawDelta.reasoning !== null) {
+          rawDelta.reasoning_content = rawDelta.reasoning;
+          delete rawDelta.reasoning;
+        } else if (rawDelta.reasoning_text !== undefined && rawDelta.reasoning_text !== null) {
+          rawDelta.reasoning_content = rawDelta.reasoning_text;
+          delete rawDelta.reasoning_text;
+        }
+      }
+    }
+
     // Accumulate content & reasoning from normalized OpenAI chunk
     const delta = parsed.choices?.[0]?.delta;
     if (delta?.content) {
@@ -224,18 +239,18 @@ export function createNormalizedStream(options) {
         if (hasValidUsage(usage)) {
           logUsage(provider, usage, model, connectionId, apiKey);
         }
+        // Diagnostic: warn when the upstream closed without ever sending a
+        // finish_reason chunk. This usually means truncation (max_tokens,
+        // provider-side limit, or network drop), not a clean stop. We do NOT
+        // synthesize finish_reason: "stop" because that masks the truncation
+        // and makes the client think the response completed successfully.
         if (!finishChunkSeen) {
-          const synthetic = {
-            id: `chatcmpl-${Date.now().toString(36)}`,
-            object: "chat.completion.chunk",
-            created: Math.floor(Date.now() / 1000),
-            model: model || "",
-            choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
-          };
-          const output = formatSSE(synthetic, sourceFormat);
-          if (output) {
-            controller.enqueue(encoder.encode(output));
-          }
+          console.warn(
+            `[NormalizedStream] PREMATURE EOF | provider=${provider} | model=${model} | ` +
+            `maxTokens=${body?.max_tokens ?? body?.max_completion_tokens ?? "unset"} | ` +
+            `contentBytes=${accumulatedContent.length} | reasoningBytes=${accumulatedThinking.length} | ` +
+            `totalBytes=${totalContentLength} | upstream did not send finish_reason — NOT synthesizing stop`
+          );
         }
       }
 

@@ -22,3 +22,47 @@ export {
   getModelOrder, setModelOrder,
   exportDb, importDb,
 } from "@/lib/db/index.js";
+
+export function getModelNormalizeToolCallId(providerId, modelId, sourceFormat) {
+  return false;
+}
+
+export function getModelPreserveOpenAIDeveloperRole(providerId, modelId, sourceFormat) {
+  return undefined;
+}
+
+export async function incrementWindowTokens(id, windowStart, delta) {
+  return typeof delta === "number" ? delta : 0;
+}
+
+export async function getWindowUsage(id, windowStart) {
+  return 0;
+}
+
+export async function resetWindowIfElapsed(limit, now) {
+  return { windowStart: now, needsReset: false };
+}
+
+export async function getTokenLimitsForRequest(options) {
+  return [];
+}
+
+export async function logTokenLimitReset(entryId) {
+  return;
+}
+
+export async function resolveProxyForScopeFromRegistry(scope) {
+  return null;
+}
+
+export async function listProxies(options = {}) {
+  return [];
+}
+
+export async function listOneproxyProxies(options = {}) {
+  return [];
+}
+
+export async function getUpstreamProxyConfig(provider) {
+  return null;
+}
