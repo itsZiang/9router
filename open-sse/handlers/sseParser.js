@@ -59,6 +59,58 @@ export function extractSSEErrorMessage(rawSSE) {
 }
 
 /**
+ * Extract a provider error message from a parsed JSON body (HTTP 200) that
+ * carries an `error` field and no usable choices/output.
+ *
+ * Some upstreams (notably OpenRouter free-tier models) return HTTP 200 with a
+ * body like `{"error":{"code":429,"message":"No available providers..."}}`
+ * instead of a proper 4xx/5xx when rate-limited or out of quota. The non-stream
+ * JSON path parses such a body as `kind:"ok"` (it is valid JSON), so without
+ * this helper the real upstream message is swallowed and the client receives a
+ * generic "returned an empty response (no usable choices/output)" 502 (#A).
+ *
+ * Provider-agnostic and symmetric with `extractSSEErrorMessage`: only extracts
+ * an error when the body has *no* usable output (no `choices`/`content`/`output`
+ * /`text`), so a valid response carrying an incidental `error` field is never
+ * misread. The returned message is run through sanitizeErrorMessage so stack
+ * traces / absolute source paths never leak (Hard Rule #12). Returns `null`
+ * when the body carries usable output or has no `error` field.
+ */
+export function extractJsonBodyErrorMessage(body) {
+  if (!body || typeof body !== "object" || Array.isArray(body)) return null;
+  const record = body;
+
+  // A body with usable content is a real completion — never short-circuit it
+  // into an error. Mirrors the "skip when choices present" guard in
+  // extractSSEErrorMessage so valid-content responses are left to the normal
+  // success path.
+  if (Array.isArray(record.choices) && record.choices.length > 0) return null;
+  if (Array.isArray(record.output) && record.output.length > 0) return null;
+  if (Array.isArray(record.content) && record.content.length > 0) return null;
+  if (typeof record.text === "string" && record.text.length > 0) return null;
+
+  const err = record.error;
+  if (err == null) return null;
+  let message = "";
+  if (typeof err === "string") {
+    message = err;
+  } else if (typeof err === "object" && !Array.isArray(err)) {
+    const errRecord = err;
+    if (typeof errRecord.message === "string" && errRecord.message.length > 0) {
+      message = errRecord.message;
+    } else if (typeof errRecord.code === "string" && errRecord.code.length > 0) {
+      message = errRecord.code;
+    } else {
+      message = JSON.stringify(err);
+    }
+  } else {
+    message = String(err);
+  }
+  const sanitized = sanitizeErrorMessage(message);
+  return sanitized || null;
+}
+
+/**
  * Convert OpenAI-style SSE chunks into a single non-streaming JSON response.
  * Used as a fallback when upstream returns text/event-stream for stream=false.
  */

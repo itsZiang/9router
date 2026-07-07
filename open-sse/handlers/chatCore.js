@@ -2791,6 +2791,10 @@ export async function handleChatCore({
     }
     let responseBody = parsed.responseBody;
     let responsePayloadFormat = parsed.responsePayloadFormat;
+    // HTTP-200 body that carries a provider `error` field and no usable output (e.g. OpenRouter
+    // free-tier rate-limit/quota masquerading as 200). Kept around so the malformed-translated
+    // 502 path can surface this real message instead of the generic "empty response" one (#A).
+    let upstreamBodyError = parsed.bodyError || null;
 
     // Check for empty content response (fake success) - trigger fallback
     if (isEmptyContentResponse(responseBody)) {
@@ -2896,18 +2900,12 @@ export async function handleChatCore({
 
     // Save structured call log with full payloads
     const cacheUsageLogMeta = buildCacheUsageLogMeta(usage);
-    recordNonStreamingUsageStats(usage, {
-      traceEnabled,
-      provider,
-      connectionId: successConnectionId,
-      model,
-      startTime,
-      apiKeyInfo,
-      effectiveServiceTier,
-      isCombo,
-      comboStrategy,
-      endpoint: endpointPath
-    });
+    // NOTE: success-usage recording (recordNonStreamingUsageStats) is intentionally deferred
+    // until *after* the guardrail + malformed-response checks below. A guardrail-blocked or
+    // malformed-translated response is a failure, not a success — recording a status:"200" usage
+    // row before those checks caused a contradictory double-insert (one "200" success row with
+    // real tokens, then a "502" failure row with zero tokens) for HTTP-200-but-empty upstream
+    // responses (#B). Each terminal branch records usage itself so behaviour is preserved.
     // Pass toolNameMap so Claude OAuth proxy_ prefix is stripped in tool_use blocks (#605)
     let translatedResponse = needsTranslation(responsePayloadFormat, clientResponseFormat) ? translateNonStreamingResponse(responseBody, responsePayloadFormat, clientResponseFormat, responseToolNameMap) : responseBody;
     const memoryExtractionResponse = translatedResponse;
@@ -3035,6 +3033,22 @@ export async function handleChatCore({
       if (apiKeyInfo?.id && estimatedCost > 0) {
         recordCost(apiKeyInfo.id, estimatedCost);
       }
+      // Record success usage here (preserving prior behaviour): the upstream call did complete
+      // and consume tokens even though a post-call guardrail blocked delivery to the client.
+      // This was previously recorded earlier (before the guardrail check); it now lives on the
+      // terminal branch so the malformed/empty path below never records a spurious success row.
+      recordNonStreamingUsageStats(usage, {
+        traceEnabled,
+        provider,
+        connectionId: successConnectionId,
+        model,
+        startTime,
+        apiKeyInfo,
+        effectiveServiceTier,
+        isCombo,
+        comboStrategy,
+        endpoint: endpointPath
+      });
       log?.warn?.("GUARDRAIL", `Response blocked by ${postCallGuardrails.guardrail || "guardrail"}: ${guardrailMessage}`);
       finalizePendingScope(pendingScope, {
         providerResponse: responseBody,
@@ -3077,7 +3091,12 @@ export async function handleChatCore({
         connectionId,
         status: `FAILED ${HTTP_STATUS.BAD_GATEWAY}`
       }).catch(() => {});
-      const malformedMessage = `[${provider}/${model}] returned an empty response (no usable choices/output)`;
+      // Surface the real upstream error when the HTTP-200 body carried one (e.g. OpenRouter
+      // free-tier `{error:{message:"No available providers..."}}`), instead of the generic
+      // empty-response message. Falls back to the generic message when no error was embedded.
+      const malformedMessage = upstreamBodyError
+        ? `[${provider}/${model}] ${upstreamBodyError}`
+        : `[${provider}/${model}] returned an empty response (no usable choices/output)`;
       persistAttemptLogs({
         status: HTTP_STATUS.BAD_GATEWAY,
         tokens: usage,
@@ -3108,6 +3127,23 @@ export async function handleChatCore({
       apiKeyId: apiKeyInfo?.id ?? undefined,
       usage,
       log
+    });
+
+    // Record success usage now that the response has cleared both the guardrail and the
+    // malformed-response checks — i.e. it is genuinely a usable 200 we are delivering. Moved
+    // from above the checks to avoid recording a "200" success row for a response that is then
+    // rejected as a malformed 502 (which records its own failure row) — the double-insert (#B).
+    recordNonStreamingUsageStats(usage, {
+      traceEnabled,
+      provider,
+      connectionId: successConnectionId,
+      model,
+      startTime,
+      apiKeyInfo,
+      effectiveServiceTier,
+      isCombo,
+      comboStrategy,
+      endpoint: endpointPath
     });
 
     // ── Phase 9.2: Save for idempotency ──

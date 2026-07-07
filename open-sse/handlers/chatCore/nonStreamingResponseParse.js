@@ -12,7 +12,7 @@
  */
 
 import { normalizePayloadForLog } from "../../stubs/lib/logPayloads";
-import { extractSSEErrorMessage } from "../sseParser";
+import { extractSSEErrorMessage, extractJsonBodyErrorMessage } from "../sseParser";
 import { readNonStreamingResponseBody } from "./nonStreamingResponseBody";
 import { normalizeNonStreamingEventPayload, parseNonStreamingSSEPayload, shouldTreatBufferedEventResponseAsExpected } from "./nonStreamingSse";
 export async function parseNonStreamingResponseBody(opts) {
@@ -63,12 +63,19 @@ export async function parseNonStreamingResponseBody(opts) {
   }
   try {
     const responseBody = rawBody ? JSON.parse(rawBody) : {};
+    // Some upstreams (e.g. OpenRouter free-tier) return HTTP 200 with a JSON body
+    // that carries an `error` field and no usable choices/output — a real failure
+    // masquerading as a 200. Surface that error message (sanitized) so the handler
+    // can use it as the client-facing error instead of the generic empty-response
+    // 502. Null for valid completions; see extractJsonBodyErrorMessage.
+    const bodyError = extractJsonBodyErrorMessage(responseBody);
     return {
       kind: "ok",
       responseBody,
       responsePayloadFormat: targetFormat,
       looksLikeSSE: false,
-      normalizedProviderPayload
+      normalizedProviderPayload,
+      bodyError
     };
   } catch (err) {
     const detailedError = `Invalid JSON response from provider (error: ${err instanceof Error ? err.message : String(err)}): ${rawBody.substring(0, 1000)}`;
