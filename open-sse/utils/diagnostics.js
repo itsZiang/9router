@@ -199,6 +199,19 @@ export function detectMalformedNonStream(resp) {
   // ── Chat Completions shape ──
   const choices = body.choices;
   if (!Array.isArray(choices) || choices.length === 0) return "empty_choices";
+
+  // A completion truncated at the token budget (finish_reason "length") is a
+  // legitimate terminal state, not a malformed response — even when the model
+  // only emitted reasoning before being cut off (content:null). Cohere / North
+  // on OpenRouter do exactly this with small max_tokens: they stream reasoning
+  // then hit max_tokens with content still null. Without this guard a valid 200
+  // was rewritten into a false 502. Mirrors LEGIT_EMPTY_OPENAI_FINISH in
+  // isEmptyContentResponse so the two detectors agree.
+  const anyLegitTruncation = choices.some(choice => {
+    const fr = choice?.finish_reason;
+    return typeof fr === "string" && (fr === "length" || fr === "tool_calls");
+  });
+
   const anyHasOutput = choices.some(choice => {
     const c = choice;
     const msg = c?.message;
@@ -212,10 +225,21 @@ export function detectMalformedNonStream(resp) {
       return !!b && typeof b === "object" && b.type === "text" && typeof b.text === "string" && b.text.length > 0;
     })) return true;
     if (Array.isArray(msg?.tool_calls) && msg.tool_calls.length > 0) return true;
+    // Reasoning-only responses are valid completions (a model that thinks but
+    // produced no visible text). `reasoning_content` is the OpenAI-style field;
+    // `reasoning` is the alias Cohere/North and some NVIDIA models (kimi-k2.5)
+    // use — the streaming parser already honors it. `reasoning_details` carries
+    // the same text as structured blocks (type:"reasoning.text"). Without these
+    // a reasoning-then-truncated completion was falsely flagged as empty_choices.
     if (typeof msg?.reasoning_content === "string" && msg.reasoning_content.length > 0) return true;
+    if (typeof msg?.reasoning === "string" && msg.reasoning.length > 0) return true;
+    if (Array.isArray(msg?.reasoning_details) && msg.reasoning_details.some(block => {
+      const b = block;
+      return !!b && typeof b === "object" && typeof b.text === "string" && b.text.length > 0;
+    })) return true;
     return false;
   });
-  if (!anyHasOutput) return "empty_choices";
+  if (!anyHasOutput && !anyLegitTruncation) return "empty_choices";
   return null;
 }
 
