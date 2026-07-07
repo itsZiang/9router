@@ -2,6 +2,9 @@
 
 # dependencies
 /node_modules
+# tests use a transient symlinked node_modules (e.g. -> /tmp/node_modules) for the
+# local vitest runner; never track it — the absolute symlink breaks on other machines/CI.
+/tests/node_modules
 /.pnp
 .pnp.*
 .yarn/*
