@@ -3085,6 +3085,18 @@ export async function handleChatCore({
         ttftMs: totalLatency,
         elapsedMs: totalLatency
       });
+      // Diagnostic: surface the raw (pre-translation) upstream body shape so the real cause of
+      // an empty-choices 200 can be identified instead of guessed. Sanitized to avoid leaking
+      // absolute paths; capped to the first 600 chars so it stays log-friendly.
+      try {
+        const topKeys = responseBody && typeof responseBody === "object"
+          ? Object.keys(responseBody).join(",")
+          : "(non-object)";
+        const preview = sanitizeErrorMessage(JSON.stringify(responseBody ?? {}).slice(0, 600));
+        console.log(`[MALFORMED-200-BODY] provider=${provider || "?"} model=${model || "?"} keys=[${topKeys}] bodyError=${upstreamBodyError ? "present" : "absent"} preview=${preview}`);
+      } catch {
+        // never break the response path on a diagnostic
+      }
       appendRequestLog({
         model,
         provider,
