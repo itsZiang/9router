@@ -208,9 +208,6 @@ export function trackPendingRequest(model, provider, connectionId, started, erro
     lastErrorProvider.ts = Date.now();
   }
 
-  const utc7 = new Date(Date.now() + 7 * 60 * 60 * 1000);
-  const t = `${String(utc7.getUTCHours()).padStart(2, "0")}:${String(utc7.getUTCMinutes()).padStart(2, "0")}:${String(utc7.getUTCSeconds()).padStart(2, "0")}`;
-  console.log(`[${t}] [PENDING] ${started ? "START" : "END"}${error ? " (ERROR)" : ""} | provider=${provider} | model=${model}`);
   scheduleStatsEvent("pending");
 }
 
