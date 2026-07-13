@@ -15,13 +15,12 @@ import { formatUsageLog } from "../../stubs/lib/usage/tokenAccounting";
 import { COLORS } from "../../utils/stream";
 import { recordTokenUsage } from "../../services/tokenLimitCounter";
 import { computeBillableTokens } from "./upstreamTimeouts";
-function logUsageTrace(usage, provider, connectionId) {
-  const msg = `[${new Date().toLocaleTimeString("en-US", {
-    hour12: false,
-    hour: "2-digit",
-    minute: "2-digit"
-  })}] 📊 [USAGE] ${provider?.toUpperCase()} | ${formatUsageLog(usage)}${connectionId ? ` | account=${connectionId.slice(0, 8)}...` : ""}`;
-  console.log(`${COLORS.green}${msg}${COLORS.reset}`);
+import { logUsage } from "../../utils/usageTracking";
+
+function logUsageTrace(usage, provider, connectionId, model, latencyMs) {
+  // Use the unified logUsage helper for non-streaming requests too.
+  // Passing isStream=false to indicate a sync request.
+  logUsage(provider, usage, model, connectionId, null, latencyMs, "ok", false);
 }
 function persistUsageRow(usage, ctx) {
   const {
@@ -65,7 +64,8 @@ export function recordNonStreamingUsageStats(usage, ctx) {
   if (!usage || typeof usage !== "object") {
     return;
   }
-  if (ctx.traceEnabled) logUsageTrace(usage, ctx.provider, ctx.connectionId);
+  const latencyMs = Date.now() - ctx.startTime;
+  if (ctx.traceEnabled) logUsageTrace(usage, ctx.provider, ctx.connectionId, ctx.model, latencyMs);
   persistUsageRow(usage, ctx);
   recordBillableTokens(usage, ctx.apiKeyInfo, ctx.provider, ctx.model);
 }

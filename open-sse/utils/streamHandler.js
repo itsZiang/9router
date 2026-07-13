@@ -186,9 +186,7 @@ export function createStreamController({
   let pendingRequestCleared = false;
   let cleanupClientAbortSignal = null;
   const logStream = status => {
-    const duration = Date.now() - startTime;
-    const p = provider?.toUpperCase() || "UNKNOWN";
-    console.log(`[${getTimeString()}] 🌊 [STREAM] ${p} | ${model || "unknown"} | ${duration}ms | ${status}`);
+    // Disabled intentionally: merged into the unified [USAGE] log
   };
   const clearPendingRequest = error => {
     if (pendingRequestCleared) return;

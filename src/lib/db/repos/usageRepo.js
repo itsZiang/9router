@@ -261,7 +261,6 @@ export async function getActiveRequests() {
 
 export async function saveRequestUsage(entry) {
   try {
-    console.log("[USAGE-DEBUG] saveRequestUsage called", { provider: entry.provider, model: entry.model, tokens: entry.tokens ? Object.keys(entry.tokens) : null, status: entry.status });
     const db = await getAdapter();
 
     if (!entry.timestamp) entry.timestamp = new Date().toISOString();
@@ -327,14 +326,10 @@ export async function saveRequestUsage(entry) {
     });
 
     if (inserted) {
-      console.log("[USAGE-DEBUG] saveRequestUsage: inserted successfully", { provider: entry.provider, model: entry.model });
       pushToRing(entry);
       scheduleStatsEvent("update", 250);
-    } else {
-      console.log("[USAGE-DEBUG] saveRequestUsage: skipped (dedup or not inserted)", { provider: entry.provider, model: entry.model });
     }
   } catch (e) {
-    console.error("[USAGE-DEBUG] saveRequestUsage FAILED:", e.message, e.stack);
     console.error("Failed to save usage stats:", e);
   }
 }

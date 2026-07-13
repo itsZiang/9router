@@ -1710,7 +1710,8 @@ export function createSSEStream(options = {}) {
             usage = estimateUsage(body, totalContentLength, sourceFormat || FORMATS.OPENAI);
           }
           if (hasValidUsage(usage)) {
-            logUsage(provider, usage, model, connectionId, apiKeyInfo);
+            const latencyMs = streamStartTime ? Date.now() - streamStartTime : null;
+            logUsage(provider, usage, model, connectionId, apiKeyInfo, latencyMs, "ok", true);
           } else {
             appendRequestLog({
               model,
@@ -1955,7 +1956,8 @@ export function createSSEStream(options = {}) {
           state.usage = estimateUsage(body, totalContentLength, sourceFormat);
         }
         if (hasValidUsage(state?.usage)) {
-          logUsage(state.provider || targetFormat, state.usage, model, connectionId, apiKeyInfo);
+          const latencyMs = streamStartTime ? Date.now() - streamStartTime : null;
+          logUsage(state.provider || targetFormat, state.usage, model, connectionId, apiKeyInfo, latencyMs, "ok", true);
         } else {
           appendRequestLog({
             model,

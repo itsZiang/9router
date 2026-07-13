@@ -459,7 +459,7 @@ export function estimateUsage(body, contentLength, targetFormat = FORMATS.OPENAI
 /**
  * Log usage with cache info (green color)
  */
-export function logUsage(provider, usage, model = null, connectionId = null, apiKeyInfo = null) {
+export function logUsage(provider, usage, model = null, connectionId = null, apiKeyInfo = null, latencyMs = null, status = "ok", isStream = true) {
   if (!usage || typeof usage !== "object") return;
   const p = provider?.toUpperCase() || "UNKNOWN";
 
@@ -471,7 +471,12 @@ export function logUsage(provider, usage, model = null, connectionId = null, api
   void apiKeyInfo;
   const normalizedConnectionId = typeof connectionId === "string" ? connectionId : undefined;
   const accountPrefix = normalizedConnectionId ? normalizedConnectionId.slice(0, 8) + "..." : "unknown";
-  let msg = `[${getTimeString()}] 📊 ${COLORS.green}[USAGE] ${p} | in=${inTokens} | out=${outTokens} | account=${accountPrefix}${COLORS.reset}`;
+
+  const statusStr = status === "ok" || status === 200 || status === "200" ? `${COLORS.green}ok${COLORS.reset}` : `${COLORS.red}${status}${COLORS.reset}`;
+  const streamStr = isStream ? "stream" : "sync";
+  const timeStr = latencyMs !== null ? `${latencyMs}ms` : "-";
+
+  let msg = `[${getTimeString()}] 📊 [USAGE] ${p} | ${model || "unknown"} | ${statusStr} | ${streamStr} | ${timeStr} | in=${inTokens} | out=${outTokens} | account=${accountPrefix}`;
 
   // Add estimated flag if present
   if (usage.estimated) {
