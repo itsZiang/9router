@@ -41,15 +41,7 @@ export function computeBillableTokens(usage) {
   return getLoggedInputTokens(usage) + getLoggedOutputTokens(usage) + getReasoningTokens(usage);
 }
 export function getExecutorTimeoutMs(executor) {
-  const getTimeoutMs = executor?.getTimeoutMs;
-  if (typeof getTimeoutMs !== "function") return FETCH_TIMEOUT_MS;
-  try {
-    const timeoutMs = getTimeoutMs.call(executor);
-    if (typeof timeoutMs !== "number" || !Number.isFinite(timeoutMs)) return FETCH_TIMEOUT_MS;
-    return Math.max(0, Math.floor(timeoutMs));
-  } catch {
-    return FETCH_TIMEOUT_MS;
-  }
+  return 0; // Disabled: no upstream timeout
 }
 export function normalizeExecutorResult(result) {
   if (result instanceof Response) {

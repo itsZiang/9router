@@ -327,11 +327,7 @@ export class BaseExecutor {
     return this.getBaseUrls().length || 1;
   }
   getTimeoutMs() {
-    const configured = this.config?.timeoutMs;
-    if (typeof configured !== "number" || !Number.isFinite(configured)) {
-      return FETCH_TIMEOUT_MS;
-    }
-    return Math.max(1, Math.floor(configured));
+    return 0; // Disabled: no upstream timeout
   }
   getCountTokensTimeoutMs() {
     return this.getTimeoutMs();
@@ -711,7 +707,7 @@ export class BaseExecutor {
           let timeoutId = null;
           if (timeoutController) {
             timeoutId = setTimeout(() => {
-              const timeoutError = new Error(`Fetch timeout after ${fetchStartTimeoutMs}ms on ${requestUrl}`);
+              const timeoutError = new Error(`Upstream request did not return response headers after ${fetchStartTimeoutMs}ms (${this.provider}/${model})`);
               timeoutError.name = "TimeoutError";
               timeoutController.abort(timeoutError);
             }, fetchStartTimeoutMs);
@@ -1181,7 +1177,7 @@ export class BaseExecutor {
         // Distinguish timeout errors from other abort errors
         const err = error instanceof Error ? error : new Error(String(error));
         if (err.name === "TimeoutError") {
-          log?.warn?.("TIMEOUT", `Fetch timeout after ${this.getTimeoutMs()}ms on ${url}`);
+          log?.warn?.("TIMEOUT", err.message);
         }
         lastError = err;
         if (!skipUpstreamRetry && urlIndex + 1 < fallbackCount) {
