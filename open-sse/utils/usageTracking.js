@@ -4,8 +4,22 @@
  */
 
 import { appendRequestLog } from "@/lib/usageDb";
-import { getLoggedInputTokens, getLoggedOutputTokens, getPromptCacheCreationTokens, getPromptCacheReadTokens } from "../stubs/lib/usage/tokenAccounting";
 import { FORMATS } from "../translator/formats";
+
+// Stub getters in stubs/lib/usage/tokenAccounting always return null — read
+// straight from the usage object (supports both OpenAI and Claude field names).
+function getLoggedInputTokens(usage) {
+  return usage?.prompt_tokens ?? usage?.input_tokens ?? null;
+}
+function getLoggedOutputTokens(usage) {
+  return usage?.completion_tokens ?? usage?.output_tokens ?? null;
+}
+function getPromptCacheReadTokens(usage) {
+  return usage?.cached_tokens ?? usage?.cache_read_input_tokens ?? null;
+}
+function getPromptCacheCreationTokens(usage) {
+  return usage?.cache_creation_input_tokens ?? null;
+}
 
 // ANSI color codes
 export const COLORS = {

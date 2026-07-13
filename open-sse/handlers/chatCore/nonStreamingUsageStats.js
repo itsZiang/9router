@@ -65,7 +65,7 @@ export function recordNonStreamingUsageStats(usage, ctx) {
     return;
   }
   const latencyMs = Date.now() - ctx.startTime;
-  if (ctx.traceEnabled) logUsageTrace(usage, ctx.provider, ctx.connectionId, ctx.model, latencyMs);
+  logUsageTrace(usage, ctx.provider, ctx.connectionId, ctx.model, latencyMs);
   persistUsageRow(usage, ctx);
   recordBillableTokens(usage, ctx.apiKeyInfo, ctx.provider, ctx.model);
 }
