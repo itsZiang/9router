@@ -1710,7 +1710,7 @@ export function createSSEStream(options = {}) {
             usage = estimateUsage(body, totalContentLength, sourceFormat || FORMATS.OPENAI);
           }
           if (hasValidUsage(usage)) {
-            const latencyMs = streamStartTime ? Date.now() - streamStartTime : null;
+            const latencyMs = Date.now() - streamStartedAt;
             logUsage(provider, usage, model, connectionId, apiKeyInfo, latencyMs, "ok", true);
           } else {
             appendRequestLog({
