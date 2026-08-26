@@ -2,7 +2,7 @@
 
 import { useState, useEffect, useRef, useCallback } from "react";
 import PropTypes from "prop-types";
-import { Card, Button, Input, Modal, CardSkeleton, Toggle, ConfirmModal } from "@/shared/components";
+import { Card, Button, Input, Modal, CardSkeleton, Toggle, ConfirmModal, Select } from "@/shared/components";
 import { useCopyToClipboard } from "@/shared/hooks/useCopyToClipboard";
 import {
   TUNNEL_BENEFITS,
@@ -22,6 +22,7 @@ export default function APIPageClient({ machineId }) {
   const [loading, setLoading] = useState(true);
   const [showAddModal, setShowAddModal] = useState(false);
   const [newKeyName, setNewKeyName] = useState("");
+  const [newKeyScope, setNewKeyScope] = useState("full");
   const [createdKey, setCreatedKey] = useState(null);
   const [confirmState, setConfirmState] = useState(null);
 
@@ -614,7 +615,7 @@ export default function APIPageClient({ machineId }) {
       const res = await fetch("/api/keys", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ name: newKeyName }),
+        body: JSON.stringify({ name: newKeyName, scope: newKeyScope }),
       });
       const data = await res.json();
 
@@ -622,6 +623,7 @@ export default function APIPageClient({ machineId }) {
         setCreatedKey(data.key);
         await fetchData();
         setNewKeyName("");
+        setNewKeyScope("full");
         setShowAddModal(false);
       }
     } catch (error) {
@@ -664,6 +666,25 @@ export default function APIPageClient({ machineId }) {
       }
     } catch (error) {
       console.log("Error toggling key:", error);
+    }
+  };
+
+  const handleUpdateScope = async (id, scope) => {
+    try {
+      const res = await fetch(`/api/keys/${id}`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ scope }),
+      });
+      if (res.ok) {
+        const data = await res.json();
+        setKeys(prev => prev.map(k => k.id === id ? { ...k, scope: data.key.scope } : k));
+      } else {
+        const err = await res.json();
+        alert(err.error || "Failed to update scope");
+      }
+    } catch (error) {
+      console.log("Error updating scope:", error);
     }
   };
 
@@ -998,7 +1019,10 @@ export default function APIPageClient({ machineId }) {
                 className={`group flex items-center justify-between py-3 border-b border-black/[0.03] dark:border-white/[0.03] last:border-b-0 ${key.isActive === false ? "opacity-60" : ""}`}
               >
                 <div className="flex-1 min-w-0">
-                  <p className="text-sm font-medium">{key.name}</p>
+                  <div className="flex items-center gap-2">
+                    <p className="text-sm font-medium">{key.name}</p>
+                    <span className={`text-[10px] px-1.5 py-0.5 rounded font-medium ${key.scope === 'expose_only' ? 'bg-amber-500/15 text-amber-700 dark:text-amber-400' : 'bg-blue-500/15 text-blue-700 dark:text-blue-400'}`}>{key.scope === 'expose_only' ? 'Expose only' : 'Full'}</span>
+                  </div>
                   <div className="flex items-center gap-2 mt-1">
                     <code className="text-xs text-text-muted font-mono">
                       {visibleKeys.has(key.id) ? key.key : maskKey(key.key)}
@@ -1029,6 +1053,17 @@ export default function APIPageClient({ machineId }) {
                   )}
                 </div>
                 <div className="flex items-center gap-2">
+                  <div className="w-[140px]">
+                    <select
+                      value={key.scope || "full"}
+                      onChange={(e) => handleUpdateScope(key.id, e.target.value)}
+                      className="w-full py-1 px-2 text-xs rounded border border-border bg-surface-2 text-text-main"
+                      title="Scope"
+                    >
+                      <option value="full">Full</option>
+                      <option value="expose_only">Expose only</option>
+                    </select>
+                  </div>
                   <Toggle
                     size="sm"
                     checked={key.isActive ?? true}
@@ -1068,6 +1103,7 @@ export default function APIPageClient({ machineId }) {
         onClose={() => {
           setShowAddModal(false);
           setNewKeyName("");
+          setNewKeyScope("full");
         }}
       >
         <div className="flex flex-col gap-4">
@@ -1077,6 +1113,16 @@ export default function APIPageClient({ machineId }) {
             onChange={(e) => setNewKeyName(e.target.value)}
             placeholder="Production Key"
           />
+          <Select
+            label="Scope"
+            value={newKeyScope}
+            onChange={(e) => setNewKeyScope(e.target.value)}
+            options={[
+              { value: "full", label: "Full - provider + combos (no Expose)" },
+              { value: "expose_only", label: "Expose only - only Expose models" },
+            ]}
+            hint={newKeyScope === "full" ? "Can call all providers & regular combos, cannot call Expose" : "Can only call Expose models, cannot call providers directly"}
+          />
           <div className="flex gap-2">
             <Button onClick={handleCreateKey} fullWidth disabled={!newKeyName.trim()}>
               Create
@@ -1085,6 +1131,7 @@ export default function APIPageClient({ machineId }) {
               onClick={() => {
                 setShowAddModal(false);
                 setNewKeyName("");
+                setNewKeyScope("full");
               }}
               variant="ghost"
               fullWidth

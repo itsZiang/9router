@@ -81,6 +81,14 @@ const nextConfig = {
       {
         source: "/v1",
         destination: "/api/v1"
+      },
+      {
+        source: "/v2/:path*",
+        destination: "/api/v2/:path*"
+      },
+      {
+        source: "/v2",
+        destination: "/api/v2/models"
       }
     ];
   }

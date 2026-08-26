@@ -466,9 +466,33 @@ export async function OPTIONS() {
 /**
  * GET /v1/models - OpenAI compatible models list (LLM/chat models only by default).
  * For other capabilities use /v1/models/{kind} (image, tts, stt, embedding, image-to-text, web).
+ * Scope: expose_only keys are redirected to expose list (GET /v2/models equivalent).
  */
-export async function GET() {
+export async function GET(request) {
   try {
+    // Scope-based redirect for expose_only
+    if (request) {
+      try {
+        const authHeader = request.headers.get("Authorization") || request.headers.get("x-api-key") || "";
+        let apiKey = null;
+        if (authHeader.startsWith("Bearer ")) apiKey = authHeader.slice(7);
+        else if (authHeader) apiKey = authHeader;
+        if (!apiKey) {
+          const xKey = request.headers.get("x-api-key");
+          if (xKey) apiKey = xKey;
+        }
+        if (apiKey) {
+          const { getApiKeyRecord } = await import("@/lib/localDb");
+          const record = await getApiKeyRecord(apiKey).catch(() => null);
+          if (record && record.scope === "expose_only") {
+            const { getExposeCombos } = await import("@/lib/localDb");
+            const combos = await getExposeCombos().catch(() => []);
+            const data = combos.filter(c => !c.kind || c.kind === "llm").map(c => ({ id: c.name, object: "model", owned_by: "combo" }));
+            return Response.json({ object: "list", data }, { headers: { "Access-Control-Allow-Origin": "*" } });
+          }
+        }
+      } catch {}
+    }
     const data = await buildModelsList([LLM_KIND]);
     return Response.json({ object: "list", data }, {
       headers: { "Access-Control-Allow-Origin": "*" },

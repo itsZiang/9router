@@ -78,6 +78,7 @@ export const TABLES = {
       name: "TEXT",
       machineId: "TEXT",
       isActive: "INTEGER DEFAULT 1",
+      scope: "TEXT DEFAULT 'full'",
       createdAt: "TEXT NOT NULL",
     },
     indexes: ["CREATE INDEX IF NOT EXISTS idx_ak_key ON apiKeys(key)"],
@@ -100,6 +101,18 @@ export const TABLES = {
       updatedAt: "TEXT NOT NULL",
     },
     indexes: ["CREATE INDEX IF NOT EXISTS idx_combo_name ON combos(name)"],
+  },
+  exposeCombos: {
+    columns: {
+      id: "TEXT PRIMARY KEY",
+      name: "TEXT UNIQUE NOT NULL",
+      kind: "TEXT",
+      models: "TEXT NOT NULL",
+      sortOrder: "INTEGER DEFAULT 0",
+      createdAt: "TEXT NOT NULL",
+      updatedAt: "TEXT NOT NULL",
+    },
+    indexes: ["CREATE INDEX IF NOT EXISTS idx_expose_combo_name ON exposeCombos(name)"],
   },
   kv: {
     columns: {

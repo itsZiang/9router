@@ -32,7 +32,7 @@ const PUBLIC_API_PATHS = [
 ];
 
 // Public top-level prefixes (LLM API endpoints with their own API key auth).
-const PUBLIC_PREFIXES = ["/v1", "/v1beta", "/api/v1", "/api/v1beta", "/codex"];
+const PUBLIC_PREFIXES = ["/v1", "/v1beta", "/v2", "/api/v1", "/api/v1beta", "/api/v2", "/codex"];
 
 // Always require JWT token regardless of requireLogin setting
 const ALWAYS_PROTECTED = [
@@ -52,6 +52,7 @@ const PROTECTED_API_PATHS = [
   "/api/provider-nodes",
   "/api/proxy-pools",
   "/api/combos",
+  "/api/expose-combos",
   "/api/models",
   "/api/usage",
   "/api/oauth",

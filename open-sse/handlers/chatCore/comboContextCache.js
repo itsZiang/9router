@@ -20,6 +20,7 @@ export async function getCombosCached() {
   const now = Date.now();
   const {
     getCombos,
+    getExposeCombos,
     getCombosCacheVersion
   } = await import("@/lib/localDb");
   const version = getCombosCacheVersion();
@@ -35,7 +36,17 @@ export async function getCombosCached() {
   }
   _combosCacheTs = now;
   _combosCacheVersionSnapshot = version;
-  _combosPromise = getCombos();
+  _combosPromise = (async () => {
+    const [combos, exposeCombos] = await Promise.all([
+      getCombos().catch(() => []),
+      getExposeCombos ? getExposeCombos().catch(() => []) : [],
+    ]);
+    // merge for routing; dedupe by name
+    const seen = new Set(combos.map(c => c.name));
+    const merged = [...combos];
+    for (const c of exposeCombos) if (!seen.has(c.name)) merged.push(c);
+    return merged;
+  })();
   return _combosPromise;
 }
 export function clearCombosCache() {

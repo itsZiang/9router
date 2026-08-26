@@ -1,4 +1,4 @@
-import { getProviderConnections, validateApiKey, updateProviderConnection, getSettings, pullKeysFromPool, getAutoReplace, batchCreatePoolConnections } from "@/lib/localDb";
+import { getProviderConnections, validateApiKey, getApiKeyRecord as getApiKeyRecordDb, updateProviderConnection, getSettings, pullKeysFromPool, getAutoReplace, batchCreatePoolConnections } from "@/lib/localDb";
 import { resolveConnectionProxyConfig } from "@/lib/network/connectionProxy";
 import { formatRetryAfter, checkFallbackError } from "open-sse/services/accountFallback.js";
 import { MAX_RATE_LIMIT_COOLDOWN_MS, QUOTA_POOL_PATTERNS } from "open-sse/config/errorConfig.js";
@@ -593,6 +593,63 @@ export function extractApiKey(request) {
 export async function isValidApiKey(apiKey) {
   if (!apiKey) return false;
   return await validateApiKey(apiKey);
+}
+
+export async function getApiKeyRecord(apiKey) {
+  if (!apiKey) return null;
+  try {
+    return await getApiKeyRecordDb(apiKey);
+  } catch {
+    return null;
+  }
+}
+
+// Scope enforcement: full can call provider/model + regular combos, not expose;
+// expose_only only expose combos.
+// Name collisions (same name in both combos and exposeCombos): each key type
+// resolves the name to the combo it's entitled to — full keys get the regular
+// combo (matching getComboByName routing priority), expose_only keys get the
+// expose combo. The authorized combo's models are returned as `comboModels`
+// so the caller routes to exactly that combo.
+export async function checkModelScopeAllowed(apiKey, modelStr, request) {
+  // Local bypass: if no key or localhost, allow all
+  if (!apiKey) return { allowed: true };
+  // Need to detect localhost via request headers? Caller handles local bypass separately.
+  // Here we just check record scope
+  const record = await getApiKeyRecord(apiKey);
+  if (!record) return { allowed: false, reason: "Invalid API key" };
+  const scope = record.scope || "full";
+  if (scope !== "full" && scope !== "expose_only") return { allowed: true };
+
+  let regular = null;
+  let expose = null;
+  // Provider/model direct (contains "/") is never a combo
+  if (!modelStr.includes("/")) {
+    try {
+      const { getCombos, getExposeComboByName } = await import("@/lib/localDb");
+      const regulars = await getCombos().catch(() => []);
+      regular = regulars.find((c) => c.name === modelStr) || null;
+      expose = await getExposeComboByName(modelStr).catch(() => null);
+    } catch {}
+  }
+
+  if (scope === "full") {
+    if (regular) {
+      // Regular combo wins on collision — matches getComboByName routing priority
+      return { allowed: true, comboResolved: true, comboModels: regular.models || [] };
+    }
+    if (expose) {
+      return { allowed: false, reason: "This API key (full) cannot call Expose models. Use an expose_only key." };
+    }
+    // Unknown name — treated as provider-like, validated later in routing
+    return { allowed: true };
+  }
+
+  // expose_only: expose combo wins on collision
+  if (expose) {
+    return { allowed: true, comboResolved: true, comboModels: expose.models || [] };
+  }
+  return { allowed: false, reason: "This API key (expose_only) can only call Expose models." };
 }
 
 // ==================== SESSION AFFINITY STUFF (OmniRoute) ====================

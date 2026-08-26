@@ -23,14 +23,46 @@ export async function getCombos() {
 
 export async function getComboById(id) {
   const db = await getAdapter();
-  const row = db.get(`SELECT * FROM combos WHERE id = ?`, [id]);
-  return rowToCombo(row);
+  let row = db.get(`SELECT * FROM combos WHERE id = ?`, [id]);
+  if (row) return rowToCombo(row);
+  // fallback to exposeCombos so routing works for exposed combos
+  try {
+    row = db.get(`SELECT * FROM exposeCombos WHERE id = ?`, [id]);
+    if (row) {
+      return {
+        id: row.id,
+        name: row.name,
+        kind: row.kind,
+        models: parseJson(row.models, []),
+        sortOrder: row.sortOrder ?? 0,
+        createdAt: row.createdAt,
+        updatedAt: row.updatedAt,
+      };
+    }
+  } catch {}
+  return null;
 }
 
 export async function getComboByName(name) {
   const db = await getAdapter();
-  const row = db.get(`SELECT * FROM combos WHERE name = ?`, [name]);
-  return rowToCombo(row);
+  let row = db.get(`SELECT * FROM combos WHERE name = ?`, [name]);
+  if (row) return rowToCombo(row);
+  // fallback to exposeCombos
+  try {
+    row = db.get(`SELECT * FROM exposeCombos WHERE name = ?`, [name]);
+    if (row) {
+      return {
+        id: row.id,
+        name: row.name,
+        kind: row.kind,
+        models: parseJson(row.models, []),
+        sortOrder: row.sortOrder ?? 0,
+        createdAt: row.createdAt,
+        updatedAt: row.updatedAt,
+      };
+    }
+  } catch {}
+  return null;
 }
 
 export async function createCombo(data) {

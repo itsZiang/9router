@@ -30,7 +30,7 @@ export {
 
 // API keys
 export {
-  getApiKeys, getApiKeyById, createApiKey, updateApiKey, deleteApiKey, validateApiKey,
+  getApiKeys, getApiKeyById, createApiKey, updateApiKey, deleteApiKey, validateApiKey, getApiKeyRecord, isValidScope, VALID_SCOPES,
 } from "./repos/apiKeysRepo.js";
 
 // Combos
@@ -38,6 +38,12 @@ export {
   getCombos, getComboById, getComboByName,
   createCombo, updateCombo, deleteCombo, reorderCombos,
 } from "./repos/combosRepo.js";
+
+// Expose combos (public /v2/models)
+export {
+  getExposeCombos, getExposeComboById, getExposeComboByName,
+  createExposeCombo, updateExposeCombo, deleteExposeCombo, reorderExposeCombos,
+} from "./repos/exposeCombosRepo.js";
 
 // Aliases (model + custom + mitm)
 export {
@@ -89,8 +95,11 @@ export async function exportDb() {
     providerConnections: db.all(`SELECT * FROM providerConnections`).map((r) => ({ ...parseJson(r.data, {}), id: r.id, provider: r.provider, authType: r.authType, name: r.name, email: r.email, priority: r.priority, isActive: r.isActive === 1, createdAt: r.createdAt, updatedAt: r.updatedAt })),
     providerNodes: db.all(`SELECT * FROM providerNodes`).map((r) => ({ ...parseJson(r.data, {}), id: r.id, type: r.type, name: r.name, createdAt: r.createdAt, updatedAt: r.updatedAt })),
     proxyPools: db.all(`SELECT * FROM proxyPools`).map((r) => ({ ...parseJson(r.data, {}), id: r.id, isActive: r.isActive === 1, testStatus: r.testStatus, createdAt: r.createdAt, updatedAt: r.updatedAt })),
-    apiKeys: db.all(`SELECT * FROM apiKeys`).map((r) => ({ id: r.id, key: r.key, name: r.name, machineId: r.machineId, isActive: r.isActive === 1, createdAt: r.createdAt })),
+    apiKeys: db.all(`SELECT * FROM apiKeys`).map((r) => ({ id: r.id, key: r.key, name: r.name, machineId: r.machineId, isActive: r.isActive === 1, scope: r.scope || "full", createdAt: r.createdAt })),
     combos: db.all(`SELECT * FROM combos`).map((r) => ({ id: r.id, name: r.name, kind: r.kind, models: parseJson(r.models, []), createdAt: r.createdAt, updatedAt: r.updatedAt })),
+    exposeCombos: (() => {
+      try { return db.all(`SELECT * FROM exposeCombos`).map((r) => ({ id: r.id, name: r.name, kind: r.kind, models: parseJson(r.models, []), createdAt: r.createdAt, updatedAt: r.updatedAt })); } catch { return []; }
+    })(),
     modelAliases: {},
     customModels: [],
     mitmAlias: {},
@@ -133,6 +142,7 @@ export async function importDb(payload) {
     db.run(`DELETE FROM proxyPools`);
     db.run(`DELETE FROM apiKeys`);
     db.run(`DELETE FROM combos`);
+    try { db.run(`DELETE FROM exposeCombos`); } catch {}
     db.run(`DELETE FROM kv WHERE scope IN ('modelAliases', 'customModels', 'mitmAlias', 'pricing', 'keyPoolSettings', 'disabledModels')`);
 
     // Settings
@@ -162,9 +172,10 @@ export async function importDb(payload) {
       );
     }
     for (const k of payload.apiKeys || []) {
+      const scope = k.scope === "expose_only" ? "expose_only" : "full";
       db.run(
-        `INSERT OR REPLACE INTO apiKeys(id, key, name, machineId, isActive, createdAt) VALUES(?, ?, ?, ?, ?, ?)`,
-        [k.id, k.key, k.name || null, k.machineId || null, k.isActive === false ? 0 : 1, k.createdAt || new Date().toISOString()]
+        `INSERT OR REPLACE INTO apiKeys(id, key, name, machineId, isActive, scope, createdAt) VALUES(?, ?, ?, ?, ?, ?, ?)`,
+        [k.id, k.key, k.name || null, k.machineId || null, k.isActive === false ? 0 : 1, scope, k.createdAt || new Date().toISOString()]
       );
     }
     for (const c of payload.combos || []) {
@@ -172,6 +183,14 @@ export async function importDb(payload) {
         `INSERT OR REPLACE INTO combos(id, name, kind, models, createdAt, updatedAt) VALUES(?, ?, ?, ?, ?, ?)`,
         [c.id, c.name, c.kind || null, stringifyJson(c.models || []), c.createdAt || new Date().toISOString(), c.updatedAt || new Date().toISOString()]
       );
+    }
+    for (const c of payload.exposeCombos || []) {
+      try {
+        db.run(
+          `INSERT OR REPLACE INTO exposeCombos(id, name, kind, models, createdAt, updatedAt) VALUES(?, ?, ?, ?, ?, ?)`,
+          [c.id, c.name, c.kind || null, stringifyJson(c.models || []), c.createdAt || new Date().toISOString(), c.updatedAt || new Date().toISOString()]
+        );
+      } catch {}
     }
     for (const [a, m] of Object.entries(payload.modelAliases || {})) {
       db.run(`INSERT OR REPLACE INTO kv(scope, key, value) VALUES('modelAliases', ?, ?)`, [a, stringifyJson(m)]);

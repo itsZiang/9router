@@ -6,6 +6,7 @@ import {
   clearAccountError,
   extractApiKey,
   isValidApiKey,
+  checkModelScopeAllowed,
 } from "../services/auth.js";
 import { cacheClaudeHeaders } from "open-sse/utils/claudeHeaderCache.js";
 import { getSettings } from "@/lib/localDb";
@@ -80,9 +81,29 @@ export async function handleChat(request, clientRawRequest = null) {
     }
   }
 
-  if (!modelStr) {
-    log.warn("CHAT", "Missing model");
-    return errorResponse(HTTP_STATUS.BAD_REQUEST, "Missing model");
+  if (typeof modelStr !== "string" || modelStr.trim().length === 0) {
+    log.warn("CHAT", "Missing or invalid model");
+    return errorResponse(HTTP_STATUS.NOT_FOUND, "Model not found");
+  }
+
+  // Scope check (tách bạch 100%): full cannot call expose, expose_only only expose
+  // Skip for local requests without key (localhost bypass).
+  // When the scope check resolved a combo by name, scopeCheck.comboModels is the
+  // model list of the combo the key is authorized for (regular combo for full
+  // keys, expose combo for expose_only keys). Use it for routing so a name that
+  // exists in both tables always resolves to the authorized combo.
+  let authorizedComboModels = null;
+  let authorizedComboResolved = false;
+  if (apiKey) {
+    const scopeCheck = await checkModelScopeAllowed(apiKey, modelStr, request);
+    if (!scopeCheck.allowed) {
+      // Do not disclose whether the model exists in another scope. Expose
+      // scope failures as an ordinary model-not-found response.
+      log.warn("AUTH", `Scope denied: ${scopeCheck.reason} | model=${modelStr}`);
+      return errorResponse(HTTP_STATUS.NOT_FOUND, "Model not found");
+    }
+    authorizedComboResolved = scopeCheck.comboResolved === true;
+    authorizedComboModels = scopeCheck.comboModels || null;
   }
 
   // Bypass naming/warmup requests before combo rotation to avoid wasting rotation slots
@@ -91,7 +112,9 @@ export async function handleChat(request, clientRawRequest = null) {
   if (bypassResponse) return bypassResponse.response || bypassResponse;
 
   // Check if model is a combo (has multiple models with fallback)
-  const comboModels = await getComboModels(modelStr);
+  const comboModels = authorizedComboResolved
+    ? (authorizedComboModels.length > 0 ? authorizedComboModels : null)
+    : await getComboModels(modelStr);
   if (comboModels) {
     // Check for combo-specific strategy first, fallback to global
     const comboStrategies = settings.comboStrategies || {};

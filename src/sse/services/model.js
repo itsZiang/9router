@@ -1,5 +1,5 @@
 // Re-export from open-sse with localDb integration
-import { getModelAliases, getComboByName, getProviderNodes } from "@/lib/localDb";
+import { getModelAliases, getComboByName, getExposeComboByName, getProviderNodes } from "@/lib/localDb";
 import { parseModel as parseModelCore, resolveModelAliasFromMap, getModelInfoCore } from "open-sse/services/model.js";
 import REGISTRY from "open-sse/providers/registry/index.js";
 
@@ -68,10 +68,15 @@ export async function getModelInfo(modelStr) {
 
   // Check if this is a combo name before resolving as alias
   // This prevents combo names from being incorrectly routed to providers
+  // Check both regular combos and expose combos
   const combo = await getComboByName(parsed.model);
   if (combo) {
     // Return null provider to signal this should be handled as combo
     // The caller (handleChat) will detect this and handle it as combo
+    return { provider: null, model: parsed.model };
+  }
+  const exposeCombo = await getExposeComboByName(parsed.model).catch(() => null);
+  if (exposeCombo) {
     return { provider: null, model: parsed.model };
   }
 
@@ -89,6 +94,10 @@ export async function getComboModels(modelStr) {
   const combo = await getComboByName(modelStr);
   if (combo && combo.models && combo.models.length > 0) {
     return combo.models;
+  }
+  const exposeCombo = await getExposeComboByName(modelStr).catch(() => null);
+  if (exposeCombo && exposeCombo.models && exposeCombo.models.length > 0) {
+    return exposeCombo.models;
   }
   return null;
 }
