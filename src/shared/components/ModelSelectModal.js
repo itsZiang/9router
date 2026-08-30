@@ -48,6 +48,7 @@ export default function ModelSelectModal({
   const [providerNodes, setProviderNodes] = useState([]);
   const [customModels, setCustomModels] = useState([]);
   const [disabledModels, setDisabledModels] = useState({});
+  const [suggestedModels, setSuggestedModels] = useState({});
 
   const fetchCombos = async () => {
     try {
@@ -112,6 +113,46 @@ export default function ModelSelectModal({
   useEffect(() => {
     if (isOpen) fetchDisabledModels();
   }, [isOpen]);
+
+  // Hybrid B+A: fetch dynamic catalogs for passthrough providers (opencode/kilo)
+  // so combos can pick from full free catalog instead of only hardcoded/alias models.
+  // Falls back to editable placeholder when fetch fails/offline.
+  useEffect(() => {
+    if (!isOpen) return;
+    // Skip for typed non-LLM kinds (e.g. tts/image/embedding) where passthrough catalog is LLM-only
+    if (kindFilter && kindFilter !== "llm") return;
+    const activeIds = filteredActiveProviders.map((p) => p.provider);
+    const noAuthIdsLocal = NO_AUTH_PROVIDER_IDS.filter((id) => {
+      if (!kindFilter) return true;
+      return (AI_PROVIDERS[id]?.serviceKinds || ["llm"]).includes(kindFilter);
+    });
+    const ids = new Set([...activeIds, ...noAuthIdsLocal]);
+    ids.forEach(async (pid) => {
+      const info = AI_PROVIDERS[pid];
+      if (!info?.passthroughModels || !info?.modelsFetcher) return;
+      // Already fetched — cache per session
+      if (suggestedModels[pid]) return;
+      try {
+        if (pid === "kilocode") {
+          const res = await fetch("/api/providers/kilo/free-models");
+          if (!res.ok) throw new Error(`kilo ${res.status}`);
+          const json = await res.json();
+          const list = (json.models || []).map((m) => ({ id: m.id, name: m.name || m.id }));
+          if (list.length) setSuggestedModels((prev) => ({ ...prev, [pid]: list }));
+        } else {
+          const fetcher = info.modelsFetcher;
+          const params = new URLSearchParams({ url: fetcher.url, type: fetcher.type });
+          const res = await fetch(`/api/providers/suggested-models?${params}`);
+          if (!res.ok) throw new Error(`suggested ${res.status}`);
+          const json = await res.json();
+          const list = (json.data || []).map((m) => ({ id: m.id, name: m.name || m.id }));
+          if (list.length) setSuggestedModels((prev) => ({ ...prev, [pid]: list }));
+        }
+      } catch (_) {
+        // Fail silently — placeholder fallback below keeps modal usable offline
+      }
+    });
+  }, [isOpen, filteredActiveProviders, kindFilter, suggestedModels]);
 
   const allProviders = useMemo(() => ({ ...OAUTH_PROVIDERS, ...FREE_PROVIDERS, ...FREE_TIER_PROVIDERS, ...APIKEY_PROVIDERS }), []);
 
@@ -209,16 +250,26 @@ export default function ModelSelectModal({
           }
         } else {
           // LLM/null kind: merge hardcoded models (e.g. mimo-free → mimo-auto) with user-added models
+          // + dynamic suggested catalog (opencode/kilo) when available (Hybrid B)
           const registeredLlms = customRegisteredModels.filter((m) => !getModelKind(m) || getModelKind(m) === "llm");
           const seen = new Set([...aliasModels, ...registeredLlms].map((m) => m.value));
           const hardcoded = getModelsByProviderId(providerId)
             .filter((m) => !getModelKind(m) || getModelKind(m) === "llm")
             .map((m) => ({ id: m.id, name: m.name, value: `${alias}/${m.id}`, kind: getModelKind(m) }))
             .filter((m) => !seen.has(m.value));
-          combined = [...registeredLlms, ...aliasModels.filter((m) => !registeredLlms.some((registered) => registered.value === m.value)), ...hardcoded];
+          const base = [...registeredLlms, ...aliasModels.filter((m) => !registeredLlms.some((registered) => registered.value === m.value)), ...hardcoded];
+          const seenBase = new Set(base.map((m) => m.value));
+          const suggested = (suggestedModels[providerId] || [])
+            .map((m) => ({ id: m.id, name: m.name || m.id, value: `${alias}/${m.id}`, isSuggested: true }))
+            .filter((m) => !seenBase.has(m.value));
+          combined = [...base, ...suggested];
+          // Hybrid A fallback: always show even when empty (editable placeholder like openai-compatible)
+          if (combined.length === 0) {
+            combined = [{ id: `__placeholder__${providerId}`, name: `${alias}/model-id`, value: `${alias}/model-id`, isPlaceholder: true }];
+          }
         }
 
-        if (combined.length > 0) {
+        {
           // Check for custom name from providerNodes (for compatible providers)
           const matchedNode = providerNodes.find(node => node.id === providerId);
           const displayName = matchedNode?.name || providerInfo.name;
@@ -349,7 +400,7 @@ export default function ModelSelectModal({
     });
 
     return groups;
-  }, [filteredActiveProviders, modelAliases, allProviders, providerNodes, customModels, disabledModels, kindFilter, activeProviders]);
+  }, [filteredActiveProviders, modelAliases, allProviders, providerNodes, customModels, disabledModels, kindFilter, activeProviders, suggestedModels]);
 
   // Filter combos by search query (and hide combos when kindFilter is set — combos are LLM-only by design)
   const filteredCombos = useMemo(() => {
