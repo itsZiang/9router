@@ -14,7 +14,7 @@ export { extractThinkingFromContent, shouldParseTextualReasoningTags } from "./r
  * 4. Converts developer role → system for non-OpenAI providers
  */
 
-const ALLOWED_USAGE_FIELDS = new Set(["prompt_tokens", "completion_tokens", "total_tokens", "prompt_tokens_details", "completion_tokens_details"]);
+const ALLOWED_USAGE_FIELDS = new Set(["prompt_tokens", "completion_tokens", "total_tokens", "prompt_tokens_details", "completion_tokens_details", "input_tokens", "output_tokens"]);
 const ALLOWED_RESPONSES_USAGE_FIELDS = new Set(["input_tokens", "output_tokens", "total_tokens", "input_tokens_details", "output_tokens_details", "estimated"]);
 export const OMIT_STREAMING_CHUNK_MARKER = "__omniroute_omit_streaming_chunk";
 function toRecord(value) {

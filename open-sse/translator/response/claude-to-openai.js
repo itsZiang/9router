@@ -142,16 +142,16 @@ export function claudeToOpenAIResponse(chunk, state) {
           // Use OpenAI format keys for consistent logging in stream.js
           // Issue #1426: Include cache_read tokens in prompt_tokens so cached input
           // is visible to downstream billing systems.
-          // Issue #2215: Exclude cache_creation_input_tokens from prompt_tokens —
-          // Anthropic's cache-creation pads short prompts up to a 1024-token
-          // minimum, so a 2-token "hi" can be reported as ~2008 prompt_tokens and
-          // inflate downstream billing ~250x. cache_creation is still exposed
-          // separately via prompt_tokens_details.cache_creation_tokens below.
-          const billableInputTokens = inputTokens > 0 || cacheReadTokens > 0 || cacheCreationTokens > 0 ? inputTokens + cacheReadTokens : previousInputTokens;
+          // Keep provider usage exact. Cache-creation tokens are reported
+          // separately by Anthropic, but they are still prompt-side usage.
+          // Do not silently discard or clamp them: clients need real numbers.
+          const promptTokens = inputTokens > 0 || cacheReadTokens > 0 || cacheCreationTokens > 0
+            ? inputTokens + cacheReadTokens + cacheCreationTokens
+            : previousInputTokens;
           state.usage = {
-            prompt_tokens: billableInputTokens,
+            prompt_tokens: promptTokens,
             completion_tokens: outputTokens,
-            input_tokens: billableInputTokens,
+            input_tokens: inputTokens,
             output_tokens: outputTokens
           };
 
@@ -200,11 +200,12 @@ export function claudeToOpenAIResponse(chunk, state) {
             const cachedTokens = state.usage.cache_read_input_tokens || 0;
             const cacheCreationTokens = state.usage.cache_creation_input_tokens || 0;
 
-            // prompt_tokens = input_tokens (input + cache_read, per #2215 —
-            // cache_creation is exposed separately in prompt_tokens_details below).
+            // prompt_tokens is the complete prompt-side usage reported by
+            // Claude: raw input + cache read + cache creation. Keep cache
+            // creation visible instead of silently dropping it.
             // completion_tokens = output_tokens
             // total_tokens = prompt_tokens + completion_tokens
-            const promptTokens = inputTokens;
+            const promptTokens = inputTokens + cachedTokens + cacheCreationTokens;
             const completionTokens = outputTokens;
             const totalTokens = promptTokens + completionTokens;
             finalChunk.usage = {
@@ -235,9 +236,9 @@ export function claudeToOpenAIResponse(chunk, state) {
           const finishReason = state.finishReason || (state.toolCalls?.size > 0 ? "tool_calls" : "stop");
           const usageObj = state.usage && typeof state.usage === "object" ? {
             usage: {
-              prompt_tokens: state.usage.input_tokens || 0,
+              prompt_tokens: state.usage.prompt_tokens || 0,
               completion_tokens: state.usage.output_tokens || 0,
-              total_tokens: (state.usage.input_tokens || 0) + (state.usage.output_tokens || 0)
+              total_tokens: (state.usage.prompt_tokens || 0) + (state.usage.output_tokens || 0)
             }
           } : {};
           results.push({

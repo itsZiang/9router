@@ -39,11 +39,12 @@ export const COLORS = {
  * Configurable via:
  *   - Settings API / Dashboard: `usageTokenBuffer` (persisted in DB)
  *   - Environment variable: `USAGE_TOKEN_BUFFER`
- *   - Defaults to 2000 if neither is set
+ *   - Defaults to 0 if neither is set (raw provider token counts)
  *
- * Set to 0 to disable the buffer entirely (raw provider token counts).
+ * Set USAGE_TOKEN_BUFFER or the dashboard setting to a positive value only
+ * when a client needs a safety margin for translated/system/tool overhead.
  */
-const DEFAULT_BUFFER_TOKENS = 2000;
+const DEFAULT_BUFFER_TOKENS = 0;
 let _cachedBuffer = null;
 let _cacheTimestamp = 0;
 const CACHE_TTL_MS = 30_000; // Re-read from DB/env every 30s
