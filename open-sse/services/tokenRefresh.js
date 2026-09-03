@@ -556,6 +556,18 @@ export async function refreshClineToken(refreshToken, log, proxyConfig = null) {
           code
         };
       }
+      // Cline's refresh endpoint returns a non-standard 401 body
+      // ("Please make sure you're using the latest version of Cline…")
+      // which extractOAuthErrorCode() doesn't classify. Any 401 here
+      // means the refresh credential is dead — surface as unrecoverable
+      // so HealthCheck deactivates instead of looping (mirrors Codex's
+      // 401 guard in refreshCodexToken).
+      if (response.status === 401) {
+        return {
+          error: "unrecoverable_refresh_error",
+          code: code || "unauthorized"
+        };
+      }
       return null;
     }
     const payload = await response.json();

@@ -7,13 +7,12 @@ initConsoleLogCapture();
 export async function GET(request) {
   const encoder = new TextEncoder();
   const emitter = getConsoleEmitter();
-  const state = { closed: false, send: null, sendLines: null, sendClear: null, keepalive: null };
+  const state = { closed: false, sendLines: null, sendClear: null, keepalive: null };
 
   // Idempotent: safe to call from request.signal abort, cancel(), or enqueue failure.
   const cleanup = () => {
     if (state.closed) return;
     state.closed = true;
-    if (state.send) emitter.off("line", state.send);
     if (state.sendLines) emitter.off("lines", state.sendLines);
     if (state.sendClear) emitter.off("clear", state.sendClear);
     if (state.keepalive) clearInterval(state.keepalive);

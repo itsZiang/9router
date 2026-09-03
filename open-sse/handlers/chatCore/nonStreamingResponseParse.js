@@ -62,7 +62,27 @@ export async function parseNonStreamingResponseBody(opts) {
     };
   }
   try {
-    const responseBody = rawBody ? JSON.parse(rawBody) : {};
+    let responseBody = rawBody ? JSON.parse(rawBody) : {};
+    // Cline envelope: non-stream returns { success:true, data:{ choices, id, ... } }
+    // while stream returns bare OpenAI chunks. Unwrap so diagnostics +
+    // translation see the real completion (stream:false only).
+    if (
+      responseBody &&
+      typeof responseBody === "object" &&
+      !Array.isArray(responseBody) &&
+      responseBody.data &&
+      typeof responseBody.data === "object" &&
+      !Array.isArray(responseBody.data)
+    ) {
+      const d = responseBody.data;
+      const looksLikeChatCompletion =
+        Array.isArray(d.choices) || typeof d.id === "string" || typeof d.model === "string";
+      const topLooksEnvelope =
+        typeof responseBody.success === "boolean" && looksLikeChatCompletion;
+      if (topLooksEnvelope) {
+        responseBody = d;
+      }
+    }
     // Some upstreams (e.g. OpenRouter free-tier) return HTTP 200 with a JSON body
     // that carries an `error` field and no usable choices/output — a real failure
     // masquerading as a 200. Surface that error message (sanitized) so the handler

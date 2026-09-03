@@ -135,13 +135,16 @@ export async function pingModelByKind(model, kind, baseUrl = `http://127.0.0.1:$
     headers,
     body: JSON.stringify({
       model,
-      // Claude-on-Copilot returns empty choices at max_tokens:1 (budget is spent
-      // before a content token emits), so a 1-token probe yields a false negative.
-      max_tokens: 16,
+      // Reasoning models (z-ai/glm-*, deepseek, kimi-thinking) spend the entire
+      // budget on reasoning before any visible content: at max_tokens:16 glm-5.3-flash
+      // upstream returns {success:false, error:"empty response content"}. Bump probe
+      // to 512 so the provider has budget for reasoning + at least one content token.
+      // Claude-on-Copilot already needed >1 for the same reason.
+      max_tokens: 512,
       stream: false,
       messages: [{ role: "user", content: "hi" }],
     }),
-    signal: AbortSignal.timeout(15000),
+    signal: AbortSignal.timeout(30000),
   });
   const latencyMs = Date.now() - start;
 

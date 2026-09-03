@@ -100,6 +100,11 @@ export function getConsoleLogs() {
 
 export function clearConsoleLogs() {
   state.logs = [];
+  state.pendingLines = [];
+  if (state.flushTimer) {
+    clearTimeout(state.flushTimer);
+    state.flushTimer = null;
+  }
   state.emitter.emit("clear");
 }
 

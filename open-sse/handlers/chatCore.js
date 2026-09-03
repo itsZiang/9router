@@ -46,6 +46,7 @@ import { createStreamController } from "../utils/streamHandler";
 import * as streamFailure from "../utils/streamFailureFinalization";
 import { refreshWithRetry, isUnrecoverableRefreshError, runWithOnPersist, runWithCasGuard } from "../services/tokenRefresh";
 import { createRequestLogger } from "../utils/requestLogger";
+import { runWithProxyContext } from "../utils/proxyFetch";
 import { createPreparedRequestLogger, runWithCapture } from "../utils/providerRequestLogging";
 import { summarizeToolSources } from "../utils/toolSources";
 import { applyResponsesPreviousResponseIdPolicy } from "../utils/responsesStatePolicy";
@@ -1796,13 +1797,20 @@ export async function handleChatCore({
                 updatePendingScope(pendingScope, {
                   stage: "rate_limit_slot_acquired"
                 });
+                const proxyData = execCreds?.providerSpecificData;
+                const connectionProxy = proxyData?.vercelRelayUrl || (proxyData?.connectionProxyEnabled === true && proxyData?.connectionProxyUrl) ? {
+                  connectionProxyEnabled: proxyData?.connectionProxyEnabled === true,
+                  connectionProxyUrl: proxyData?.connectionProxyUrl || "",
+                  connectionNoProxy: proxyData?.connectionNoProxy || "",
+                  vercelRelayUrl: proxyData?.vercelRelayUrl || ""
+                } : null;
                 return executeWithUpstreamStartTimeout({
                   executor,
                   provider,
                   model: modelToCall,
                   signal: streamController.signal,
                   log,
-                  execute: signal => runWithCapture(providerRequestCapture, () => executor.execute({
+                  execute: signal => runWithCapture(providerRequestCapture, () => runWithProxyContext(connectionProxy, () => executor.execute({
                     model: modelToCall,
                     body: bodyToSend,
                     stream: upstreamStream,
@@ -1817,7 +1825,7 @@ export async function handleChatCore({
                     contextEditing: {
                       enabled: contextEditingEnabled
                     }
-                  }))
+                  })))
                 });
               }, streamController.signal);
               const res = normalizeExecutorResult(rawExecutorResult);

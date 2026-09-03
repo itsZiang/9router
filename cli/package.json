@@ -1,6 +1,6 @@
 {
   "name": "@ltgiang/9router",
-  "version": "0.5.67",
+  "version": "0.5.70",
   "description": "9Router CLI - Start and manage 9Router server",
   "bin": {
     "9router": "./cli.js"

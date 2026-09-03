@@ -97,8 +97,8 @@ const patchState = getPatchState();
 const originalFetch = patchState.originalFetch;
 const originalFetchWithDispatcher = originalFetch;
 const proxyContext = patchState.proxyContext;
-function noProxyMatch(targetUrl) {
-  const noProxy = process.env.NO_PROXY || process.env.no_proxy;
+function noProxyMatch(targetUrl, configuredNoProxy = undefined) {
+  const noProxy = configuredNoProxy ?? process.env.NO_PROXY ?? process.env.no_proxy;
   if (!noProxy) return false;
   let target;
   try {
@@ -192,9 +192,12 @@ export function resolveProxyForRequest(targetUrl) {
   }
   const contextProxy = proxyContext.getStore();
   if (contextProxy) {
+    if (contextProxy.__noProxy && noProxyMatch(targetUrl, contextProxy.__noProxy)) {
+      return { source: "direct", proxyUrl: null };
+    }
     return {
       source: "context",
-      proxyUrl: proxyConfigToUrl(contextProxy)
+      proxyUrl: contextProxy.__relayUrl || contextProxy.__proxyUrl || proxyConfigToUrl(contextProxy)
     };
   }
   const envProxyUrl = resolveEnvProxyUrl(targetUrl);
@@ -221,8 +224,28 @@ export async function runWithProxyContext(proxyConfig, fn, opts) {
 
   // Inherit existing context if no specific proxyConfig is provided
   const currentContext = proxyContext.getStore();
-  const effectiveProxyConfig = proxyConfig || currentContext || null;
-  const resolvedProxyUrl = effectiveProxyConfig ? proxyConfigToUrl(effectiveProxyConfig) : null;
+  let effectiveProxyConfig = proxyConfig || currentContext || null;
+  if (effectiveProxyConfig?.vercelRelayUrl) {
+    let relay;
+    try {
+      relay = new URL(effectiveProxyConfig.vercelRelayUrl);
+    } catch {
+      throw new Error("[ProxyFetch] Invalid relay URL");
+    }
+    effectiveProxyConfig = {
+      type: "vercel",
+      host: relay.host,
+      __relayUrl: relay.toString().replace(/\/$/, ""),
+      __allowMissingRelayAuth: true,
+      __noProxy: effectiveProxyConfig.connectionNoProxy || ""
+    };
+  } else if (effectiveProxyConfig?.connectionProxyUrl) {
+    effectiveProxyConfig = effectiveProxyConfig.connectionProxyEnabled === true ? {
+      __proxyUrl: effectiveProxyConfig.connectionProxyUrl,
+      __noProxy: effectiveProxyConfig.connectionNoProxy || ""
+    } : null;
+  }
+  const resolvedProxyUrl = effectiveProxyConfig ? (effectiveProxyConfig.__proxyUrl || proxyConfigToUrl(effectiveProxyConfig)) : null;
 
   // The caller must opt in, and the runtime feature flag must also be enabled.
   // This fallback changes egress IP, so upgrades must not silently turn it on.
@@ -458,7 +481,7 @@ async function patchedFetch(input, options = {}, deps = {}) {
   const contextProxy = proxyContext.getStore();
   if (contextProxy && typeof contextProxy === "object" && isRelayType(contextProxy.type)) {
     const vc = contextProxy;
-    if (!vc.relayAuth) {
+    if (!vc.relayAuth && !vc.__allowMissingRelayAuth) {
       // Generic message without internal labels — this throw can bubble up to
       // catch blocks that put error.message in response bodies (combo per-model
       // timeout, executor catch-all). Don't leak "[ProxyFetch]" diagnostics.
@@ -466,7 +489,7 @@ async function patchedFetch(input, options = {}, deps = {}) {
       throw new Error(`${label} configuration error: missing relayAuth`);
     }
     const targetUrl = getTargetUrl(input);
-    const relayHeaders = buildVercelRelayHeaders(targetUrl, vc.relayAuth);
+    const relayHeaders = buildVercelRelayHeaders(targetUrl, vc.relayAuth || "");
     const mergedHeaders = new Headers(options?.headers);
     for (const [k, v] of Object.entries(relayHeaders)) mergedHeaders.set(k, v);
     // Pass host through proxyUrlForLogs so the same redaction policy applies
@@ -475,7 +498,7 @@ async function patchedFetch(input, options = {}, deps = {}) {
     if (process.env.OMNIROUTE_PROXY_FETCH_DEBUG === "true") {
       console.debug(`[ProxyFetch] Routing via ${vc.type || "edge"} relay: ${hostForLogs}`);
     }
-    return await originalFetch(`https://${vc.host}`, {
+    return await originalFetch(vc.__relayUrl || `https://${vc.host}`, {
       ...options,
       headers: mergedHeaders,
       duplex: "half"
@@ -538,6 +561,9 @@ export function getOriginalFetch() {
   return originalFetch;
 }
 export async function proxyAwareFetch(url, options = {}, proxyOptions = null) {
+  if (proxyOptions && (proxyOptions.connectionProxyEnabled === true || proxyOptions.vercelRelayUrl)) {
+    return runWithProxyContext(proxyOptions, () => proxyFetch(url, options));
+  }
   return proxyFetch(url, options);
 }
 
