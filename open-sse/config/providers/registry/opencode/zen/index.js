@@ -13,6 +13,23 @@ export const opencode_zenProvider = {
   // from the live API response so new models work without a code deploy.
   passthroughModels: true,
   models: [
+  // Muse Spark models are served by /zen/v1/responses (they 500 on
+  // /chat/completions), so the format is declared per-model, not per-provider.
+  {
+    id: "muse-spark-1.2-contributor-free",
+    name: "Muse Spark 1.2 Contributor Free",
+    targetFormat: "openai-responses",
+    contextLength: 1048576,
+    supportsVision: true,
+    supportsReasoning: true
+  }, {
+    id: "muse-spark-1.3-contributor-free",
+    name: "Muse Spark 1.3 Contributor Free",
+    targetFormat: "openai-responses",
+    contextLength: 1048576,
+    supportsVision: true,
+    supportsReasoning: true
+  },
   // ── Chat / Coding ──────────────────────────────────────────
   // #2900: big-pickle's upstream runs DeepSeek thinking mode — declare the
   // interleaved reasoning_content contract so follow-up/tool-use turns replay

@@ -10,6 +10,22 @@ import { shouldParseTextualReasoningTags } from "../../handlers/responseSanitize
 function normalizeToolName(value) {
   return typeof value === "string" ? value.trim() : "";
 }
+
+// Coerce upstream tool-call ids to strings for OpenAI-protocol clients.
+// Some Responses providers (NVIDIA NIM, GLM, Kimi, Muse Spark, ...) emit
+// numeric call_ids; @ai-sdk/openai-compatible validates tool_calls[].id as a
+// string and throws AI_InvalidResponseDataError "Expected 'id' to be a
+// string" otherwise (chit-chat is unaffected — only tool calls emit ids).
+// Round-trip integrity is preserved: String(123) === "123" still matches the
+// upstream id when the client echoes it back in function_call_output.
+function coerceToolCallId(value, fallback) {
+  if (typeof value === "string") {
+    const trimmed = value.trim();
+    return trimmed !== "" ? trimmed : fallback;
+  }
+  if (typeof value === "number" && Number.isFinite(value)) return String(value);
+  return fallback;
+}
 function stripEmptyOptionalToolArgs(value, toolName) {
   if (value == null) return value;
   if (typeof value === "string") {
@@ -371,7 +387,9 @@ function closeMessage(state, emit, idx) {
 }
 function emitToolCall(state, emit, tc) {
   const tcIdx = tc.index ?? 0;
-  const newCallId = tc.id;
+  // Coerce numeric upstream ids to strings (see coerceToolCallId); leave
+  // missing ids untouched to preserve the deferred-emission behavior below.
+  const newCallId = tc.id == null || tc.id === "" ? tc.id : coerceToolCallId(tc.id, tc.id);
   const funcName = tc.function?.name;
 
   // T37: If we already have a tool call at this index but the ID changed,
@@ -692,6 +710,11 @@ function openaiResponsesToOpenAIResponseStream(chunk, state) {
     state.created = Math.floor(Date.now() / 1000);
     state.toolCallIndex = 0;
     state.currentToolCallId = null;
+    // Indexes whose head chunk (id + type + name) was already emitted to the
+    // client. A tool call whose head was never emitted must be completed with
+    // a combined head chunk at output_item.done — emitting id-less args first
+    // breaks strict OpenAI clients (ai-sdk: "Expected 'id' to be a string").
+    state.toolCallHeadEmitted = new Set();
   }
 
   // Text content delta
@@ -721,9 +744,17 @@ function openaiResponsesToOpenAIResponseStream(chunk, state) {
   // Function call started
   if (eventType === "response.output_item.added" && data.item?.type === "function_call") {
     const item = data.item;
-    state.currentToolCallId = item.call_id || fallbackToolCallId();
+    // Late-added: argument deltas may have arrived before added. They were
+    // buffered (never streamed); keep them and fold into the head chunk below
+    // so arguments are lossless. Normally the buffer is empty → no change.
+    const pendingArgs = state.currentToolCallArgsBuffer || "";
+    state.currentToolCallId = coerceToolCallId(item.call_id, fallbackToolCallId());
     state.currentToolCallArgsBuffer = ""; // reset per-call arg buffer
     state.currentToolCallDeferred = false;
+    // Late-added args were folded into the head chunk below, so the done
+    // handler must not re-emit them (it otherwise mistakes the reset buffer
+    // for "args never delivered"). Overwritten on every added event.
+    state.toolCallHeadFoldedArgs = pendingArgs !== "";
     const toolName = normalizeToolName(item.name);
     if (!toolName) {
       // Some Responses providers briefly emit placeholder/empty tool names.
@@ -731,6 +762,7 @@ function openaiResponsesToOpenAIResponseStream(chunk, state) {
       state.currentToolCallDeferred = true;
       return null;
     }
+    state.toolCallHeadEmitted?.add(state.toolCallIndex);
     return {
       id: state.chatId,
       object: "chat.completion.chunk",
@@ -745,7 +777,7 @@ function openaiResponsesToOpenAIResponseStream(chunk, state) {
             type: "function",
             function: {
               name: toolName,
-              arguments: ""
+              arguments: pendingArgs
             }
           }]
         },
@@ -758,11 +790,16 @@ function openaiResponsesToOpenAIResponseStream(chunk, state) {
   // NOTE: Do NOT include `id` or `type` here - only first chunk (response.output_item.added)
   // should have them. Including `id` on every chunk causes openai-to-claude.ts to emit
   // a new content_block_start for each delta, breaking Claude Code ACP sessions.
+  // Deltas arriving before any head chunk for this index are buffered only, never
+  // streamed: an id-less chunk must never be the head (ai-sdk rejects it with
+  // "Expected 'id' to be a string"). The head + buffered args go out together
+  // when response.output_item.done arrives (see below).
   if (eventType === "response.function_call_arguments.delta") {
     const argsDelta = data.delta || "";
     if (!argsDelta) return null;
     state.currentToolCallArgsBuffer = (state.currentToolCallArgsBuffer || "") + argsDelta;
     if (state.currentToolCallDeferred) return null;
+    if (!state.toolCallHeadEmitted?.has(state.toolCallIndex)) return null;
     return {
       id: state.chatId,
       object: "chat.completion.chunk",
@@ -790,9 +827,14 @@ function openaiResponsesToOpenAIResponseStream(chunk, state) {
     const item = data.item;
     const buffered = state.currentToolCallArgsBuffer || "";
     const currentIndex = state.toolCallIndex; // capture before increment
-    const callId = item.call_id || state.currentToolCallId || fallbackToolCallId();
+    const callId = coerceToolCallId(item.call_id, coerceToolCallId(state.currentToolCallId, fallbackToolCallId()));
     const toolName = normalizeToolName(item.name);
-    if (state.currentToolCallDeferred) {
+    // First-chunk emission: either the added event carried a placeholder name
+    // (deferred), or no head chunk was ever emitted for this index (done-only
+    // payloads, or deltas that arrived before added and were buffered above).
+    // Emitting the head here — with id + type + name — keeps strict OpenAI
+    // clients (ai-sdk) from ever seeing an id-less head chunk.
+    if (state.currentToolCallDeferred || !state.toolCallHeadEmitted?.has(currentIndex)) {
       state.currentToolCallDeferred = false;
       state.currentToolCallArgsBuffer = "";
       state.currentToolCallId = null;
@@ -800,6 +842,7 @@ function openaiResponsesToOpenAIResponseStream(chunk, state) {
         return null;
       }
       state.toolCallIndex++;
+      state.toolCallHeadEmitted?.add(currentIndex);
       const argsToEmit = stripEmptyOptionalToolArgs(item.arguments, toolName);
       const argsStr = argsToEmit != null ? typeof argsToEmit === "string" ? argsToEmit : JSON.stringify(argsToEmit) : buffered;
       return {
@@ -828,8 +871,11 @@ function openaiResponsesToOpenAIResponseStream(chunk, state) {
     state.currentToolCallArgsBuffer = ""; // reset for next tool call
     state.currentToolCallId = null;
 
-    // Only emit if arguments exist in the done event AND they weren't already streamed via deltas
-    if (item.arguments != null && !buffered) {
+    // Only emit if arguments exist in the done event AND they weren't already
+    // delivered (neither streamed via deltas nor folded into the head chunk).
+    const argsDelivered = buffered !== "" || state.toolCallHeadFoldedArgs === true;
+    state.toolCallHeadFoldedArgs = false;
+    if (item.arguments != null && !argsDelivered) {
       const argsToEmit = stripEmptyOptionalToolArgs(item.arguments, toolName);
       const argsStr = typeof argsToEmit === "string" ? argsToEmit : JSON.stringify(argsToEmit);
       if (argsStr) {

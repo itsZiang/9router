@@ -1,6 +1,6 @@
 import { generateModels, generateAliasMap } from "./providerRegistry";
 import { modelQuotaFamily, modelStrip } from "../providers/models/schema.js";
-import { CODEX_REVIEW_SUFFIX } from "../providers/models/helpers.js";
+import { CODEX_REVIEW_SUFFIX, isMuseSparkModel } from "../providers/models/helpers.js";
 
 // Provider models - Generated from providerRegistry.js (single source of truth)
 export const PROVIDER_MODELS = generateModels();
@@ -41,6 +41,13 @@ export function findModelName(aliasOrId, modelId) {
   return found?.name || modelId;
 }
 export function getModelTargetFormat(aliasOrId, modelId) {
+  // Muse Spark models on OpenCode Free are served by /zen/v1/responses (they
+  // 500 on /chat/completions). Family check covers current + future ids and
+  // dynamically-synced passthrough ids that post-date the static catalog.
+  // Scoped to the opencode family so other providers keep their own routing.
+  if ((!aliasOrId || aliasOrId === "oc" || aliasOrId === "opencode" || aliasOrId === "opencode-zen") && isMuseSparkModel(modelId)) {
+    return "openai-responses";
+  }
   const models = PROVIDER_MODELS[aliasOrId];
   const found = models?.find(m => m.id === modelId);
   if (found?.targetFormat) return found.targetFormat;

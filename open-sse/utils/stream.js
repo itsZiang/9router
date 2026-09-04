@@ -1956,7 +1956,7 @@ export function createSSEStream(options = {}) {
           state.usage = estimateUsage(body, totalContentLength, sourceFormat);
         }
         if (hasValidUsage(state?.usage)) {
-          const latencyMs = streamStartTime ? Date.now() - streamStartTime : null;
+          const latencyMs = Date.now() - streamStartedAt;
           logUsage(state.provider || targetFormat, state.usage, model, connectionId, apiKeyInfo, latencyMs, "ok", true);
         } else {
           appendRequestLog({

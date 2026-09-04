@@ -1,6 +1,5 @@
 // Codex auto-generates a "-review" variant for each llm model (review quota family)
 export const CODEX_REVIEW_SUFFIX = "-review";
-
 export function withCodexReviewModels(models) {
   return models.flatMap((model) => {
     if ((model.kind || model.type || "llm") !== "llm" || model.id.endsWith(CODEX_REVIEW_SUFFIX)) {
@@ -17,4 +16,15 @@ export function withCodexReviewModels(models) {
       }
     ];
   });
+}
+
+// Muse Spark models on OpenCode Free are served by /zen/v1/responses (they
+// 500 on /chat/completions). Match the family so current and future
+// muse-spark ids route to the Responses API even when the static catalog
+// lags behind the live https://opencode.ai/zen/v1/models list.
+export function isMuseSparkModel(modelId) {
+  if (!modelId || typeof modelId !== "string") return false;
+  const clean = modelId.replace(/\([^()]+\)\s*$/, "").trim();
+  const base = clean.includes("/") ? clean.split("/").pop() : clean;
+  return /^muse[-_]?spark(?:$|[-_:.\s])/i.test(base);
 }
