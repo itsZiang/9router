@@ -8,6 +8,7 @@ import { isOpenAIResponsesStoreEnabled } from "../../stubs/lib/providers/request
 import { FORMATS } from "../formats";
 import { generateToolCallId } from "../helpers/toolCallHelper";
 import { register } from "../registry";
+import { isMuseSparkModel } from "../../providers/models/helpers";
 import { normalizeResponsesInputForChat } from "../../utils/responsesInputNormalization";
 const RESPONSES_STORE_MARKER = "_omnirouteResponsesStore";
 const COPILOT_REASONING_SUMMARY_MARKER = "_omnirouteCopilotReasoningSummary";
@@ -798,6 +799,23 @@ export function openaiToOpenAIResponsesRequest(model, body, stream, credentials)
       }
     } else {
       result.tool_choice = root.tool_choice;
+    }
+  }
+
+  // Muse Spark on OpenCode Free only supports tool_choice "auto" on /responses:
+  // "none", "required" and named function choices are rejected with 400
+  // invalid_request_error. "none" (e.g. client compaction/summarization turns)
+  // maps to dropping tools + tool_choice — the model cannot call tools it never
+  // sees. Forced choices degrade to "auto" with a warning; the agent loop
+  // retries if a call was actually needed.
+  if (isMuseSparkModel(model) && result.tool_choice !== undefined && result.tool_choice !== "auto") {
+    const originalChoice = typeof result.tool_choice === "string" ? result.tool_choice : "object";
+    console.warn(`[muse-spark] Neutralizing unsupported tool_choice ${originalChoice} (upstream only supports "auto")`);
+    if (result.tool_choice === "none") {
+      delete result.tool_choice;
+      delete result.tools;
+    } else {
+      result.tool_choice = "auto";
     }
   }
 

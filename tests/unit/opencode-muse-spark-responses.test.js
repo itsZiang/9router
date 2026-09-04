@@ -7,6 +7,7 @@ import { isMuseSparkModel } from "../../open-sse/providers/models/helpers.js";
 import { getCapabilitiesForModel } from "../../open-sse/providers/capabilities.js";
 import { resolveChatCoreTargetFormat } from "../../open-sse/handlers/chatCore/targetFormat.js";
 import { OpencodeExecutor } from "../../open-sse/executors/opencode.js";
+import { openaiToOpenAIResponsesRequest } from "../../open-sse/translator/request/openai-responses.js";
 
 const MODELS = [
   "muse-spark-1.2-contributor-free",
@@ -75,5 +76,53 @@ describe("opencode muse-spark responses routing", () => {
         maxOutput: 131072,
       });
     }
+  });
+});
+
+describe("muse-spark tool_choice sanitize (upstream only supports auto)", () => {
+  const baseBody = {
+    messages: [{ role: "user", content: "hi" }],
+    tools: [{ type: "function", function: { name: "read", description: "read", parameters: { type: "object", properties: {} } } }],
+  };
+  const MODEL = MODELS[1];
+
+  it('tool_choice "none" strips tools + tool_choice (compaction/summarization turns)', () => {
+    const out = openaiToOpenAIResponsesRequest(MODEL, { ...baseBody, tool_choice: "none" }, true, null);
+    expect(out.tool_choice).toBeUndefined();
+    expect(out.tools).toBeUndefined();
+  });
+
+  it('tool_choice "required" degrades to "auto" and keeps tools', () => {
+    const out = openaiToOpenAIResponsesRequest(MODEL, { ...baseBody, tool_choice: "required" }, true, null);
+    expect(out.tool_choice).toBe("auto");
+    expect(out.tools).toHaveLength(1);
+  });
+
+  it("named function choice degrades to auto (Responses {type,name} shape)", () => {
+    const out = openaiToOpenAIResponsesRequest(
+      MODEL,
+      { ...baseBody, tool_choice: { type: "function", function: { name: "read" } } },
+      true,
+      null
+    );
+    expect(out.tool_choice).toBe("auto");
+    expect(out.tools).toHaveLength(1);
+  });
+
+  it('tool_choice "auto" and absent pass through untouched', () => {
+    const autoOut = openaiToOpenAIResponsesRequest(MODEL, { ...baseBody, tool_choice: "auto" }, true, null);
+    expect(autoOut.tool_choice).toBe("auto");
+    expect(autoOut.tools).toHaveLength(1);
+    const absentOut = openaiToOpenAIResponsesRequest(MODEL, { ...baseBody }, true, null);
+    expect(absentOut.tool_choice).toBeUndefined();
+    expect(absentOut.tools).toHaveLength(1);
+  });
+
+  it("non-muse-spark models are not touched (no blast radius)", () => {
+    const out = openaiToOpenAIResponsesRequest("big-pickle", { ...baseBody, tool_choice: "none" }, true, null);
+    expect(out.tool_choice).toBe("none");
+    expect(out.tools).toHaveLength(1);
+    const requiredOut = openaiToOpenAIResponsesRequest("big-pickle", { ...baseBody, tool_choice: "required" }, true, null);
+    expect(requiredOut.tool_choice).toBe("required");
   });
 });
