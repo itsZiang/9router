@@ -9,6 +9,7 @@ import { OAUTH_PROVIDERS, APIKEY_PROVIDERS, FREE_PROVIDERS, FREE_TIER_PROVIDERS,
 import { getModelsByProviderId, getModelKind } from "@/shared/constants/models";
 import { useCopyToClipboard } from "@/shared/hooks/useCopyToClipboard";
 import { useModelCaps } from "@/shared/hooks/useModelCaps";
+import { useNotificationStore } from "@/store/notificationStore";
 import { translate } from "@/i18n/runtime";
 import { fetchSuggestedModels } from "@/shared/utils/providerModelsFetcher";
 import { getProviderCustomModelRows } from "@/shared/utils/providerCustomModels";
@@ -80,6 +81,9 @@ export default function ProviderDetailPage() {
   const [oneByOneSummary, setOneByOneSummary] = useState(null);
   const stopOneByOneRef = useRef(false);
   const [importingQoderModels, setImportingQoderModels] = useState(false);
+  const [copyingConnectionId, setCopyingConnectionId] = useState(null);
+  const notifyError = useNotificationStore((s) => s.error);
+  const secretCacheRef = useRef(new Map());
   const { copied, copy } = useCopyToClipboard();
 
   const AG_RISK_STORAGE_KEY = "ag_risk_confirmed";
@@ -767,6 +771,45 @@ export default function ProviderDetailPage() {
     }
   };
 
+  const prefetchApiKey = (connId) => {
+    // Hover-prefetch so click-to-copy feels instant. Short TTL cache, single user.
+    const cached = secretCacheRef.current.get(connId);
+    if (cached && Date.now() < cached.expiresAt) return;
+    fetch(`/api/providers/${connId}/secret`, { cache: "no-store" })
+      .then((res) => res.json().catch(() => null))
+      .then((data) => {
+        if (data?.apiKey) {
+          secretCacheRef.current.set(connId, { apiKey: data.apiKey, expiresAt: Date.now() + 15000 });
+        }
+      })
+      .catch(() => {});
+  };
+
+  const handleCopyApiKey = async (connId) => {
+    if (copyingConnectionId) return;
+    setCopyingConnectionId(connId);
+    try {
+      const cached = secretCacheRef.current.get(connId);
+      let apiKey = cached && Date.now() < cached.expiresAt ? cached.apiKey : null;
+      if (!apiKey) {
+        const res = await fetch(`/api/providers/${connId}/secret`, { cache: "no-store" });
+        const data = await res.json().catch(() => null);
+        if (!res.ok || !data?.apiKey) {
+          notifyError(data?.error || "Failed to copy API key", "Copy failed");
+          return;
+        }
+        apiKey = data.apiKey;
+        secretCacheRef.current.set(connId, { apiKey, expiresAt: Date.now() + 15000 });
+      }
+      copy(apiKey, `apikey-${connId}`);
+    } catch (error) {
+      console.log("Error copying API key:", error);
+      notifyError("Failed to copy API key", "Copy failed");
+    } finally {
+      setCopyingConnectionId(null);
+    }
+  };
+
   const handleOAuthSuccess = () => {
     fetchConnections();
     setShowOAuthModal(false);
@@ -1011,6 +1054,10 @@ export default function ProviderDetailPage() {
                   setShowEditModal(true);
                 }}
                 onPushToPool={() => handlePushToPool(conn.id)}
+                onCopyApiKey={() => handleCopyApiKey(conn.id)}
+                copyingApiKey={copyingConnectionId === conn.id}
+                justCopiedApiKey={copied === `apikey-${conn.id}`}
+                onPrefetchApiKey={() => prefetchApiKey(conn.id)}
                 onDelete={() => handleDelete(conn.id)}
                 oneByOneStatus={oneByOneResults[conn.id] || null}
               />
@@ -1826,6 +1873,9 @@ export default function ProviderDetailPage() {
         proxyPools={proxyPools}
         onSave={handleUpdateConnection}
         onClose={() => setShowEditModal(false)}
+        onCopyApiKey={selectedConnection?.id ? () => handleCopyApiKey(selectedConnection.id) : undefined}
+        copyingApiKey={selectedConnection?.id ? copyingConnectionId === selectedConnection.id : false}
+        justCopiedApiKey={selectedConnection?.id ? copied === `apikey-${selectedConnection.id}` : false}
       />
       {isCompatible && (
         <EditCompatibleNodeModal

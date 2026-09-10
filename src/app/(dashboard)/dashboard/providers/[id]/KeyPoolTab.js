@@ -1,8 +1,20 @@
 "use client";
 
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useCallback, useRef } from "react";
 import { Button, Toggle } from "@/shared/components";
+import { useNotificationStore } from "@/store/notificationStore";
 import AddToPoolModal from "./AddToPoolModal";
+
+const SECRET_TTL_MS = 15000;
+
+// Module-scope helpers (outside component) for the hover-prefetch cache.
+function isFreshEntry(entry) {
+  return !!entry && Date.now() < entry.expiresAt;
+}
+
+function freshEntry(key) {
+  return { key, expiresAt: Date.now() + SECRET_TTL_MS };
+}
 
 export default function KeyPoolTab({ provider, onPullDone }) {
   const [poolData, setPoolData] = useState({ keys: [], count: 0, page: 1, totalPages: 1, poolSize: 30, autoReplace: true });
@@ -12,6 +24,10 @@ export default function KeyPoolTab({ provider, onPullDone }) {
   const [pullResult, setPullResult] = useState(null);
   const [showAddModal, setShowAddModal] = useState(false);
   const [deletingKey, setDeletingKey] = useState(null);
+  const [copyingKeyId, setCopyingKeyId] = useState(null);
+  const [copiedKeyId, setCopiedKeyId] = useState(null);
+  const notifyError = useNotificationStore((s) => s.error);
+  const poolSecretCacheRef = useRef(new Map());
   const [page, setPage] = useState(1);
 
   const fetchPool = useCallback(async (p = page) => {
@@ -58,6 +74,55 @@ export default function KeyPoolTab({ provider, onPullDone }) {
       await fetchPool(page);
     } finally {
       setDeletingKey(null);
+    }
+  }
+
+  const prefetchPoolKey = (id) => {
+    if (isFreshEntry(poolSecretCacheRef.current.get(id))) return;
+    fetch(`/api/providers/${provider}/pool/${id}/secret`, { cache: "no-store" })
+      .then((res) => res.json().catch(() => null))
+      .then((data) => {
+        if (data?.key) {
+          poolSecretCacheRef.current.set(id, freshEntry(data.key));
+        }
+      })
+      .catch(() => {});
+  }
+
+  const handleCopyKey = async (id) => {
+    if (copyingKeyId) return;
+    setCopyingKeyId(id);
+    try {
+      const cached = poolSecretCacheRef.current.get(id);
+      let key = isFreshEntry(cached) ? cached.key : null;
+      if (!key) {
+        const res = await fetch(`/api/providers/${provider}/pool/${id}/secret`, { cache: "no-store" });
+        const data = await res.json().catch(() => null);
+        if (!res.ok || !data?.key) {
+          notifyError(data?.error || "Failed to copy key", "Copy failed");
+          return;
+        }
+        key = data.key;
+        poolSecretCacheRef.current.set(id, freshEntry(key));
+      }
+      if (navigator?.clipboard?.writeText) {
+        await navigator.clipboard.writeText(key);
+      } else {
+        const textarea = document.createElement("textarea");
+        textarea.value = key;
+        textarea.style.position = "fixed";
+        textarea.style.opacity = "0";
+        document.body.appendChild(textarea);
+        textarea.select();
+        document.execCommand("copy");
+        document.body.removeChild(textarea);
+      }
+      setCopiedKeyId(id);
+      setTimeout(() => setCopiedKeyId((prev) => (prev === id ? null : prev)), 2000);
+    } catch {
+      notifyError("Failed to copy key", "Copy failed");
+    } finally {
+      setCopyingKeyId(null);
     }
   }
 
@@ -152,14 +217,29 @@ export default function KeyPoolTab({ provider, onPullDone }) {
                     <td className="px-4 py-2 text-text-muted">{k.name || <span className="text-text-muted/50 italic">—</span>}</td>
                     <td className="px-4 py-2 font-mono text-xs text-text-muted">{k.key}</td>
                     <td className="px-4 py-2 text-right">
-                      <button
-                        className="text-red-500 hover:text-red-400 transition-colors disabled:opacity-40"
-                        onClick={() => handleDeleteKey(k.id)}
-                        disabled={deletingKey === k.id}
-                        title="Remove from pool"
-                      >
-                        <span className="material-symbols-outlined text-base">close</span>
-                      </button>
+                      <span className="inline-flex items-center gap-2">
+                        <button
+                          className={`transition-colors disabled:opacity-40 ${copiedKeyId === k.id ? "text-green-600 dark:text-green-400" : "text-text-muted hover:text-primary"}`}
+                          onClick={() => handleCopyKey(k.id)}
+                          onMouseEnter={() => prefetchPoolKey(k.id)}
+                          onFocus={() => prefetchPoolKey(k.id)}
+                          disabled={copyingKeyId === k.id}
+                          title={copiedKeyId === k.id ? "Copied!" : copyingKeyId === k.id ? "Copying..." : "Copy full key to clipboard"}
+                          aria-live="polite"
+                        >
+                          <span className={`material-symbols-outlined text-base ${copyingKeyId === k.id ? "animate-spin" : ""}`}>
+                            {copyingKeyId === k.id ? "progress_activity" : copiedKeyId === k.id ? "check" : "content_copy"}
+                          </span>
+                        </button>
+                        <button
+                          className="text-red-500 hover:text-red-400 transition-colors disabled:opacity-40"
+                          onClick={() => handleDeleteKey(k.id)}
+                          disabled={deletingKey === k.id}
+                          title="Remove from pool"
+                        >
+                          <span className="material-symbols-outlined text-base">close</span>
+                        </button>
+                      </span>
                     </td>
                   </tr>
                 ))}

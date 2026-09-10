@@ -202,6 +202,7 @@ export async function handleChatCore({
   clientRawRequest,
   connectionId,
   apiKeyInfo = null,
+  apiKey = null,
   userAgent,
   comboName,
   comboStrategy = null,
@@ -218,6 +219,22 @@ export async function handleChatCore({
     model,
     extendedContext
   } = modelInfo;
+  // Normalize client API-key attribution: callers may pass raw `apiKey` string
+  // (legacy, e.g. src/sse/handlers/chat.js) and/or `apiKeyInfo` object.
+  // usageHistory.apiKey stores the RAW key so getUsageStats can look up the name
+  // via apiKeys table. Without this, every row becomes "Local (No API Key)".
+  {
+    const rawFromString = typeof apiKey === "string" && apiKey.length > 0 ? apiKey : null;
+    const rawFromInfo = typeof apiKeyInfo === "string" ? apiKeyInfo : (apiKeyInfo?.key || null);
+    const apiKeyRaw = rawFromString || rawFromInfo;
+    if (apiKeyRaw) {
+      if (!apiKeyInfo || typeof apiKeyInfo === "string") {
+        apiKeyInfo = { id: null, name: null, key: apiKeyRaw };
+      } else if (!apiKeyInfo.key) {
+        apiKeyInfo = { ...apiKeyInfo, key: apiKeyRaw };
+      }
+    }
+  }
   // ── Memory pressure guard ────────────────────────────────────────────
   // Reject early if V8 heap is already near the 256MB limit. Prevents
   // cascading OOM when many large-context requests arrive concurrently.
@@ -317,6 +334,7 @@ export async function handleChatCore({
       model,
       connectionId: getCurrentConnectionId(),
       apiKeyInfo,
+      apiKey: apiKeyInfo?.key || (typeof apiKey === "string" ? apiKey : undefined),
       effectiveServiceTier,
       isCombo,
       comboStrategy,
@@ -507,6 +525,11 @@ export async function handleChatCore({
     stage: "registered",
     correlationId
   }) || generateRequestId();
+  // Single clear-pending helper capturing the exact key used at registration
+  // (pendingConnId). Every terminal branch must use this — never bare
+  // `connectionId` — or the decrement misses its bucket and the Usage topology
+  // keeps a stuck "active" edge until the 60s safety timer zeroes it.
+  const clearPendingRequest = () => trackPendingRequest(model, provider, pendingConnId, false);
 
   // Initialize rate limit settings from persisted DB (once, lazy)
   await initializeRateLimits();
@@ -673,7 +696,7 @@ export async function handleChatCore({
     stream: !!stream,
     reqLogger,
     effectiveServiceTier,
-    connectionId,
+    connectionId: pendingConnId,
     startTime,
     log,
     persistAttemptLogs,
@@ -1421,7 +1444,7 @@ export async function handleChatCore({
     const errorType = typeof error?.errorType === "string" ? error.errorType : null;
     log?.warn?.("TRANSLATE", `Request translation failed: ${message}`);
     if (errorType) {
-      trackPendingRequest(model, provider, connectionId, false);
+      clearPendingRequest();
       return {
         success: false,
         status: statusCode,
@@ -1440,7 +1463,7 @@ export async function handleChatCore({
         })
       };
     }
-    trackPendingRequest(model, provider, connectionId, false);
+    clearPendingRequest();
     return createErrorResult(statusCode, message);
   }
   trace("post_translation");
@@ -2165,7 +2188,7 @@ export async function handleChatCore({
         const scopeLabel = tokenBreach.scopeType === "global" ? "account" : `${tokenBreach.scopeType} "${tokenBreach.scopeValue}"`;
         // FIX 6: clear the pending request marker before the early return so we do
         // not leak a phantom pending request (start was tracked at line ~1847).
-        trackPendingRequest(model, provider, connectionId, false);
+        clearPendingRequest();
         // FIX 5: tag this as a per-API-key token-limit breach (errorCode
         // TOKEN_LIMIT_EXCEEDED) so the combo loop can distinguish it from an
         // upstream 429 and NOT cool shared accounts / retry it transiently.
@@ -2216,7 +2239,7 @@ export async function handleChatCore({
       // fail-open: saturation signal is best-effort
     }
   } catch (error) {
-    trackPendingRequest(model, provider, connectionId, false);
+    clearPendingRequest();
     if (isSemaphoreCapacityError(error)) {
       appendRequestLog({
         model,
@@ -2447,7 +2470,7 @@ export async function handleChatCore({
 
   // Check provider response - return error info for fallback handling
   if (!providerResponse.ok) {
-    trackPendingRequest(model, provider, connectionId, false);
+    clearPendingRequest();
     let statusCode = providerResponse.status;
     let message = "";
     let retryAfterMs = null;
@@ -2773,7 +2796,7 @@ export async function handleChatCore({
         cacheSource: "upstream"
       });
       persistFailureUsage(HTTP_STATUS.BAD_GATEWAY, "invalid_sse_payload");
-      trackPendingRequest(model, provider, pendingConnId, false);
+      clearPendingRequest();
       return createErrorResult(HTTP_STATUS.BAD_GATEWAY, invalidSseMessage);
     }
     if (parsed.kind === "invalid_json") {
@@ -2794,7 +2817,7 @@ export async function handleChatCore({
         cacheSource: "upstream"
       });
       persistFailureUsage(HTTP_STATUS.BAD_GATEWAY, "invalid_json_payload");
-      trackPendingRequest(model, provider, connectionId, false);
+      clearPendingRequest();
       return createErrorResult(HTTP_STATUS.BAD_GATEWAY, invalidJsonMessage);
     }
     let responseBody = parsed.responseBody;
@@ -2843,19 +2866,19 @@ export async function handleChatCore({
               log?.info?.("EMPTY_CONTENT_FALLBACK", `Serving ${nextModel} as fallback for ${model}`);
               // Fall through — continue processing with the new responseBody
             } catch {
-              trackPendingRequest(model, provider, connectionId, false);
+              clearPendingRequest();
               return createErrorResult(HTTP_STATUS.BAD_GATEWAY, emptyContentMessage);
             }
           } else {
-            trackPendingRequest(model, provider, connectionId, false);
+            clearPendingRequest();
             return createErrorResult(HTTP_STATUS.BAD_GATEWAY, emptyContentMessage);
           }
         } catch {
-          trackPendingRequest(model, provider, connectionId, false);
+          clearPendingRequest();
           return createErrorResult(HTTP_STATUS.BAD_GATEWAY, emptyContentMessage);
         }
       } else {
-        trackPendingRequest(model, provider, connectionId, false);
+        clearPendingRequest();
         return createErrorResult(HTTP_STATUS.BAD_GATEWAY, emptyContentMessage);
       }
     }
@@ -3121,7 +3144,7 @@ export async function handleChatCore({
         cacheSource: "upstream"
       });
       persistFailureUsage(HTTP_STATUS.BAD_GATEWAY, "malformed_translated_response");
-      trackPendingRequest(model, provider, pendingConnId, false);
+      clearPendingRequest();
       return createErrorResult(HTTP_STATUS.BAD_GATEWAY, malformedMessage);
     }
 
@@ -3153,6 +3176,10 @@ export async function handleChatCore({
       comboStrategy,
       endpoint: endpointPath
     });
+    // Clear the pending marker registered at request start (same pendingConnId
+    // key). This was missing on the non-streaming success path, leaving a
+    // phantom "active" entry on the Usage topology until the 60s safety timer.
+    clearPendingRequest();
 
     // ── Phase 9.2: Save for idempotency ──
     // Reuse the key resolved by checkIdempotencyCache() above (single derivation per
@@ -3257,7 +3284,7 @@ export async function handleChatCore({
       code: streamReadiness.code,
       type: streamReadiness.type
     };
-    trackPendingRequest(model, provider, connectionId, false);
+    clearPendingRequest();
     appendRequestLog({
       model,
       provider,

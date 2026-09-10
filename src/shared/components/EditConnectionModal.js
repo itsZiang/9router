@@ -8,7 +8,7 @@ import Button from "@/shared/components/Button";
 import Badge from "@/shared/components/Badge";
 import { isOpenAICompatibleProvider, isAnthropicCompatibleProvider } from "@/shared/constants/providers";
 
-export default function EditConnectionModal({ isOpen, connection, proxyPools, onSave, onClose }) {
+export default function EditConnectionModal({ isOpen, connection, proxyPools, onSave, onClose, onCopyApiKey, copyingApiKey = false, justCopiedApiKey = false }) {
   const [formData, setFormData] = useState({
     name: "",
     priority: 1,
@@ -183,6 +183,21 @@ export default function EditConnectionModal({ isOpen, connection, proxyPools, on
 
         {!isOAuth && (
           <>
+            {connection?.authType === "apikey" && onCopyApiKey && (
+              <div className="flex items-center justify-between rounded-lg border border-border bg-black/[0.02] px-3 py-2 dark:bg-white/[0.02]">
+                <span className="text-xs text-text-muted">Current key is hidden. Click to copy it without displaying.</span>
+                <Button
+                  onClick={onCopyApiKey}
+                  disabled={copyingApiKey || saving}
+                  variant={justCopiedApiKey ? "success" : "secondary"}
+                  size="sm"
+                  icon={copyingApiKey ? undefined : justCopiedApiKey ? "check" : "content_copy"}
+                  loading={copyingApiKey}
+                >
+                  {copyingApiKey ? "Copying..." : justCopiedApiKey ? "Copied" : "Copy current key"}
+                </Button>
+              </div>
+            )}
             <div className="flex gap-2">
               <Input
                 label="API Key"
@@ -282,5 +297,8 @@ EditConnectionModal.propTypes = {
   })),
   onSave: PropTypes.func.isRequired,
   onClose: PropTypes.func.isRequired,
+  onCopyApiKey: PropTypes.func,
+  copyingApiKey: PropTypes.bool,
+  justCopiedApiKey: PropTypes.bool,
 };
 

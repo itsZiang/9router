@@ -26,6 +26,7 @@ export function buildFailureUsageRecord(opts) {
     errorCode: opts.errorCode || String(opts.statusCode),
     timestamp: new Date().toISOString(),
     connectionId: opts.connectionId || undefined,
+    apiKey: opts.apiKey || opts.apiKeyInfo?.key || undefined,
     apiKeyId: opts.apiKeyInfo?.id || undefined,
     apiKeyName: opts.apiKeyInfo?.name || undefined,
     serviceTier: opts.effectiveServiceTier,

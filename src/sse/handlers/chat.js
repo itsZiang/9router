@@ -7,6 +7,7 @@ import {
   extractApiKey,
   isValidApiKey,
   checkModelScopeAllowed,
+  getApiKeyRecord,
 } from "../services/auth.js";
 import { cacheClaudeHeaders } from "open-sse/utils/claudeHeaderCache.js";
 import { getSettings } from "@/lib/localDb";
@@ -94,7 +95,20 @@ export async function handleChat(request, clientRawRequest = null) {
   // exists in both tables always resolves to the authorized combo.
   let authorizedComboModels = null;
   let authorizedComboResolved = false;
+  let apiKeyInfo = null;
   if (apiKey) {
+    try {
+      const record = await getApiKeyRecord(apiKey);
+      if (record) {
+        apiKeyInfo = { id: record.id, name: record.name, key: record.key, scope: record.scope };
+      } else {
+        // Key present but not found (e.g. requireApiKey=false local mode):
+        // keep raw key so usage can still be attributed by prefix.
+        apiKeyInfo = { id: null, name: null, key: apiKey };
+      }
+    } catch {
+      apiKeyInfo = { id: null, name: null, key: apiKey };
+    }
     const scopeCheck = await checkModelScopeAllowed(apiKey, modelStr, request);
     if (!scopeCheck.allowed) {
       // Do not disclose whether the model exists in another scope. Expose
@@ -132,7 +146,7 @@ export async function handleChat(request, clientRawRequest = null) {
             const { tools, tool_choice, ...cleanBody } = clientRawRequest.body || {};
             cleanRawReq = { ...clientRawRequest, body: cleanBody };
           }
-          return handleSingleModelChat(b, m, cleanRawReq, request, apiKey);
+          return handleSingleModelChat(b, m, cleanRawReq, request, apiKey, apiKeyInfo);
         },
         log,
         comboName: modelStr,
@@ -146,7 +160,7 @@ export async function handleChat(request, clientRawRequest = null) {
     return handleComboChat({
       body,
       models: comboModels,
-      handleSingleModel: (b, m) => handleSingleModelChat(b, m, clientRawRequest, request, apiKey),
+      handleSingleModel: (b, m) => handleSingleModelChat(b, m, clientRawRequest, request, apiKey, apiKeyInfo),
       log,
       comboName: modelStr,
       comboStrategy,
@@ -155,13 +169,24 @@ export async function handleChat(request, clientRawRequest = null) {
   }
 
   // Single model request
-  return handleSingleModelChat(body, modelStr, clientRawRequest, request, apiKey);
+  return handleSingleModelChat(body, modelStr, clientRawRequest, request, apiKey, apiKeyInfo);
 }
 
 /**
  * Handle single model chat request
  */
-async function handleSingleModelChat(body, modelStr, clientRawRequest = null, request = null, apiKey = null) {
+async function handleSingleModelChat(body, modelStr, clientRawRequest = null, request = null, apiKey = null, apiKeyInfo = null) {
+  // Resolve apiKeyInfo lazily when called without it (e.g. nested combo recursion
+  // passes raw key only). Ensures usage attribution even if outer caller forgot.
+  if (apiKey && !apiKeyInfo) {
+    try {
+      const { getApiKeyRecord: _getRecord } = await import("../services/auth.js");
+      const rec = await _getRecord(apiKey);
+      apiKeyInfo = rec ? { id: rec.id, name: rec.name, key: rec.key, scope: rec.scope } : { id: null, name: null, key: apiKey };
+    } catch {
+      apiKeyInfo = { id: null, name: null, key: apiKey };
+    }
+  }
   const modelInfo = await getModelInfo(modelStr);
 
   // Check for combo when provider is null OR when model has no explicit provider prefix.
@@ -187,7 +212,7 @@ async function handleSingleModelChat(body, modelStr, clientRawRequest = null, re
               const { tools, tool_choice, ...cleanBody } = clientRawRequest.body || {};
               cleanRawReq = { ...clientRawRequest, body: cleanBody };
             }
-            return handleSingleModelChat(b, m, cleanRawReq, request, apiKey);
+            return handleSingleModelChat(b, m, cleanRawReq, request, apiKey, apiKeyInfo);
           },
           log,
           comboName: modelStr,
@@ -201,7 +226,7 @@ async function handleSingleModelChat(body, modelStr, clientRawRequest = null, re
       return handleComboChat({
         body,
         models: comboModels,
-        handleSingleModel: (b, m) => handleSingleModelChat(b, m, clientRawRequest, request, apiKey),
+        handleSingleModel: (b, m) => handleSingleModelChat(b, m, clientRawRequest, request, apiKey, apiKeyInfo),
         log,
         comboName: modelStr,
         comboStrategy,
@@ -295,6 +320,7 @@ async function handleSingleModelChat(body, modelStr, clientRawRequest = null, re
       connectionId: credentials.connectionId,
       userAgent,
       apiKey,
+      apiKeyInfo,
       requestSignal: request?.signal,
       ccFilterNaming: !!chatSettings.ccFilterNaming,
       rtkEnabled: !!chatSettings.rtkEnabled,

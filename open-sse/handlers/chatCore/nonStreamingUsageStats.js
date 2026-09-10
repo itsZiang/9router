@@ -42,6 +42,7 @@ function persistUsageRow(usage, ctx) {
     errorCode: null,
     timestamp: new Date().toISOString(),
     connectionId: connectionId || undefined,
+    apiKey: ctx.apiKey || apiKeyInfo?.key || undefined,
     apiKeyId: apiKeyInfo?.id || undefined,
     apiKeyName: apiKeyInfo?.name || undefined,
     serviceTier: effectiveServiceTier,

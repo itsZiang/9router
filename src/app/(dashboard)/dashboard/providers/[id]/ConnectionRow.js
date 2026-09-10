@@ -6,7 +6,7 @@ import PropTypes from "prop-types";
 import { Badge, Toggle, Tooltip } from "@/shared/components";
 import CooldownTimer from "./CooldownTimer";
 
-export default function ConnectionRow({ connection, proxyPools, isOAuth, isFirst, isLast, onMoveUp, onMoveDown, onToggleActive, onUpdateProxy, onEdit, onDelete, onPushToPool, oneByOneStatus = null, autoPing = null }) {
+export default function ConnectionRow({ connection, proxyPools, isOAuth, isFirst, isLast, onMoveUp, onMoveDown, onToggleActive, onUpdateProxy, onEdit, onDelete, onPushToPool, onCopyApiKey, copyingApiKey = false, justCopiedApiKey = false, onPrefetchApiKey, oneByOneStatus = null, autoPing = null }) {
   const [showProxyDropdown, setShowProxyDropdown] = useState(false);
   const [updatingProxy, setUpdatingProxy] = useState(false);
   const proxyDropdownRef = useRef(null);
@@ -261,6 +261,22 @@ export default function ConnectionRow({ connection, proxyPools, isOAuth, isFirst
             <span className="material-symbols-outlined text-[18px]">edit</span>
             <span className="text-[10px] leading-tight">Edit</span>
           </button>
+          {rowAuthType === "apikey" && onCopyApiKey && (
+            <button
+              onClick={onCopyApiKey}
+              onMouseEnter={onPrefetchApiKey}
+              onFocus={onPrefetchApiKey}
+              disabled={copyingApiKey}
+              className={`flex min-w-[56px] flex-col items-center rounded px-2 py-1 transition-colors disabled:opacity-40 dark:hover:bg-white/5 hover:bg-black/5 ${justCopiedApiKey ? "text-green-600 dark:text-green-400" : "text-text-muted hover:text-primary"}`}
+              title={justCopiedApiKey ? "Copied!" : copyingApiKey ? "Copying..." : "Copy API key to clipboard"}
+              aria-live="polite"
+            >
+              <span className={`material-symbols-outlined text-[18px] ${copyingApiKey ? "animate-spin" : ""}`}>
+                {copyingApiKey ? "progress_activity" : justCopiedApiKey ? "check" : "content_copy"}
+              </span>
+              <span className="text-[10px] leading-tight">{copyingApiKey ? "Copying..." : justCopiedApiKey ? "Copied" : "Copy key"}</span>
+            </button>
+          )}
           {rowAuthType === "apikey" && onPushToPool && (
             <button onClick={onPushToPool} className="flex flex-col items-center rounded px-2 py-1 text-text-muted hover:bg-black/5 hover:text-primary dark:hover:bg-white/5" title="Move API key back into key pool reserve">
               <span className="material-symbols-outlined text-[18px]">upload</span>
@@ -313,6 +329,10 @@ ConnectionRow.propTypes = {
   onEdit: PropTypes.func.isRequired,
   onDelete: PropTypes.func.isRequired,
   onPushToPool: PropTypes.func,
+  onCopyApiKey: PropTypes.func,
+  copyingApiKey: PropTypes.bool,
+  justCopiedApiKey: PropTypes.bool,
+  onPrefetchApiKey: PropTypes.func,
   oneByOneStatus: PropTypes.shape({
     state: PropTypes.string,
     error: PropTypes.string,

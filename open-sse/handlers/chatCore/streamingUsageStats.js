@@ -33,6 +33,7 @@ function persistStreamingUsageRow(usage, ctx) {
     errorCode: streamStatus === 200 ? null : streamErrorCode || String(streamStatus),
     timestamp: new Date().toISOString(),
     connectionId: ctx.connectionId || undefined,
+    apiKey: ctx.apiKey || ctx.apiKeyInfo?.key || undefined,
     apiKeyId: ctx.apiKeyInfo?.id || undefined,
     apiKeyName: ctx.apiKeyInfo?.name || undefined,
     serviceTier: ctx.effectiveServiceTier,

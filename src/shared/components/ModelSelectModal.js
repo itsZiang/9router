@@ -7,6 +7,7 @@ import ProviderIcon from "./ProviderIcon";
 import CapacityBadges from "./CapacityBadges";
 import { useModelCaps } from "@/shared/hooks/useModelCaps";
 import { getModelsByProviderId, getModelKind } from "@/shared/constants/models";
+import { filterGroupedModels } from "@/shared/utils/modelSearch";
 import { OAUTH_PROVIDERS, APIKEY_PROVIDERS, FREE_PROVIDERS, FREE_TIER_PROVIDERS, AI_PROVIDERS, isOpenAICompatibleProvider, isAnthropicCompatibleProvider, getProviderAlias } from "@/shared/constants/providers";
 
 // Provider order: OAuth first, then Free Tier, then API Key (matches dashboard/providers)
@@ -410,36 +411,13 @@ export default function ModelSelectModal({
     return combos.filter(c => c.name.toLowerCase().includes(query));
   }, [combos, searchQuery, kindFilter]);
 
-  // Sort models alphabetically, with added models floated to top
-  const sortModels = (models) => {
-    const added = models.filter(m => addedModelValues.includes(m.value)).sort((a, b) => a.name.localeCompare(b.name));
-    const rest = models.filter(m => !addedModelValues.includes(m.value)).sort((a, b) => a.name.localeCompare(b.name));
-    return [...added, ...rest];
-  };
-
-  // Filter models by search query
+  // Filter + rank models by search query (generic token-AND + separator-tolerant
+  // matching across id/name/value/provider; see @/shared/utils/modelSearch).
+  // Exact matches rank first, fuzzy (normalized) suggestions after.
+  // Provider scoping works via text: "inferx flash" only keeps inferx models
+  // containing "flash". Groups with zero matching models are dropped.
   const filteredGroups = useMemo(() => {
-    const query = searchQuery.trim().toLowerCase();
-
-    const filtered = {};
-    Object.entries(groupedModels).forEach(([providerId, group]) => {
-      let models = group.models;
-      if (query) {
-        const providerNameMatches = group.name.toLowerCase().includes(query);
-        models = models.filter(
-          (m) =>
-            m.name.toLowerCase().includes(query) ||
-            m.id.toLowerCase().includes(query)
-        );
-        if (models.length === 0 && !providerNameMatches) return;
-      }
-      filtered[providerId] = {
-        ...group,
-        models: sortModels(models),
-      };
-    });
-
-    return filtered;
+    return filterGroupedModels(groupedModels, searchQuery, { addedValues: addedModelValues });
   }, [groupedModels, searchQuery, addedModelValues]);
 
   const handleSelect = (model) => {

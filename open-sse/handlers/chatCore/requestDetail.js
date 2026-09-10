@@ -84,11 +84,13 @@ export function buildRequestDetail(base, overrides = {}) {
   };
 }
 
-export function saveUsageStats({ provider, model, tokens, connectionId, apiKey, endpoint, label = "USAGE" }) {
+export function saveUsageStats({ provider, model, tokens, connectionId, apiKey, apiKeyInfo, endpoint, label = "USAGE" }) {
   if (!tokens || typeof tokens !== "object") {
     console.log(`[${label}] SKIP: tokens is null or not an object`);
     return;
   }
+
+  const resolvedApiKey = apiKey || apiKeyInfo?.key || undefined;
 
   const inTokens = tokens.input_tokens ?? tokens.prompt_tokens ?? 0;
   const outTokens = tokens.output_tokens ?? tokens.completion_tokens ?? 0;
@@ -115,7 +117,7 @@ export function saveUsageStats({ provider, model, tokens, connectionId, apiKey, 
     tokens: normalized,
     timestamp: new Date().toISOString(),
     connectionId: connectionId || undefined,
-    apiKey: apiKey || undefined,
+    apiKey: resolvedApiKey,
     endpoint: endpoint || null
   }).catch((e) => {
     console.error(`[${label}] saveRequestUsage failed:`, e?.message || e);

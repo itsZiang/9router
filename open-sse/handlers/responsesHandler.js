@@ -32,6 +32,8 @@ export async function handleResponsesCore({
   onRequestSuccess,
   onDisconnect,
   connectionId,
+  apiKey = null,
+  apiKeyInfo = null,
   signal
 }) {
   // Convert Responses API format to Chat Completions format
@@ -51,6 +53,8 @@ export async function handleResponsesCore({
     onDisconnect,
     clientRawRequest: null,
     connectionId,
+    apiKey,
+    apiKeyInfo,
     userAgent: null,
     comboName: null
   });

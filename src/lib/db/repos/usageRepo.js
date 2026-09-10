@@ -85,8 +85,15 @@ function aggregateEntryToDay(day, entry) {
     addToCounter(day.byAccount, entry.connectionId, { ...vals, meta: { rawModel: entry.model, provider: entry.provider } });
   }
 
-  const apiKeyVal = entry.apiKey && typeof entry.apiKey === "string" ? entry.apiKey : "local-no-key";
-  const akModelKey = `${apiKeyVal}|${entry.model}|${entry.provider || "unknown"}`;
+  const apiKeyVal = entry.apiKey && typeof entry.apiKey === "string" ? entry.apiKey : null;
+  // NOTE: dict key uses MASKED key (never raw) so /api/usage/stats never leaks
+  // full client keys in JSON keys. Lookup still uses meta.apiKey (raw).
+  // No-key entries are split per model/provider (same as keyed entries) so
+  // Today/24h and 7d/30d group identically.
+  const apiKeyMaskedForKey = maskApiKey(apiKeyVal);
+  const akModelKey = apiKeyMaskedForKey
+    ? `${apiKeyMaskedForKey}|${entry.model}|${entry.provider || "unknown"}`
+    : `local-no-key|${entry.model}|${entry.provider || "unknown"}`;
   addToCounter(day.byApiKey, akModelKey, { ...vals, meta: { rawModel: entry.model, provider: entry.provider, apiKey: entry.apiKey || null } });
 
   const endpoint = entry.endpoint || "Unknown";
@@ -261,6 +268,13 @@ export async function saveRequestUsage(entry) {
     const db = await getAdapter();
 
     if (!entry.timestamp) entry.timestamp = new Date().toISOString();
+    // Defensive: callers historically sent apiKeyId/apiKeyName but not apiKey
+    // (usageHistory only has `apiKey` column). Recover raw key whenever possible
+    // so rows aren't misattributed to "Local (No API Key)".
+    if (!entry.apiKey || typeof entry.apiKey !== "string") {
+      const fallback = entry.apiKeyInfo?.key || entry.key || null;
+      if (typeof fallback === "string" && fallback.length > 0) entry.apiKey = fallback;
+    }
     entry.cost = await calculateCost(entry.provider, entry.model, entry.tokens);
 
     const tokens = entry.tokens || {};
@@ -522,14 +536,21 @@ export async function getUsageStats(period = "all") {
         const keyName = keyInfo?.name || (apiKeyVal ? apiKeyVal.slice(0, 8) + "..." : "Local (No API Key)");
         const apiKeyMasked = maskApiKey(apiKeyVal);
         const apiKeyKey = apiKeyMasked || "local-no-key";
-        if (!stats.byApiKey[akKey]) {
-          stats.byApiKey[akKey] = { requests: 0, promptTokens: 0, completionTokens: 0, cost: 0, rawModel, provider: providerDisplayName, apiKeyMasked, keyName, apiKeyKey, lastUsed: dateKey };
+        // Normalize output key to masked (handles old blobs that stored full raw
+        // keys, and unifies daily path with live 24h/today path).
+        const modelPart = rawModel || akKey.split("|")[1] || "";
+        const providerPart = provider || akKey.split("|")[2] || "unknown";
+        const outKey = apiKeyMasked
+          ? `${apiKeyMasked}|${modelPart}|${providerPart}`
+          : `local-no-key|${modelPart}|${providerPart}`;
+        if (!stats.byApiKey[outKey]) {
+          stats.byApiKey[outKey] = { requests: 0, promptTokens: 0, completionTokens: 0, cost: 0, rawModel, provider: providerDisplayName, apiKeyMasked, keyName, apiKeyKey, lastUsed: dateKey };
         }
-        stats.byApiKey[akKey].requests += ak.requests || 0;
-        stats.byApiKey[akKey].promptTokens += ak.promptTokens || 0;
-        stats.byApiKey[akKey].completionTokens += ak.completionTokens || 0;
-        stats.byApiKey[akKey].cost += ak.cost || 0;
-        if (dateKey > (stats.byApiKey[akKey].lastUsed || "")) stats.byApiKey[akKey].lastUsed = dateKey;
+        stats.byApiKey[outKey].requests += ak.requests || 0;
+        stats.byApiKey[outKey].promptTokens += ak.promptTokens || 0;
+        stats.byApiKey[outKey].completionTokens += ak.completionTokens || 0;
+        stats.byApiKey[outKey].cost += ak.cost || 0;
+        if (dateKey > (stats.byApiKey[outKey].lastUsed || "")) stats.byApiKey[outKey].lastUsed = dateKey;
       }
 
       for (const [epKey, ep] of Object.entries(day.byEndpoint || {})) {
@@ -565,9 +586,12 @@ export async function getUsageStats(period = "all") {
         if (stats.byAccount[accountKey] && new Date(ts) > new Date(stats.byAccount[accountKey].lastUsed)) stats.byAccount[accountKey].lastUsed = ts;
       }
 
-      const apiKeyKey = (e.apiKey && typeof e.apiKey === "string")
-        ? `${e.apiKey}|${e.model}|${e.provider || "unknown"}`
-        : "local-no-key";
+      const apiKeyMaskedForOverlay = (e.apiKey && typeof e.apiKey === "string")
+        ? maskApiKey(e.apiKey)
+        : null;
+      const apiKeyKey = apiKeyMaskedForOverlay
+        ? `${apiKeyMaskedForOverlay}|${e.model}|${e.provider || "unknown"}`
+        : `local-no-key|${e.model}|${e.provider || "unknown"}`;
       if (stats.byApiKey[apiKeyKey] && new Date(ts) > new Date(stats.byApiKey[apiKeyKey].lastUsed)) stats.byApiKey[apiKeyKey].lastUsed = ts;
 
       const endpoint = e.endpoint || "Unknown";
@@ -641,10 +665,13 @@ export async function getUsageStats(period = "all") {
         ake.requests++; ake.promptTokens += promptTokens; ake.completionTokens += completionTokens; ake.cost += entryCost;
         if (new Date(r.timestamp) > new Date(ake.lastUsed)) ake.lastUsed = r.timestamp;
       } else {
-        if (!stats.byApiKey["local-no-key"]) {
-          stats.byApiKey["local-no-key"] = { requests: 0, promptTokens: 0, completionTokens: 0, cost: 0, rawModel: r.model, provider: providerDisplayName, apiKeyMasked: null, keyName: "Local (No API Key)", apiKeyKey: "local-no-key", lastUsed: r.timestamp };
+        // No-key entries are split per model/provider (same as keyed entries)
+        // so Today/24h matches the daily-summary path grouping.
+        const noKeyOut = `local-no-key|${r.model}|${r.provider || "unknown"}`;
+        if (!stats.byApiKey[noKeyOut]) {
+          stats.byApiKey[noKeyOut] = { requests: 0, promptTokens: 0, completionTokens: 0, cost: 0, rawModel: r.model, provider: providerDisplayName, apiKeyMasked: null, keyName: "Local (No API Key)", apiKeyKey: "local-no-key", lastUsed: r.timestamp };
         }
-        const ake = stats.byApiKey["local-no-key"];
+        const ake = stats.byApiKey[noKeyOut];
         ake.requests++; ake.promptTokens += promptTokens; ake.completionTokens += completionTokens; ake.cost += entryCost;
         if (new Date(r.timestamp) > new Date(ake.lastUsed)) ake.lastUsed = r.timestamp;
       }
