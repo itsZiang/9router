@@ -3,7 +3,7 @@ import { PROVIDERS } from "../config/constants";
 import { getModelTargetFormat } from "../config/providerModels";
 import { injectReasoningContentForThinkingModel, isThinkingMessageModel } from "../utils/reasoningContentInjector";
 import { runWithProxyContext } from "../utils/proxyFetch";
-import { forwardOpencodeClientHeaders } from "../utils/opencodeHeaders";
+import { forwardOpencodeClientHeaders, applyOpencodeFakeFingerprint } from "../utils/opencodeHeaders";
 
 /**
  * Per-account proxy configuration, persisted by NoAuthAccountCard under
@@ -203,6 +203,10 @@ export class OpencodeExecutor extends BaseExecutor {
         synthesizeRequestId: true
       });
     }
+    // Zen free tier is UA-gated: spoof official CLI identity so
+    // `*-free` / muse-spark / nemotron models aren't rejected with
+    // "OpenCode's free tier can only be used in OpenCode".
+    applyOpencodeFakeFingerprint(headers, clientHeaders || null);
     void model;
     return headers;
   }

@@ -104,4 +104,27 @@ describe("createNormalizedStream premature EOF handling", () => {
 
     expect(output).toContain('"finish_reason":"stop"');
   });
+
+  it("errors instead of clean [DONE] when upstream sends zero bytes (no content, no finish_reason)", async () => {
+    const stream = makeStream([]);
+    const { output, error } = await readStream(stream);
+
+    // Safety net for direct-provider requests that bypass combo failover:
+    // a zero-byte close must surface as a retryable stream error, not a clean
+    // [DONE] that strict clients reject with "Stream ended without finish_reason".
+    expect(error).not.toBeNull();
+    expect(String(error?.message || error)).toContain("without content");
+    expect(output).not.toContain("data: [DONE]");
+  });
+
+  it("still completes cleanly for a finish_reason-only stream (terminated but empty)", async () => {
+    const stream = makeStream([
+      { id: "2", choices: [{ index: 0, delta: {}, finish_reason: "stop" }] },
+    ]);
+    const { output, error } = await readStream(stream);
+
+    expect(error).toBeNull();
+    expect(output).toContain('"finish_reason":"stop"');
+    expect(output).toContain("data: [DONE]");
+  });
 });

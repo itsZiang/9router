@@ -383,7 +383,7 @@ export function createNoopAbortWritable() {
  * Create transform stream with disconnect detection
  * Wraps existing transform stream and adds abort capability
  */
-export function createDisconnectAwareStream(transformStream, streamController) {
+export function createDisconnectAwareStream(transformStream, streamController, onAbortTerminal) {
   const reader = transformStream.readable.getReader();
   const writer = transformStream.writable.getWriter();
   const terminalDecoder = new TextDecoder();
@@ -441,13 +441,34 @@ export function createDisconnectAwareStream(transformStream, streamController) {
         // This prevents TransferEncodingError on the client side
         const errorMsg = getErrorMessage(error);
         const statusCode = getErrorStatusCode(error);
-        try {
-          for (const chunk of buildStreamErrorChunks(errorMsg, statusCode, streamController.clientResponseFormat)) {
-            controller.enqueue(chunk);
+
+        // Format-specific abort terminal (3-state):
+        // - function: enqueue its bytes (e.g. Responses `response.failed`).
+        //   The caller knows which terminal bytes its client parses.
+        // - null: close silently — for clients whose parser rejects any
+        //   synthetic terminal (Gemini family rejects [DONE] with a 400).
+        // - undefined (default): legacy generic error chunks. Unchanged.
+        if (typeof onAbortTerminal === "function") {
+          try {
+            const terminal = onAbortTerminal(error);
+            const chunks = Array.isArray(terminal) ? terminal : [terminal];
+            for (const chunk of chunks) {
+              if (chunk) controller.enqueue(chunk);
+            }
+          } catch {
+            // The downstream may have closed while emitting the terminal.
           }
-        } catch {
-          // The downstream may have closed while we were formatting the in-band
-          // error event. The original stream error has already been recorded.
+        } else if (onAbortTerminal === null) {
+          // Intentional silent close — no synthetic terminal.
+        } else {
+          try {
+            for (const chunk of buildStreamErrorChunks(errorMsg, statusCode, streamController.clientResponseFormat)) {
+              controller.enqueue(chunk);
+            }
+          } catch {
+            // The downstream may have closed while we were formatting the in-band
+            // error event. The original stream error has already been recorded.
+          }
         }
         try {
           controller.close();
@@ -487,7 +508,15 @@ export function createDisconnectAwareStream(transformStream, streamController) {
  *   the watchdog.
  */
 export function pipeWithDisconnect(providerResponse, transformStream, streamController, opts = {}) {
+  // Defensive: streamingHandler.js historically passed onAbortTerminal as a
+  // bare 4th positional arg. Normalize so a function never silently becomes
+  // the options bag (which previously dropped the callback AND the stall
+  // budget back to default without a trace).
+  if (typeof opts === "function") {
+    opts = { onAbortTerminal: opts };
+  }
   const stallTimeoutMs = opts.stallTimeoutMs ?? DEFAULT_STREAM_STALL_TIMEOUT_MS;
+  const onAbortTerminal = opts.onAbortTerminal;
 
   // Watchdog disabled — preserve legacy behavior verbatim.
   if (!stallTimeoutMs || stallTimeoutMs <= 0) {
@@ -495,7 +524,7 @@ export function pipeWithDisconnect(providerResponse, transformStream, streamCont
     return createDisconnectAwareStream({
       readable: transformedBody,
       writable: createNoopAbortWritable()
-    }, streamController);
+    }, streamController, onAbortTerminal);
   }
   let stallTimer = null;
   // Captured on the upstream tap's `start`, used by the watchdog to error the
@@ -586,5 +615,5 @@ export function pipeWithDisconnect(providerResponse, transformStream, streamCont
   return createDisconnectAwareStream({
     readable: transformedBody,
     writable: createNoopAbortWritable()
-  }, wrappedController);
+  }, wrappedController, onAbortTerminal);
 }

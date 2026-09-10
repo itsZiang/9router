@@ -2,6 +2,7 @@ import { BaseExecutor } from "./base.js";
 import { PROVIDERS } from "../config/providers.js";
 import { injectReasoningContent } from "../utils/reasoningContentInjector.js";
 import { ANTHROPIC_API_VERSION } from "../providers/shared.js";
+import { forwardOpencodeClientHeaders, applyOpencodeFakeFingerprint } from "../utils/opencodeHeaders.js";
 
 // Models that use /zen/go/v1/messages (Anthropic/Claude format + x-api-key auth)
 const MESSAGES_FORMAT_MODELS = new Set([
@@ -28,7 +29,7 @@ export class OpenCodeGoExecutor extends BaseExecutor {
       : `${BASE}/chat/completions`;
   }
 
-  buildHeaders(credentials, stream = true) {
+  buildHeaders(credentials, stream = true, clientHeaders = null) {
     const key = credentials?.apiKey || credentials?.accessToken;
     const headers = { "Content-Type": "application/json" };
 
@@ -40,6 +41,14 @@ export class OpenCodeGoExecutor extends BaseExecutor {
     }
 
     if (stream) headers["Accept"] = "text/event-stream";
+    // Same UA-gating as Zen: forward real client identity when present,
+    // otherwise spoof the official CLI so free-tier calls aren't rejected.
+    if (clientHeaders) {
+      forwardOpencodeClientHeaders(headers, clientHeaders, {
+        synthesizeRequestId: true
+      });
+    }
+    applyOpencodeFakeFingerprint(headers, clientHeaders);
     return headers;
   }
 

@@ -8,7 +8,9 @@ export const FORMATS = {
   CODEX: "codex",
   ANTIGRAVITY: "antigravity",
   KIRO: "kiro",
-  CURSOR: "cursor"
+  CURSOR: "cursor",
+  OLLAMA: "ollama",
+  COMMANDCODE: "commandcode"
 };
 
 export function detectFormatByEndpoint(pathname, body) {

@@ -79,16 +79,10 @@ describe("openaiToClaudeRequest", () => {
 
       const result = openaiToClaudeRequest("claude-sonnet-4.5", body, false);
 
-      // Should have system but without JSON instructions
-      expect(result.system).toBeDefined();
-      
-      const systemText = result.system
-        .filter(s => s.type === "text")
-        .map(s => s.text)
-        .join("\n");
-      
-      // Should NOT contain JSON-specific instructions
-      expect(systemText).not.toContain("You must respond with valid JSON");
+      // No system content and no response_format: the translator omits the
+      // system array entirely (Anthropic treats absent system as "no system
+      // prompt"). Must NOT contain JSON-specific instructions in any case.
+      expect(result.system).toBeUndefined();
     });
 
     it("should preserve existing system messages when adding response_format", () => {
@@ -150,7 +144,9 @@ describe("openaiToClaudeRequest", () => {
     it("passes through Claude-native tool_choice objects unchanged", () => {
       expect(choiceOf({ type: "tool", name: "todo_write" })).toEqual({ type: "tool", name: "todo_write" });
       expect(choiceOf({ type: "any" })).toEqual({ type: "any" });
-      expect(choiceOf({ type: "none" })).toEqual({ type: "none" });
+      // "none" normalizes to "auto", consistent with the string-mapping test
+      // above ("none" -> { type: "auto" }): Claude has no "none" choice type.
+      expect(choiceOf({ type: "none" })).toEqual({ type: "auto" });
     });
 
     it("never leaks an invalid type (falls back to auto)", () => {
@@ -169,7 +165,10 @@ describe("openaiToClaudeRequest", () => {
 });
 
 describe("openaiToClaudeResponse", () => {
-  it("omits empty Read pages tool argument before emitting Claude input deltas", () => {
+  it("emits cleaned Read tool arguments once at finish (shimmed tool)", () => {
+    // Read is shimmed (toolCallShim.js): per-chunk input_json_delta is
+    // suppressed and one cleaned JSON delta is emitted at finish/stop time,
+    // so the client never sees invalid fields like `pages: ""` on non-PDFs.
     const state = { toolCalls: new Map() };
     const chunk = {
       id: "chatcmpl-test",
@@ -193,11 +192,17 @@ describe("openaiToClaudeResponse", () => {
       }]
     };
 
-    const result = openaiToClaudeResponse(chunk, state);
-    const inputDelta = result.find(event => event.delta?.type === "input_json_delta");
+    const start = openaiToClaudeResponse(chunk, state);
+    expect((start || []).some(event => event.delta?.type === "input_json_delta")).toBe(false);
 
-    expect(inputDelta).toBeDefined();
-    expect(JSON.parse(inputDelta.delta.partial_json)).toEqual({
+    const finish = openaiToClaudeResponse({
+      id: "chatcmpl-test",
+      model: "gpt-test",
+      choices: [{ delta: {}, finish_reason: "tool_calls" }]
+    }, state);
+    const deltas = (finish || []).filter(event => event.delta?.type === "input_json_delta");
+    expect(deltas).toHaveLength(1);
+    expect(JSON.parse(deltas[0].delta.partial_json)).toEqual({
       file_path: "/tmp/example.txt",
       offset: 0,
       limit: 120

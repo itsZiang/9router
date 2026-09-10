@@ -75,6 +75,11 @@ export async function validateResponseQuality(response, isStreaming, log, respon
     let hasMessageStart = false;
     let hasContentBlock = false;
     let hasLifecycleEnd = false;
+    // OpenAI-shape terminal signal. isKnownNonClaudeStreamPayload only fires on
+    // content/reasoning/tool_calls — a finish_reason-only chunk (or a completely
+    // empty stream) never sets foundContent, so track the terminal signal
+    // separately to distinguish "empty but terminated" from "empty and dropped".
+    let sawOpenAIFinishReason = false;
     const sseLineNormalizer = createSSEDataLineNormalizer();
     let pendingEventType = "";
 
@@ -110,6 +115,12 @@ export async function validateResponseQuality(response, isStreaming, log, respon
         }
         const eventType = (typeof parsed.type === "string" ? parsed.type : null) || pendingEventType || "";
         pendingEventType = "";
+        // Track OpenAI terminal chunks even when they carry no content —
+        // otherwise a finish_reason-only stream is indistinguishable from an
+        // empty dropped stream in the done-branch below.
+        if (Array.isArray(parsed.choices) && parsed.choices.some(choice => !!choice && typeof choice === "object" && choice.finish_reason)) {
+          sawOpenAIFinishReason = true;
+        }
         if (isKnownNonClaudeStreamPayload(parsed, eventType)) {
           return true;
         }
@@ -201,6 +212,27 @@ export async function validateResponseQuality(response, isStreaming, log, respon
             return {
               valid: false,
               reason: "streaming empty content block"
+            };
+          }
+
+          // Zero-byte premature EOF: the peek saw no valuable payload (otherwise
+          // it would have returned valid:true above), no Claude lifecycle end,
+          // and no OpenAI finish_reason. The upstream closed without producing
+          // anything — treat as a failure so the combo falls over to the next
+          // target instead of streaming an empty [DONE] that strict
+          // OpenAI-compatible clients reject ("Stream ended without
+          // finish_reason"). A finish_reason-only stream (terminated but empty)
+          // still passes — only the unterminated one fails over.
+          if (!hasContentBlock && !hasLifecycleEnd && !sawOpenAIFinishReason) {
+            log.warn?.("COMBO", "Streaming response ended without content and without finish_reason (upstream empty close) — marking as invalid for combo failover");
+            try {
+              reader.releaseLock();
+            } catch {
+              /* reader already closed — nothing to release */
+            }
+            return {
+              valid: false,
+              reason: "empty stream: no content and no finish_reason"
             };
           }
 

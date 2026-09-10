@@ -43,6 +43,9 @@ describe("client-disconnect signal wiring", () => {
   });
 
   it("aborts the upstream signal after the disconnect delay", () => {
+    // NOTE: handleDisconnect aborts the upstream signal synchronously (no
+    // 500ms grace delay anymore) so dead client connections release upstream
+    // slots immediately. This test locks the immediate-abort behavior.
     const clientController = new AbortController();
     const streamController = createStreamController({
       onDisconnect: vi.fn(),
@@ -59,8 +62,8 @@ describe("client-disconnect signal wiring", () => {
     expect(streamController.signal.aborted).toBe(false);
     clientController.abort();
 
-    // handleDisconnect schedules abort after 500ms
-    expect(streamController.signal.aborted).toBe(false);
+    // Upstream signal is aborted synchronously on disconnect.
+    expect(streamController.signal.aborted).toBe(true);
     vi.advanceTimersByTime(500);
     expect(streamController.signal.aborted).toBe(true);
   });

@@ -141,7 +141,16 @@ export function handleStreamingResponse({ providerResponse, provider, model, sou
     ? buildAbortedResponsesTerminalBytes
     : buildAbortedTerminalBytes(sourceFormat, provider);
   const stallTimeoutMs = PROVIDERS[provider]?.stallTimeoutMs || STREAM_STALL_TIMEOUT_MS;
-  const transformedBody = pipeWithDisconnect(providerResponse, transformStream, streamController, onAbortTerminal, stallTimeoutMs, onStreamError);
+  const transformedBody = pipeWithDisconnect(providerResponse, transformStream, streamController, {
+    stallTimeoutMs,
+    // Only Responses passthrough gets a bespoke abort terminal today:
+    // response.failed is unambiguously an error signal. Other formats keep
+    // the legacy generic error chunks — a clean synthetic stop there would
+    // mask truncations as successful completions.
+    // (NOTE: the onStreamError 6th positional arg previously passed here was
+    // dead — pipeWithDisconnect never accepted it. Left unwired intentionally.)
+    onAbortTerminal: isResponsesPassthrough ? onAbortTerminal : undefined,
+  });
 
   // SSE heartbeat: emit keepalive events during idle periods (e.g. long reasoning)
   // to prevent NAT/load balancers from dropping the client connection.

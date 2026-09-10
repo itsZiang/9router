@@ -111,6 +111,32 @@ export function backfillResponsesCompletedOutput(parsed, collectedItems) {
   return true;
 }
 const RESPONSES_LIFECYCLE_EVENT_TYPES = new Set(["response.created", "response.in_progress", "response.completed"]);
+
+const _terminalEncoder = new TextEncoder();
+
+/**
+ * Terminal bytes for an aborted/stalled Responses-API stream.
+ *
+ * Emits `response.failed` (an unambiguous error signal — never mistaken for a
+ * clean finish) followed by `[DONE]`. The trailing `[DONE]` matters: it flips
+ * the disconnect-aware pipe's client-terminal latch so a subsequent client
+ * disconnect is recorded as a normal completion instead of triggering provider
+ * failover/cooldown for a request that already failed.
+ *
+ * Imported (but never implemented until now) by streamingHandler.js and
+ * responses-abort-terminal.test.js.
+ */
+export function buildAbortedResponsesTerminalBytes(message) {
+  const text = message instanceof Error
+    ? message.message || "Upstream stream aborted"
+    : typeof message === "string" && message.trim().length > 0
+      ? message
+      : "Upstream stream aborted";
+  const failed =
+    `event: response.failed\n` +
+    `data: ${JSON.stringify({ type: "response.failed", response: { status: "failed", error: { message: text, type: "server_error", code: "stream_aborted" } } })}\n\n`;
+  return _terminalEncoder.encode(`${failed}data: [DONE]\n\n`);
+}
 export function stripResponsesLifecycleEcho(parsed) {
   if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return false;
   const obj = parsed;

@@ -25,9 +25,63 @@ function stopTextBlock(state, results) {
   state.textBlockStarted = false;
 }
 
+// Flush-time terminal synthesis for premature EOF: the upstream closed without
+// finish_reason while content/thinking/tool blocks were still open. Close every
+// open block and terminate the message so Claude clients receive a well-formed
+// message_stop instead of a hanging stream. Returns null when there is nothing
+// to terminate (nothing ever received, or finish already emitted).
+function synthesizePrematureEofTerminal(state) {
+  if (!state || state.finishReason || state.claudeFinishEmitted) return null;
+  const results = [];
+  stopThinkingBlock(state, results);
+  stopTextBlock(state, results);
+  const toolCalls = state.toolCalls instanceof Map ? state.toolCalls : null;
+  if (toolCalls) {
+    for (const [, toolInfo] of toolCalls) {
+      if (!toolInfo) continue;
+      // Mirror the finish handler: shimmed tools get one corrective delta with
+      // the fully patched JSON before the block closes.
+      if (toolInfo.shimmed) {
+        const patched = applyToolCallShimToBuffer(toolInfo.name, toolInfo.argBuffer || "");
+        results.push({
+          type: "content_block_delta",
+          index: toolInfo.blockIndex,
+          delta: {
+            type: "input_json_delta",
+            partial_json: patched
+          }
+        });
+      }
+      results.push({
+        type: "content_block_stop",
+        index: toolInfo.blockIndex
+      });
+    }
+  }
+  if (results.length === 0 && !state.messageStartSent) return null;
+  state.finishReason = "stop";
+  state.claudeFinishEmitted = true;
+  results.push({
+    type: "message_delta",
+    delta: {
+      stop_reason: "end_turn"
+    },
+    usage: state.usage && typeof state.usage === "object" ? state.usage : {
+      input_tokens: 0,
+      output_tokens: 0
+    }
+  });
+  results.push({
+    type: "message_stop"
+  });
+  return results;
+}
+
 // Convert OpenAI stream chunk to Claude format
 export function openaiToClaudeResponse(chunk, state) {
-  if (!chunk || !chunk.choices?.[0]) return null;
+  if (!chunk || !chunk.choices?.[0]) {
+    return synthesizePrematureEofTerminal(state);
+  }
   const results = [];
   const choice = chunk.choices[0];
   const delta = choice.delta;

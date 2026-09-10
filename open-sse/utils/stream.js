@@ -1734,6 +1734,47 @@ export function createSSEStream(options = {}) {
               `reasoningBytes=${passthroughAccumulatedReasoning.length} | totalBytes=${totalContentLength} | ` +
               `upstream did not send finish_reason — NOT synthesizing stop`
             );
+            // Zero-byte premature EOF (no content, no reasoning, no tool_calls,
+            // no finish_reason — e.g. Cline gateway dropping a large tool_result
+            // turn) is never a valid OpenAI SSE stream: fail it with a 502 +
+            // stream error so the client gets a retryable failure (surfaced
+            // downstream as an in-band SSE error event) instead of a clean
+            // [DONE] that strict clients reject with "Stream ended without
+            // finish_reason". Partial streams (any content/tool signal) keep the
+            // legacy warn + [DONE] path so usable partial output is preserved.
+            const hasAnyToolSignal = passthroughHasToolCalls || passthroughToolCalls.size > 0;
+            const hasBufferedTextual = passthroughBufferedTextualToolCallContent.trim().length > 0;
+            if (totalContentLength === 0 && !hasAnyToolSignal && !hasBufferedTextual) {
+              const msg = `upstream closed without finish_reason and without content (provider=${provider} model=${model})`;
+              let failureHandled = false;
+              if (onFailure) {
+                try {
+                  failureHandled = onFailure({ status: 502, message: msg, code: "empty_stream", type: "empty_stream" }) === true;
+                } catch {}
+              }
+              if (onComplete) {
+                try {
+                  const errorBody = buildErrorBody(502, msg);
+                  onComplete({
+                    status: 502,
+                    usage: usage || null,
+                    responseBody: errorBody,
+                    error: msg,
+                    errorCode: "empty_stream",
+                    providerPayload: providerPayloadCollector.build(buildStreamSummaryFromEvents(providerPayloadCollector.getEvents(), sourceFormat, model), { includeEvents: false }),
+                    clientPayload: clientPayloadCollector.build(errorBody, { includeEvents: false })
+                  });
+                  failureHandled = true;
+                } catch (err) {
+                  console.error("[Stream] zero-byte empty-stream onComplete failed:", err?.message || err);
+                }
+              }
+              if (!failureHandled) {
+                clearPendingRequestFromStream();
+              }
+              controller.error(markPendingRequestCleared(new Error(msg)));
+              return;
+            }
           }
 
           if (!doneSent) {

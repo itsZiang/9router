@@ -251,6 +251,29 @@ export function createNormalizedStream(options) {
             `contentBytes=${accumulatedContent.length} | reasoningBytes=${accumulatedThinking.length} | ` +
             `totalBytes=${totalContentLength} | upstream did not send finish_reason — NOT synthesizing stop`
           );
+          // Zero-byte premature EOF (no content AND no reasoning AND no
+          // finish_reason — e.g. Cline gateway dropping a large tool_result
+          // turn) is never a valid OpenAI SSE stream: error it so the client
+          // gets a retryable failure (surfaced downstream as an in-band SSE
+          // error event) instead of a clean [DONE] that strict clients reject
+          // with "Stream ended without finish_reason". Partial streams
+          // (totalContentLength > 0) keep the legacy warn + [DONE] path so
+          // usable partial content/tool_calls are preserved.
+          if (totalContentLength === 0) {
+            if (onStreamComplete) {
+              onStreamComplete(
+                { content: accumulatedContent, thinking: accumulatedThinking },
+                state?.usage || usage || null,
+                ttftAt
+              );
+            }
+            try {
+              controller.error(new Error(`upstream closed without finish_reason and without content (provider=${provider} model=${model})`));
+            } catch {
+              /* controller already closed — downstream already handled */
+            }
+            return;
+          }
         }
       }
 

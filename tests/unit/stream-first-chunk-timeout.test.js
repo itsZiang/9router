@@ -1,6 +1,6 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { pipeWithDisconnect } from "../../open-sse/utils/streamHandler.js";
-import { STREAM_FIRST_CHUNK_TIMEOUT_MS } from "../../open-sse/config/runtimeConfig.js";
+import { STREAM_IDLE_TIMEOUT_MS as STALL_WATCHDOG_BUDGET_MS } from "../../open-sse/config/constants.js";
 
 describe("pipeWithDisconnect first-chunk timeout", () => {
   beforeEach(() => {
@@ -10,7 +10,12 @@ describe("pipeWithDisconnect first-chunk timeout", () => {
     vi.useRealTimers();
   });
 
-  it("aborts when no chunk arrives within STREAM_FIRST_CHUNK_TIMEOUT_MS", () => {
+  it("aborts when no chunk arrives within STREAM_FIRST_CHUNK_TIMEOUT_MS", async () => {
+    // NOTE: there is no separate first-chunk timer — the unified stall
+    // watchdog (budget DEFAULT_STREAM_STALL_TIMEOUT_MS = constants
+    // STREAM_IDLE_TIMEOUT_MS) fires for a hung upstream and reports "stream
+    // stall timeout". This test advances past THAT budget and locks the
+    // covering behavior: a silent upstream never hangs the client forever.
     const controller = {
       signal: { aborted: false },
       isConnected: () => true,
@@ -32,13 +37,19 @@ describe("pipeWithDisconnect first-chunk timeout", () => {
 
     pipeWithDisconnect(providerResponse, transformStream, controller);
 
+    // Let pipeThrough setup run: TransformStream start hooks (which arm the
+    // stall watchdog) execute as microtasks, and this test never pulls, so
+    // flush them explicitly before advancing the fake clock.
+    await Promise.resolve();
+    await Promise.resolve();
+
     expect(controller.abort).not.toHaveBeenCalled();
 
-    // Advance just past the first-chunk timeout
-    vi.advanceTimersByTime(STREAM_FIRST_CHUNK_TIMEOUT_MS + 1000);
+    // Advance just past the stall-watchdog budget.
+    vi.advanceTimersByTime(STALL_WATCHDOG_BUDGET_MS + 1000);
 
     expect(controller.handleError).toHaveBeenCalledWith(
-      expect.objectContaining({ message: "stream first-chunk timeout" })
+      expect.objectContaining({ message: "stream stall timeout" })
     );
     expect(controller.abort).toHaveBeenCalled();
   });
@@ -73,14 +84,18 @@ describe("pipeWithDisconnect first-chunk timeout", () => {
     // Consume the stream so the pipe pulls the chunk through upstreamTap
     await reader.read();
 
-    // Advance past the timeout
-    vi.advanceTimersByTime(STREAM_FIRST_CHUNK_TIMEOUT_MS + 1000);
+    // Within the re-armed budget window: no stall error must fire.
+    vi.advanceTimersByTime(STALL_WATCHDOG_BUDGET_MS - 60000);
 
-    // Should not have fired the first-chunk timeout error
-    const firstChunkErrors = ctrl.handleError.mock.calls.filter(
-      ([err]) => err?.message === "stream first-chunk timeout"
+    const stallErrors = () => ctrl.handleError.mock.calls.filter(
+      ([err]) => err?.message === "stream stall timeout"
     );
-    expect(firstChunkErrors).toHaveLength(0);
+    expect(stallErrors()).toHaveLength(0);
     expect(ctrl.abort).not.toHaveBeenCalled();
+
+    // Continued silence past the re-armed budget: the watchdog fires.
+    vi.advanceTimersByTime(120000);
+    expect(stallErrors()).toHaveLength(1);
+    expect(ctrl.abort).toHaveBeenCalled();
   });
 });
