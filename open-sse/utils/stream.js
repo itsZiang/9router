@@ -115,6 +115,38 @@ function collectPassthroughTextualToolCall(text, toolCalls, allowedToolNames) {
   return toolCall;
 }
 
+// A tracked OpenAI tool_call is "complete" only when it carries a function
+// name AND JSON-parseable arguments. Empty-string arguments deliberately count
+// as INCOMPLETE: a zero-arg call is indistinguishable from a call truncated
+// before its arguments arrived, and closing over a truncated call would let
+// the client execute a broken tool call (worse than erroring).
+function isCompletePassthroughToolCall(toolCall) {
+  const fn = toolCall?.function && typeof toolCall.function === "object" && !Array.isArray(toolCall.function) ? toolCall.function : null;
+  const name = typeof fn?.name === "string" ? fn.name.trim() : "";
+  if (!name) return false;
+  const args = fn?.arguments;
+  if (typeof args !== "string" || args.length === 0) return false;
+  try {
+    JSON.parse(args);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+// Pure (side-effect-free) pending-textual check for the EOF path: true when
+// there is no pending textual content, or it parses as a COMPLETE tool call
+// for an allowed tool. Never inserts into the map — insertion happens exactly
+// once, later, in flush()/onComplete — so this can run before them safely.
+function pendingTextualToolCallIsSettled(text, allowedToolNames) {
+  const pending = typeof text === "string" ? text.trim() : "";
+  if (!pending) return true;
+  const parsed = parseTextualToolCallFromContent(pending);
+  if (!parsed || !parsed.name) return false;
+  if (allowedToolNames?.size && !allowedToolNames.has(parsed.name)) return false;
+  return true;
+}
+
 /* @testonly */
 export function toStreamingToolCallDelta(toolCall) {
   return {
@@ -1774,6 +1806,40 @@ export function createSSEStream(options = {}) {
               }
               controller.error(markPendingRequestCleared(new Error(msg)));
               return;
+            }
+            // Tool-complete-but-unterminated: upstream delivered every tool_call
+            // (names + JSON-valid arguments) but dropped the terminal
+            // finish_reason chunk — the Cline-gateway pattern behind strict-client
+            // "Stream ended without finish_reason" errors on tool turns. The
+            // actionable payload is fully received; only the terminal marker the
+            // client requires is missing — so synthesize
+            // finish_reason:"tool_calls" instead of failing the turn.
+            // Strictly scoped: OpenAI-SSE clients only, every tracked call
+            // complete, no unsettled pending textual tool content. Anything else
+            // (partial content, incomplete tools, truncated args) keeps the
+            // legacy warn + [DONE] path below, so genuine truncations are never
+            // disguised as clean completions. Never synthesize "stop".
+            const clientExpectsOpenAIStream = !clientExpectsResponsesStream && !clientExpectsClaudeStream;
+            if (clientExpectsOpenAIStream && hasAnyToolSignal && passthroughToolCalls.size > 0 && [...passthroughToolCalls.values()].every(isCompletePassthroughToolCall) && pendingTextualToolCallIsSettled(passthroughBufferedTextualToolCallContent, allowedToolNames)) {
+              const terminalChunk = {
+                id: `chatcmpl-${Date.now()}`,
+                object: "chat.completion.chunk",
+                created: Math.floor(Date.now() / 1000),
+                model: model || "unknown",
+                choices: [{
+                  index: 0,
+                  delta: {},
+                  finish_reason: "tool_calls"
+                }]
+              };
+              if (hasValidUsage(usage)) {
+                terminalChunk.usage = filterUsageForFormat(addBufferToUsage(usage), FORMATS.OPENAI);
+              }
+              const terminalOutput = `data: ${JSON.stringify(terminalChunk)}\n\n`;
+              console.warn(`[SSE] SYNTHESIZED tool_calls terminal | provider=${provider} | model=${model} | toolCalls=${passthroughToolCalls.size} | upstream dropped finish_reason after complete tool_calls`);
+              clientPayloadCollector.push(terminalChunk);
+              reqLogger?.appendConvertedChunk?.(terminalOutput);
+              controller.enqueue(encoder.encode(terminalOutput));
             }
           }
 

@@ -27,6 +27,92 @@ function responsesApiOutputHasContent(output) {
 }
 
 /**
+ * Validate a NON-SSE upstream body for a streaming client request.
+ *
+ * Reads via a clone so the original body stays intact for downstream
+ * (which converts a complete JSON payload to SSE for the stream client).
+ * Only complete payloads with real streamable content pass; everything else
+ * fails over to the next combo target.
+ */
+async function validateNonSseStreamingBody(response, contentType, log) {
+  const status = response.status;
+  const tag = `status=${status} content-type=${contentType || "none"}`;
+  let probe;
+  try {
+    probe = response.clone();
+  } catch {
+    return {
+      valid: true
+    };
+  }
+  let text;
+  try {
+    text = await probe.text();
+  } catch {
+    return {
+      valid: true
+    };
+  }
+  const preview = (text || "").trim();
+  if (!preview) {
+    log.warn?.("COMBO", `Streaming upstream returned an empty non-SSE body (${tag}) — marking as invalid for combo failover`);
+    return {
+      valid: false,
+      reason: "upstream returned empty body for streaming request"
+    };
+  }
+  let json = null;
+  try {
+    json = JSON.parse(preview);
+  } catch {
+    json = null;
+  }
+  if (!json || typeof json !== "object" || Array.isArray(json)) {
+    // Raw SSE bytes under a wrong content-type: let the downstream SSE path
+    // try (the original body is untouched).
+    if (/^(data:|event:)/.test(preview)) {
+      return {
+        valid: true
+      };
+    }
+    log.warn?.("COMBO", `Streaming upstream returned a non-JSON non-SSE body (${tag}, ${preview.length} chars) — marking as invalid for combo failover`);
+    return {
+      valid: false,
+      reason: "upstream returned non-JSON non-SSE body for streaming request"
+    };
+  }
+  // Mirror the non-streaming verdicts below, tightened for streaming: only
+  // payloads with streamable content pass.
+  const firstChoice = Array.isArray(json.choices) ? json.choices[0] : null;
+  const message = firstChoice?.message || firstChoice?.delta || null;
+  const content = message?.content;
+  const toolCalls = message?.tool_calls;
+  const reasoningContent = message?.reasoning_content ?? message?.reasoning;
+  const hasContent = content !== null && content !== undefined && content !== "" || typeof reasoningContent === "string" && reasoningContent.trim().length > 0;
+  const hasToolCalls = Array.isArray(toolCalls) && toolCalls.length > 0;
+  const hasClaudeContent = Array.isArray(json.content) && json.content.length > 0;
+  const hasResponsesOutput = json?.object === "response" && responsesApiOutputHasContent(json.output);
+  if (hasContent || hasToolCalls || hasClaudeContent || hasResponsesOutput) {
+    return {
+      valid: true
+    };
+  }
+  if (json.error) {
+    const err = json.error;
+    const detail = typeof err === "object" ? err?.message || JSON.stringify(err).substring(0, 200) : String(err).substring(0, 200);
+    log.warn?.("COMBO", `Streaming upstream returned a JSON error wearing a 200 (${tag}): ${detail} — marking as invalid for combo failover`);
+    return {
+      valid: false,
+      reason: `upstream error in 200 body: ${detail}`
+    };
+  }
+  log.warn?.("COMBO", `Streaming upstream JSON has no streamable content (${tag}) — marking as invalid for combo failover`);
+  return {
+    valid: false,
+    reason: "upstream JSON has no streamable content for streaming request"
+  };
+}
+/**
  * Validate that a successful (HTTP 200) non-streaming response actually contains
  * meaningful content. Returns { valid: true } or { valid: false, reason }.
  *
@@ -47,18 +133,27 @@ export async function validateResponseQuality(response, isStreaming, log, respon
   // pipe the original reader so the rest of the stream keeps flowing normally.
   // Only fail over when a complete Claude lifecycle ends without content_block.
   //
-  // Non-text/event-stream streaming responses are not buffered at all.
+  // Non-SSE streaming responses are validated via a clone (never buffered):
+  // only complete JSON payloads with streamable content pass; empty bodies,
+  // error pages, and JSON errors wearing a 200 fail over.
   if (isStreaming) {
     const contentType = response.headers.get("content-type") || "";
-    if (!contentType.includes("text/event-stream")) {
+    if (!response.body) {
+      // A null body can never stream — fail over instead of passing a dead
+      // response downstream (which dies there as an empty [DONE]).
+      log.warn?.("COMBO", `Streaming upstream returned no body (status=${response.status}) — marking as invalid for combo failover`);
       return {
-        valid: true
+        valid: false,
+        reason: "upstream returned no body for streaming request"
       };
     }
-    if (!response.body) {
-      return {
-        valid: true
-      };
+    if (!contentType.includes("text/event-stream")) {
+      // Not SSE but the client asked for a stream. A complete JSON payload
+      // carrying real content still passes (downstream converts JSON→SSE for
+      // stream clients); anything else — empty bodies, HTML error pages, JSON
+      // errors wearing a 200 — fails over instead of dying downstream as an
+      // empty [DONE] that strict clients reject.
+      return await validateNonSseStreamingBody(response, contentType, log);
     }
     const reader = response.body.getReader();
     const decoder = new TextDecoder("utf-8");
@@ -80,6 +175,12 @@ export async function validateResponseQuality(response, isStreaming, log, respon
     // empty stream) never sets foundContent, so track the terminal signal
     // separately to distinguish "empty but terminated" from "empty and dropped".
     let sawOpenAIFinishReason = false;
+    // Whether the peeked prefix carried tool_calls (vs plain content). Used for
+    // a debug line on pass so a later mid-stream death can be correlated back
+    // to what the gate actually saw (e.g. "passed on tool-only prefix, Cline
+    // then dropped the terminal finish chunk").
+    let sawToolCallsSignal = false;
+    const peekedByteCount = () => bufferedChunks.reduce((n, c) => n + (c?.length || 0), 0);
     const sseLineNormalizer = createSSEDataLineNormalizer();
     let pendingEventType = "";
 
@@ -120,6 +221,9 @@ export async function validateResponseQuality(response, isStreaming, log, respon
         // empty dropped stream in the done-branch below.
         if (Array.isArray(parsed.choices) && parsed.choices.some(choice => !!choice && typeof choice === "object" && choice.finish_reason)) {
           sawOpenAIFinishReason = true;
+        }
+        if (Array.isArray(parsed.choices) && parsed.choices.some(choice => Array.isArray(choice?.delta?.tool_calls) && choice.delta.tool_calls.length > 0)) {
+          sawToolCallsSignal = true;
         }
         if (isKnownNonClaudeStreamPayload(parsed, eventType)) {
           return true;
@@ -224,7 +328,7 @@ export async function validateResponseQuality(response, isStreaming, log, respon
           // finish_reason"). A finish_reason-only stream (terminated but empty)
           // still passes — only the unterminated one fails over.
           if (!hasContentBlock && !hasLifecycleEnd && !sawOpenAIFinishReason) {
-            log.warn?.("COMBO", "Streaming response ended without content and without finish_reason (upstream empty close) — marking as invalid for combo failover");
+            log.warn?.("COMBO", `Streaming response ended without content and without finish_reason (upstream empty close, content-type=${contentType || "none"}, peeked=${peekedByteCount()} bytes) — marking as invalid for combo failover`);
             try {
               reader.releaseLock();
             } catch {
@@ -259,6 +363,7 @@ export async function validateResponseQuality(response, isStreaming, log, respon
           // clonedResponse that replays all buffered bytes (the current chunk
           // is already in bufferedChunks) and then forwards the remainder of
           // the original reader unchanged.
+          log.debug?.("COMBO", `Streaming SSE peek passed after ${peekedByteCount()} bytes (${sawToolCallsSignal ? "tool_calls" : "content/reasoning"} signal, finish_seen=${sawOpenAIFinishReason})`);
           const clonedResponse = buildReplayResponse(reader);
           return {
             valid: true,
@@ -267,8 +372,19 @@ export async function validateResponseQuality(response, isStreaming, log, respon
         }
       }
     } catch {
-      // If reading the stream fails, pass through — other mechanisms
-      // (stream readiness timeout) will catch truly broken streams.
+      // A read failure before any bytes arrived means the upstream produced
+      // nothing usable — fail over instead of passing a dead stream through
+      // (which dies downstream as an empty [DONE]). Failures after some bytes
+      // keep the old pass-through: the broken remainder surfaces downstream
+      // as an in-band error via the pipe.
+      const sawBytes = bufferedChunks.length > 0 || (decodedSoFar && decodedSoFar.trim().length > 0);
+      if (!sawBytes) {
+        log.warn?.("COMBO", "Streaming upstream body unreadable before first bytes — marking as invalid for combo failover");
+        return {
+          valid: false,
+          reason: "upstream stream unreadable before first bytes"
+        };
+      }
       return {
         valid: true
       };
