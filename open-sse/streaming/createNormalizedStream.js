@@ -9,6 +9,7 @@ import {
   logUsage,
 } from "../utils/usageTracking.js";
 import { STREAM_LOOP_THRESHOLD } from "../config/runtimeConfig.js";
+import { getAnyReasoningValue } from "../utils/reasoningFields.js";
 
 const STREAM_MODE = {
   TRANSLATE: "translate",
@@ -100,6 +101,15 @@ export function createNormalizedStream(options) {
     if (delta?.reasoning_content) {
       totalContentLength += delta.reasoning_content.length;
       accumulatedThinking += delta.reasoning_content;
+    } else {
+      // Cline gateway (muse-spark) can stream reasoning as `reasoning`,
+      // `thinking`/`thought` or `reasoning_details`. Count any variant so
+      // reasoning-only turns are not treated as zero-byte EOF.
+      const anyReasoning = getAnyReasoningValue(delta);
+      if (anyReasoning) {
+        totalContentLength += anyReasoning.length;
+        accumulatedThinking += anyReasoning;
+      }
     }
 
     const isFinishChunk = parsed.choices?.[0]?.finish_reason;

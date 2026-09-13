@@ -87,7 +87,12 @@ async function validateNonSseStreamingBody(response, contentType, log) {
   const message = firstChoice?.message || firstChoice?.delta || null;
   const content = message?.content;
   const toolCalls = message?.tool_calls;
-  const reasoningContent = message?.reasoning_content ?? message?.reasoning;
+  // Count any reasoning variant (reasoning_content/reasoning/reasoning_text/
+  // thinking/thought/reasoning_details) so reasoning-only JSON from Cline
+  // gateway (muse-spark) is not mistaken for empty.
+  const reasoningCandidates = [message?.reasoning_content, message?.reasoning, message?.reasoning_text, message?.thinking, message?.thought];
+  const reasoningContent = reasoningCandidates.find(v => typeof v === "string" && v.trim().length > 0)
+    ?? (Array.isArray(message?.reasoning_details) && message.reasoning_details.length > 0 ? "reasoning_details" : undefined);
   const hasContent = content !== null && content !== undefined && content !== "" || typeof reasoningContent === "string" && reasoningContent.trim().length > 0;
   const hasToolCalls = Array.isArray(toolCalls) && toolCalls.length > 0;
   const hasClaudeContent = Array.isArray(json.content) && json.content.length > 0;
@@ -493,7 +498,12 @@ export async function validateResponseQuality(response, isStreaming, log, respon
   // output in `reasoning_content` (or `reasoning`) with `content: null`. The
   // validator used to flag those as empty and trigger a false-positive 502
   // fallback. Count a non-empty reasoning_content as valid output too.
-  const reasoningContent = message.reasoning_content ?? message.reasoning;
+  // Extended for Cline gateway (muse-spark): also honor reasoning_text/
+  // thinking/thought/reasoning_details.
+  const reasoningCandidates = [message.reasoning_content, message.reasoning, message.reasoning_text, message.thinking, message.thought];
+  const reasoningString = reasoningCandidates.find(v => typeof v === "string" && v.trim().length > 0);
+  const reasoningDetailsBlocks = Array.isArray(message.reasoning_details) && message.reasoning_details.some(b => !!b && typeof b === "object" && (typeof b.text === "string" && b.text.length > 0 || typeof b.content === "string" && b.content.length > 0));
+  const reasoningContent = reasoningString ?? (reasoningDetailsBlocks ? "reasoning_details" : undefined);
   const hasReasoningContent = typeof reasoningContent === "string" && reasoningContent.trim().length > 0;
   const hasContent = content !== null && content !== undefined && content !== "" || hasReasoningContent;
   const hasToolCalls = Array.isArray(toolCalls) && toolCalls.length > 0;

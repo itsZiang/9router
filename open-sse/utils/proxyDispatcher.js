@@ -4,7 +4,7 @@ import { socksDispatcher } from "fetch-socks";
 import { getUpstreamTimeoutConfig } from "../stubs/shared/utils/runtimeTimeouts";
 import { stripIpv6Brackets, detectIpLiteralFamily, parseProxyFamily } from "./proxyFamily";
 import { createSocksDispatcherWithFamily } from "./socksConnectorWithFamily";
-import { createRoundRobinDispatcher, getDefaultCachedDispatcher, getDispatcherCache, getRetryCachedDispatcher, setDefaultCachedDispatcher, setRetryCachedDispatcher } from "./proxyDispatcherCache";
+import { createRoundRobinDispatcher, getDefaultCachedDispatcher, getDispatcherCache, getRetryCachedDispatcher, setDefaultCachedDispatcher, setRetryCachedDispatcher, getLongLivedCachedDispatcher, setLongLivedCachedDispatcher, getLongLivedRetryCachedDispatcher, setLongLivedRetryCachedDispatcher } from "./proxyDispatcherCache";
 export { __cacheProxyDispatcherForTest, clearDispatcherCache } from "./proxyDispatcherCache";
 const SUPPORTED_PROTOCOLS = new Set(["http:", "https:", "socks5:"]);
 // Edge-relay proxy types. These do NOT go through an HTTP/SOCKS dispatcher —
@@ -127,6 +127,90 @@ export function getRetryDispatcher() {
       pipelining: 0
     });
     setRetryCachedDispatcher(dispatcher);
+  }
+  return dispatcher;
+}
+
+// ─── Long-lived upstreams (reasoning streams with sparse deltas) ───────────
+// The shared direct dispatcher carries undici `bodyTimeout: 30s` (see the
+// stubs runtimeTimeouts — env overrides are ignored there). Any upstream gap
+// >30s without body bytes aborts the socket, surfacing mid-stream as
+// `terminated`/`BodyTimeoutError`. The official Opencode CLI allows 300s
+// between SSE chunks, so long-reasoning models (muse-spark, …) that stream
+// fine directly get cut when proxied. These dispatchers mirror the direct
+// pool shape but allow up to 300s of upstream silence — and never more, so a
+// genuinely wedged stream still dies instead of hanging forever.
+const LONG_LIVED_HOSTS = new Set(["opencode.ai"]);
+export const LONG_LIVED_BODY_TIMEOUT_MS_DEFAULT = 300_000;
+export const LONG_LIVED_BODY_TIMEOUT_MS_MAX = 300_000;
+
+function extraLongLivedHosts(env = process.env) {
+  const raw = env?.OMNIROUTE_LONG_LIVED_HOSTS;
+  if (raw == null || String(raw).trim() === "") return [];
+  return String(raw).split(",").map(s => s.trim().toLowerCase()).filter(Boolean);
+}
+
+export function isLongLivedUpstreamHostname(hostname) {
+  if (typeof hostname !== "string" || hostname === "") return false;
+  const host = hostname.trim().toLowerCase().replace(/\.$/, "");
+  if (LONG_LIVED_HOSTS.has(host)) return true;
+  for (const base of LONG_LIVED_HOSTS) {
+    if (host.endsWith(`.${base}`)) return true;
+  }
+  return extraLongLivedHosts().includes(host);
+}
+
+export function getLongLivedBodyTimeoutMs(env = process.env) {
+  const raw = env?.OMNIROUTE_OPENCODE_BODY_TIMEOUT_MS;
+  if (raw == null || String(raw).trim() === "") return LONG_LIVED_BODY_TIMEOUT_MS_DEFAULT;
+  const parsed = Number(String(raw).trim());
+  if (!Number.isFinite(parsed) || parsed <= 0) {
+    console.warn(`[ProxyDispatcher] Invalid OMNIROUTE_OPENCODE_BODY_TIMEOUT_MS="${raw}". Using default ${LONG_LIVED_BODY_TIMEOUT_MS_DEFAULT}.`);
+    return LONG_LIVED_BODY_TIMEOUT_MS_DEFAULT;
+  }
+  if (parsed > LONG_LIVED_BODY_TIMEOUT_MS_MAX) {
+    console.warn(`[ProxyDispatcher] OMNIROUTE_OPENCODE_BODY_TIMEOUT_MS="${raw}" exceeds max ${LONG_LIVED_BODY_TIMEOUT_MS_MAX}; clamped.`);
+    return LONG_LIVED_BODY_TIMEOUT_MS_MAX;
+  }
+  return Math.floor(parsed);
+}
+
+function getLongLivedDispatcherOptions(env = process.env) {
+  return {
+    ...getDispatcherOptions(),
+    bodyTimeout: getLongLivedBodyTimeoutMs(env)
+  };
+}
+
+export function getLongLivedDispatcher() {
+  let dispatcher = getLongLivedCachedDispatcher();
+  if (!dispatcher) {
+    const baseOptions = getLongLivedDispatcherOptions();
+    const perAgentOptions = {
+      ...baseOptions,
+      connections: 1,
+      pipelining: 0
+    };
+    const count = getDefaultDispatcherConnectionLimit();
+    const dispatchers = Array.from({
+      length: count
+    }, () => new Agent(perAgentOptions));
+    dispatcher = createRoundRobinDispatcher(dispatchers);
+    setLongLivedCachedDispatcher(dispatcher);
+  }
+  return dispatcher;
+}
+
+export function getLongLivedRetryDispatcher() {
+  let dispatcher = getLongLivedRetryCachedDispatcher();
+  if (!dispatcher) {
+    dispatcher = new Agent({
+      ...getLongLivedDispatcherOptions(),
+      keepAliveTimeout: 1,
+      keepAliveMaxTimeout: 1,
+      pipelining: 0
+    });
+    setLongLivedRetryCachedDispatcher(dispatcher);
   }
   return dispatcher;
 }
@@ -323,6 +407,9 @@ export function __getProxyDispatcherOptionsForTest(env = process.env) {
 }
 export function __getDefaultDispatcherOptionsForTest(env = process.env) {
   return getDefaultDispatcherOptions(env);
+}
+export function __getLongLivedDispatcherOptionsForTest(env = process.env) {
+  return getLongLivedDispatcherOptions(env);
 }
 export function __createRoundRobinDispatcherForTest(dispatchers) {
   return createRoundRobinDispatcher(dispatchers);

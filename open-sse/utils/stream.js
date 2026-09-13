@@ -1297,7 +1297,12 @@ export function createSSEStream(options = {}) {
                     }
                   }
                 }
-                const reasoningDelta = getReadableReasoningValue(delta);
+                // Count any reasoning variant (reasoning_content/reasoning/
+                // reasoning_text/thinking/thought/reasoning_details) so a
+                // reasoning-only turn from Cline gateway (muse-spark) is not
+                // treated as zero-byte at EOF. Forwarded chunk shape is
+                // unchanged — only accounting is widened.
+                const reasoningDelta = getAnyReasoningValue(delta);
                 if (reasoningDelta) {
                   totalContentLength += reasoningDelta.length;
                 }

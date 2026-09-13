@@ -22,14 +22,22 @@ export function isEmptyContentResponse(responseBody) {
     // structured blocks. Honor both so a reasoning-only completion (which then
     // truncated at max_tokens with content:null) is not misread as empty content.
     const reasoningAlias = message?.reasoning ?? delta?.reasoning;
-    const reasoningDetails = Array.isArray(message?.reasoning_details) && message.reasoning_details.some(block => {
+    // Cline gateway (muse-spark, OpenRouter-served) can also use
+    // `reasoning_text`/`thinking`/`thought`. Honor them so a reasoning-only
+    // completion is not misread as empty content.
+    const reasoningTextAlias = message?.reasoning_text ?? delta?.reasoning_text ?? message?.thinking ?? delta?.thinking ?? message?.thought ?? delta?.thought;
+    const reasoningDetails = (Array.isArray(message?.reasoning_details) && message.reasoning_details.some(block => {
       const b = block;
       return !!b && typeof b === "object" && typeof b.text === "string" && b.text.length > 0;
-    });
+    })) || (Array.isArray(delta?.reasoning_details) && delta.reasoning_details.some(block => {
+      const b = block;
+      return !!b && typeof b === "object" && (typeof b.text === "string" && b.text.length > 0 || typeof b.content === "string" && b.content.length > 0);
+    }));
     const hasToolCalls = Array.isArray(message?.tool_calls) && message.tool_calls.length > 0 || Array.isArray(delta?.tool_calls) && delta.tool_calls.length > 0;
     const hasContent = content !== null && content !== undefined && content !== "";
     const hasReasoning = (reasoningContent !== null && reasoningContent !== undefined && reasoningContent !== "")
       || (reasoningAlias !== null && reasoningAlias !== undefined && reasoningAlias !== "")
+      || (reasoningTextAlias !== null && reasoningTextAlias !== undefined && reasoningTextAlias !== "")
       || reasoningDetails;
 
     // A response truncated at the token limit (finish_reason "length") is a valid,

@@ -2,7 +2,7 @@
 import "./setupPolyfill";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { fetch as undiciFetch } from "undici";
-import { buildVercelRelayHeaders, createProxyDispatcher, getDefaultDispatcher, getRetryDispatcher, isRelayType, normalizeProxyUrl, proxyConfigToUrl, proxyUrlForLogs } from "./proxyDispatcher";
+import { buildVercelRelayHeaders, createProxyDispatcher, getDefaultDispatcher, getRetryDispatcher, getLongLivedDispatcher, getLongLivedRetryDispatcher, isLongLivedUpstreamHostname, isRelayType, normalizeProxyUrl, proxyConfigToUrl, proxyUrlForLogs } from "./proxyDispatcher";
 import tlsClient from "./tlsClient";
 import { isProxyReachable } from "../stubs/lib/proxyHealth";
 import { isControlPlaneProxyDirectFallbackEnabled, isFeatureFlagEnabled } from "../stubs/shared/utils/featureFlags";
@@ -384,6 +384,16 @@ async function patchedFetch(input, options = {}, deps = {}) {
     const maxAttempts = hasNonReplayableBody ? 1 : 2;
     const _undiciDirect = deps.undiciFetch ?? undiciFetch;
     const _nativeFallback = deps.nativeFetch ?? originalFetchWithDispatcher;
+    // Long-reasoning upstreams (opencode.ai Zen) emit sparse SSE deltas; the
+    // shared direct pool's 30s undici bodyTimeout would abort healthy streams
+    // mid-reasoning as `terminated`. Route them through the long-lived pool
+    // (300s silence budget, matching the official CLI's chunk timeout).
+    let useLongLivedDispatcher = false;
+    try {
+      useLongLivedDispatcher = isLongLivedUpstreamHostname(new URL(targetUrl).hostname);
+    } catch {
+      useLongLivedDispatcher = false;
+    }
     let lastDispatcherError = null;
     for (let attempt = 0; attempt < maxAttempts; attempt++) {
       try {
@@ -394,7 +404,9 @@ async function patchedFetch(input, options = {}, deps = {}) {
           // it opens a FRESH socket instead of grabbing another stale pooled one
           // — the burst pattern was the retry re-hitting a dead pooled socket and
           // then falling through to native fetch (which also pools) → 502.
-          dispatcher: attempt === 0 ? getDefaultDispatcher() : getRetryDispatcher()
+          dispatcher: attempt === 0
+            ? (useLongLivedDispatcher ? getLongLivedDispatcher() : getDefaultDispatcher())
+            : (useLongLivedDispatcher ? getLongLivedRetryDispatcher() : getRetryDispatcher())
         });
       } catch (dispatcherError) {
         const msg = dispatcherError instanceof Error ? dispatcherError.message : String(dispatcherError);

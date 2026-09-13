@@ -1,6 +1,8 @@
 const DISPATCHER_CACHE_KEY = Symbol.for("omniroute.proxyDispatcher.cache");
 const DEFAULT_DISPATCHER_KEY = Symbol.for("omniroute.proxyDispatcher.default");
 const RETRY_DISPATCHER_KEY = Symbol.for("omniroute.proxyDispatcher.retry");
+const LONG_LIVED_DISPATCHER_KEY = Symbol.for("omniroute.proxyDispatcher.longLived");
+const LONG_LIVED_RETRY_DISPATCHER_KEY = Symbol.for("omniroute.proxyDispatcher.longLivedRetry");
 /**
  * Direct upstream fan-out dispatcher.
  *
@@ -63,6 +65,18 @@ export function getRetryCachedDispatcher() {
 export function setRetryCachedDispatcher(dispatcher) {
   globalThis[RETRY_DISPATCHER_KEY] = dispatcher;
 }
+export function getLongLivedCachedDispatcher() {
+  return globalThis[LONG_LIVED_DISPATCHER_KEY];
+}
+export function setLongLivedCachedDispatcher(dispatcher) {
+  globalThis[LONG_LIVED_DISPATCHER_KEY] = dispatcher;
+}
+export function getLongLivedRetryCachedDispatcher() {
+  return globalThis[LONG_LIVED_RETRY_DISPATCHER_KEY];
+}
+export function setLongLivedRetryCachedDispatcher(dispatcher) {
+  globalThis[LONG_LIVED_RETRY_DISPATCHER_KEY] = dispatcher;
+}
 function closeDispatcher(dispatcher) {
   if (!dispatcher) return;
   try {
@@ -86,8 +100,12 @@ export function clearDispatcherCache() {
   const globalWithCache = globalThis;
   closeDispatcher(globalWithCache[DEFAULT_DISPATCHER_KEY]);
   closeDispatcher(globalWithCache[RETRY_DISPATCHER_KEY]);
+  closeDispatcher(globalWithCache[LONG_LIVED_DISPATCHER_KEY]);
+  closeDispatcher(globalWithCache[LONG_LIVED_RETRY_DISPATCHER_KEY]);
   delete globalWithCache[DEFAULT_DISPATCHER_KEY];
   delete globalWithCache[RETRY_DISPATCHER_KEY];
+  delete globalWithCache[LONG_LIVED_DISPATCHER_KEY];
+  delete globalWithCache[LONG_LIVED_RETRY_DISPATCHER_KEY];
 }
 export function __cacheProxyDispatcherForTest(key, dispatcher) {
   getDispatcherCache().set(key, dispatcher);

@@ -158,10 +158,12 @@ function hasOpenAICompatibleStreamValue(parsed) {
     const delta = isRecord(choice.delta) ? choice.delta : null;
     if (!delta) return false;
     if (typeof delta.content === "string" && delta.content.length > 0) return true;
-    if (typeof delta.reasoning_content === "string" && delta.reasoning_content.length > 0) {
-      return true;
-    }
-    if (typeof delta.reasoning_text === "string" && delta.reasoning_text.length > 0) {
+    // Muse-spark via Cline gateway can stream reasoning in `reasoning`,
+    // `thinking`/`thought` or `reasoning_details` instead of only
+    // `reasoning_content`/`reasoning_text`. Count any reasoning signal as
+    // content so reasoning-only turns are not mistaken for empty streams
+    // (matches hasValuableContent which uses hasAnyReasoningSignal).
+    if (hasAnyReasoningSignal(delta)) {
       return true;
     }
     return Array.isArray(delta.tool_calls) && delta.tool_calls.length > 0;

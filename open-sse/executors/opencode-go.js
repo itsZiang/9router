@@ -2,7 +2,7 @@ import { BaseExecutor } from "./base.js";
 import { PROVIDERS } from "../config/providers.js";
 import { injectReasoningContent } from "../utils/reasoningContentInjector.js";
 import { ANTHROPIC_API_VERSION } from "../providers/shared.js";
-import { forwardOpencodeClientHeaders, applyOpencodeFakeFingerprint } from "../utils/opencodeHeaders.js";
+import { forwardOpencodeClientHeaders, applyOpencodeFakeFingerprint, extractCallerSeed } from "../utils/opencodeHeaders.js";
 
 // Models that use /zen/go/v1/messages (Anthropic/Claude format + x-api-key auth)
 const MESSAGES_FORMAT_MODELS = new Set([
@@ -48,7 +48,16 @@ export class OpenCodeGoExecutor extends BaseExecutor {
         synthesizeRequestId: true
       });
     }
-    applyOpencodeFakeFingerprint(headers, clientHeaders);
+    const callerSeed = extractCallerSeed(clientHeaders);
+    const upstreamKey = credentials?.apiKey || credentials?.accessToken;
+    const sessionSeed = callerSeed != null && callerSeed !== ""
+      ? `${callerSeed}:${this._lastModel || ""}`
+      : (upstreamKey ? `${upstreamKey}:${this._lastModel || ""}` : null);
+    applyOpencodeFakeFingerprint(
+      headers,
+      clientHeaders,
+      sessionSeed,
+    );
     return headers;
   }
 

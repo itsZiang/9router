@@ -1,4 +1,25 @@
+import { isMuseSparkModel } from "../providers/models/helpers.js";
+
 const DEFAULT_MAX_TIMEOUT_MS = 180_000;
+// Muse Spark reasoning warm-up on OpenCode Zen is slow (large prefill, sparse
+// early deltas) — the official CLI waits up to 300s for headers/first chunk.
+// Give the family the same budget so slow prefills aren't cut with 504s.
+const MUSE_SPARK_READINESS_MS_DEFAULT = 300_000;
+const MUSE_SPARK_READINESS_MS_MAX = 600_000;
+const MUSE_SPARK_PROVIDERS = new Set(["oc", "opencode", "opencode-zen", "opencode-go"]);
+
+function getMuseSparkReadinessMs(env = process.env) {
+  const raw = env?.OMNIROUTE_MUSESPARK_READINESS_MS;
+  if (raw == null || String(raw).trim() === "") return MUSE_SPARK_READINESS_MS_DEFAULT;
+  const parsed = Number(String(raw).trim());
+  if (!Number.isFinite(parsed) || parsed <= 0) return MUSE_SPARK_READINESS_MS_DEFAULT;
+  return Math.min(Math.floor(parsed), MUSE_SPARK_READINESS_MS_MAX);
+}
+
+function isMuseSparkReadinessCase(provider, model) {
+  const normalizedProvider = (provider || "").toLowerCase();
+  return MUSE_SPARK_PROVIDERS.has(normalizedProvider) && isMuseSparkModel(model);
+}
 const LARGE_ITEM_THRESHOLD = 150;
 const VERY_LARGE_ITEM_THRESHOLD = 400;
 const TOOL_HEAVY_THRESHOLD = 15;
@@ -94,7 +115,20 @@ export function resolveStreamReadinessTimeout(input) {
     timeoutMs += 30_000;
     reasons.push("codex_gpt_5_5_large_responses");
   }
-  timeoutMs = Math.min(timeoutMs, maxTimeoutMs);
+  // Muse Spark on OpenCode Zen: floor the readiness budget at the CLI-grade
+  // 300s and lift the ceiling accordingly — a 45-90s base cuts slow prefills
+  // that succeed fine when called directly.
+  const museSparkBudgetMs = isMuseSparkReadinessCase(input.provider, input.model)
+    ? getMuseSparkReadinessMs()
+    : 0;
+  const ceilingMs = museSparkBudgetMs > 0 ? Math.max(maxTimeoutMs, museSparkBudgetMs) : maxTimeoutMs;
+  if (museSparkBudgetMs > 0) {
+    if (timeoutMs < museSparkBudgetMs) {
+      timeoutMs = museSparkBudgetMs;
+      reasons.push("muse_spark_long_reasoning");
+    }
+  }
+  timeoutMs = Math.min(timeoutMs, ceilingMs);
   if (timeoutMs === baseTimeoutMs) reasons.push("base");
   return {
     timeoutMs,

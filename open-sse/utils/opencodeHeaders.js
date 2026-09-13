@@ -1,4 +1,4 @@
-import { randomUUID } from "crypto";
+import { createHash, randomUUID } from "crypto";
 import { setUserAgentHeader } from "../executors/base";
 
 /**
@@ -48,8 +48,40 @@ function isOpencodeUA(ua) {
 function randomId(prefix) {
   return `${prefix}_${randomUUID().replace(/-/g, "").slice(0, 24)}`;
 }
+
+/**
+ * Derive a stable `ses_*` id from a seed (credential + model) so the Zen
+ * gateway's sticky provider selection + prompt-cache affinity keep working
+ * when the downstream client (e.g. `@ai-sdk/openai-compatible`) sends no
+ * `x-opencode-session` of its own. A fresh random id per request — the old
+ * behavior — disables stickiness entirely and spreads one user's traffic
+ * across upstream providers, raising the odds of hitting an unhealthy one
+ * (surfaced as transport `terminated`). The seed is SHA-256 hashed: the raw
+ * key never leaves this function in recoverable form.
+ */
+export function stableSessionId(seed) {
+  const digest = createHash("sha256").update(String(seed ?? "")).digest("hex").slice(0, 24);
+  return `ses_${digest}`;
+}
 function findHeader(headers, name) {
   return Object.entries(headers).find(([key]) => key.toLowerCase() === name.toLowerCase())?.[1];
+}
+
+/**
+ * Extract a per-caller seed from downstream headers (the caller's own API
+ * key). Used ONLY as hash input for a stable `x-opencode-session` — the raw
+ * value is never logged, never forwarded upstream, and never leaves this
+ * module except inside a SHA-256 digest. Returns null when absent.
+ */
+export function extractCallerSeed(clientHeaders) {
+  if (!clientHeaders || typeof clientHeaders !== "object") return null;
+  try {
+    const auth = findHeader(clientHeaders, "authorization");
+    if (typeof auth === "string" && auth.trim() !== "") return auth.trim();
+  } catch {
+    // Malformed headers object — no per-caller seed.
+  }
+  return null;
 }
 
 /**
@@ -103,14 +135,18 @@ export function forwardOpencodeClientHeaders(headers, clientHeaders, options) {
  *   `Mozilla/5.0 ...`) with {@link OPENCODE_FAKE_USER_AGENT} — the gateway
  *   checks UA *content*, headers alone are not enough (opencode#42500).
  * - Defaults `x-opencode-client` to `cli`, `x-opencode-project` to `global`,
- *   synthesizes `ses_*` / `msg_*` ids per request when absent.
+ *   synthesizes `msg_*` per request when absent.
+ * - `x-opencode-session`: when the client sent none and `stableSeed` is
+ *   provided, derives a stable per-user/per-model id (sticky routing + prompt
+ *   cache affinity, like the official CLI's per-session id). Falls back to a
+ *   per-request random id when no seed is available.
  * - No-op when `OMNIROUTE_OPENCODE_FAKE_HEADERS=0/false/off/no`.
  *
  * Must run AFTER `forwardOpencodeClientHeaders()` and BEFORE
  * `stripStainlessHeadersForOpenAICompat()` (the strip only normalizes UAs
  * containing "openai", so the fake `opencode/...` UA survives it).
  */
-export function applyOpencodeFakeFingerprint(headers, clientHeaders = null) {
+export function applyOpencodeFakeFingerprint(headers, clientHeaders = null, stableSeed = null) {
   if (isFakeDisabled()) return headers;
   // x-opencode-client
   if (!headers["x-opencode-client"]) {
@@ -122,11 +158,14 @@ export function applyOpencodeFakeFingerprint(headers, clientHeaders = null) {
     const project = clientHeaders ? findHeader(clientHeaders, "x-opencode-project") : null;
     headers["x-opencode-project"] = project || OPENCODE_FAKE_PROJECT;
   }
-  // x-opencode-session (per-request random when absent)
+  // x-opencode-session: prefer the client's real session; otherwise a stable
+  // per-user/per-model id so Zen sticky routing keeps working.
   if (!headers["x-opencode-session"]) {
-    headers["x-opencode-session"] = randomId("ses");
+    headers["x-opencode-session"] = stableSeed != null && stableSeed !== ""
+      ? stableSessionId(stableSeed)
+      : randomId("ses");
   }
-  // x-opencode-request (per-request random when absent)
+  // x-opencode-request (per-request random when absent — matches CLI's msg_*).
   if (!headers["x-opencode-request"]) {
     headers["x-opencode-request"] = randomId("msg");
   }
