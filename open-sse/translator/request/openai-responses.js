@@ -751,12 +751,19 @@ export function openaiToOpenAIResponsesRequest(model, body, stream, credentials)
   // Filter orphaned function_call_output items (no matching function_call)
   // This happens when Claude Code compaction removes messages but leaves tool results
   const knownCallIds = new Set(input.filter(item => item.type === "function_call" && item.call_id).map(item => item.call_id));
+  const outputCount = input.filter(item => item.type === "function_call_output").length;
   result.input = input.filter(item => {
     if (item.type === "function_call_output" && item.call_id) {
       return knownCallIds.has(item.call_id);
     }
     return true;
   });
+  const droppedOutputs = outputCount - result.input.filter(item => item.type === "function_call_output").length;
+  if (droppedOutputs > 0) {
+    // Dropped tool results blind the model to its own previous actions — a
+    // classic cause of "does one thing then stops" mid-task. Loud by design.
+    console.warn(`[responses] Dropped ${droppedOutputs}/${outputCount} orphaned function_call_output items (no matching function_call) | model=${model} | calls=${knownCallIds.size}`);
+  }
 
   // If no system message, keep empty instructions
   if (!hasSystemMessage) {
@@ -841,6 +848,18 @@ export function openaiToOpenAIResponsesRequest(model, body, stream, credentials)
     result.max_output_tokens = root.max_completion_tokens;
   } else if (root.max_tokens !== undefined) {
     result.max_output_tokens = root.max_tokens;
+  }
+  // Muse Spark reasoning turns bill reasoning_tokens out of the same
+  // max_output_tokens budget. opencode's default (max_tokens: 32000, see
+  // provider/transform.ts OUTPUT_TOKEN_MAX) is easily exhausted by reasoning
+  // alone on this 1M-context family (capabilities maxOutput: 131072), leaving
+  // no budget for text/tool_calls — upstream ends the turn `incomplete` and
+  // the agent stops mid-task. Floor explicit low budgets up to 64000 (the
+  // 9router DEFAULT_MAX_TOKENS). Absent budgets are left untouched so the
+  // upstream default applies.
+  if (isMuseSparkModel(model) && typeof result.max_output_tokens === "number" && result.max_output_tokens <= 32000) {
+    console.warn(`[muse-spark] Bumping max_output_tokens ${result.max_output_tokens} → 64000 (reasoning models exhaust 32k on thinking alone)`);
+    result.max_output_tokens = 64000;
   }
   if (root.top_p !== undefined) result.top_p = root.top_p;
   // GPT-5 verbosity: Chat Completions `verbosity` → Responses `text.verbosity`.

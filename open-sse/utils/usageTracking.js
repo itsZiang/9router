@@ -473,8 +473,11 @@ export function estimateUsage(body, contentLength, targetFormat = FORMATS.OPENAI
 
 /**
  * Log usage with cache info (green color)
+ * @param {object} [extra] - Optional terminal diagnostics: { finishReason, toolCalls }.
+ *   Surfaced in the log line so truncated turns (length / premature-EOF stop with
+ *   0 tool calls) are distinguishable from clean completions at a glance.
  */
-export function logUsage(provider, usage, model = null, connectionId = null, apiKeyInfo = null, latencyMs = null, status = "ok", isStream = true) {
+export function logUsage(provider, usage, model = null, connectionId = null, apiKeyInfo = null, latencyMs = null, status = "ok", isStream = true, extra = null) {
   if (!usage || typeof usage !== "object") return;
   const p = provider?.toUpperCase() || "UNKNOWN";
 
@@ -505,6 +508,14 @@ export function logUsage(provider, usage, model = null, connectionId = null, api
   if (cacheCreation) msg += ` | cache_create=${cacheCreation}`;
   const reasoning = usage.reasoning_tokens;
   if (reasoning) msg += ` | reasoning=${reasoning}`;
+
+  // Terminal diagnostics: how the turn ended (stop / length / tool_calls / error)
+  // and how many tool calls were emitted. A turn with finish=stop/length and
+  // tools=0 mid-task is an early stop, not a clean completion.
+  const finishReason = extra && typeof extra.finishReason === "string" ? extra.finishReason : null;
+  if (finishReason) msg += ` | finish=${finishReason}`;
+  const toolCalls = extra && Number.isFinite(Number(extra.toolCalls)) ? Number(extra.toolCalls) : null;
+  if (toolCalls !== null) msg += ` | tools=${toolCalls}`;
   console.log(msg);
 
   // Streaming requests persist usage once in chatCore's completion callback.

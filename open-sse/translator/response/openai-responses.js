@@ -625,6 +625,66 @@ function computeFinishReason(state) {
   return (state.toolCallIndex || 0) > 0 || state.currentToolCallId ? "tool_calls" : "stop";
 }
 
+// Responses API terminal statuses: a turn can end as `completed` (full output)
+// or `incomplete` (cut short — e.g. `max_output_tokens` exhausted, reported via
+// `incomplete_details.reason: "max_output_tokens"`). An `incomplete` turn must
+// surface as Chat `finish_reason: "length"` so clients can tell truncation apart
+// from a clean `stop`. Previously this event fell through to the flush path and
+// was misreported as `stop`, making opencode end the turn silently (it shows no
+// error for `length`, and none at all for a masked `stop`) and forcing the user
+// to type "continue".
+function isIncompleteResponsesStatus(data) {
+  const response = data?.response && typeof data.response === "object" ? data.response : null;
+  if (response?.status === "incomplete" || data?.status === "incomplete") return true;
+  if (response?.incomplete_details != null || data?.incomplete_details != null) return true;
+  return false;
+}
+
+// One-line per-turn summary: what the upstream actually emitted this turn.
+// Lets operators tell "model genuinely stopped calling tools" apart from
+// "translator dropped tool items" without capturing full payloads.
+function logResponsesTurnSummary(state, status) {
+  const kinds = state.responsesItemKinds instanceof Set && state.responsesItemKinds.size > 0
+    ? [...state.responsesItemKinds].join(",")
+    : "-";
+  console.log(`[responses] turn | model=${state.model || "unknown"} | status=${status} | ` +
+    `textChars=${state.responsesTextChars || 0} | tools=${state.toolCallIndex || 0} | ` +
+    `reasoning=${state.responsesSawReasoning ? "yes" : "no"} | items=${kinds}`);
+}
+
+// Shared usage normalization for `response.completed` / `response.incomplete`:
+// Responses `{input_tokens, output_tokens}` → Chat `{prompt_tokens,
+// completion_tokens}` (prompt side includes cached tokens).
+function extractResponsesUsage(responseUsage) {
+  if (!responseUsage || typeof responseUsage !== "object") return null;
+  const inputTokens = responseUsage.input_tokens || responseUsage.prompt_tokens || 0;
+  const outputTokens = responseUsage.output_tokens || responseUsage.completion_tokens || 0;
+  const cacheReadTokens = responseUsage.cache_read_input_tokens || responseUsage.input_tokens_details?.cached_tokens || responseUsage.prompt_tokens_details?.cached_tokens || 0;
+  const cacheCreationTokens = responseUsage.cache_creation_input_tokens || 0;
+  const reasoningTokens = responseUsage.output_tokens_details?.reasoning_tokens || responseUsage.completion_tokens_details?.reasoning_tokens || responseUsage.reasoning_tokens || 0;
+  const promptTokens = inputTokens + cacheReadTokens + cacheCreationTokens;
+  const usage = {
+    prompt_tokens: promptTokens,
+    completion_tokens: outputTokens,
+    total_tokens: promptTokens + outputTokens
+  };
+  if (cacheReadTokens > 0 || cacheCreationTokens > 0) {
+    usage.prompt_tokens_details = {};
+    if (cacheReadTokens > 0) {
+      usage.prompt_tokens_details.cached_tokens = cacheReadTokens;
+    }
+    if (cacheCreationTokens > 0) {
+      usage.prompt_tokens_details.cache_creation_tokens = cacheCreationTokens;
+    }
+  }
+  if (reasoningTokens > 0) {
+    usage.completion_tokens_details = {
+      reasoning_tokens: reasoningTokens
+    };
+  }
+  return usage;
+}
+
 // #5786 — remember that a reasoning delta was streamed for a given reasoning item, so
 // the terminal `response.output_item.done` snapshot for that item is NOT re-emitted
 // (which would duplicate the reasoning channel). Keyed by item_id when present, with a
@@ -678,6 +738,12 @@ function openaiResponsesToOpenAIResponseStream(chunk, state) {
     if (!state.finishReasonSent && state.started) {
       state.finishReasonSent = true;
       const finishReason = computeFinishReason(state);
+      if (!state.responsesTerminalSeen) {
+        // Upstream never sent response.completed/incomplete/failed — the stream
+        // was cut (network drop, timeout, gateway EOF). Log it so a masked
+        // truncation is diagnosable instead of looking like a clean `stop`.
+        console.warn(`[responses] PREMATURE EOF without terminal event | model=${state.model || "unknown"} | finish_reason=${finishReason} | toolCallIndex=${state.toolCallIndex || 0} | pendingToolCall=${state.currentToolCallId ? "yes" : "no"}`);
+      }
       return {
         id: state.chatId || `chatcmpl-${Date.now()}`,
         object: "chat.completion.chunk",
@@ -710,6 +776,16 @@ function openaiResponsesToOpenAIResponseStream(chunk, state) {
     state.created = Math.floor(Date.now() / 1000);
     state.toolCallIndex = 0;
     state.currentToolCallId = null;
+    // Terminal-event tracking: set when response.completed/incomplete/failed
+    // arrives. Flush uses it to detect premature EOF (see above).
+    state.responsesTerminalSeen = false;
+    state.responsesTerminalReason = null;
+    // Per-turn observability: what the upstream actually sent this turn, so a
+    // "model stopped calling tools" turn can be told apart from a translator
+    // silently dropping tool items of an unknown shape.
+    state.responsesTextChars = 0;
+    state.responsesSawReasoning = false;
+    state.responsesItemKinds = new Set();
     // Indexes whose head chunk (id + type + name) was already emitted to the
     // client. A tool call whose head was never emitted must be completed with
     // a combined head chunk at output_item.done — emitting id-less args first
@@ -717,10 +793,19 @@ function openaiResponsesToOpenAIResponseStream(chunk, state) {
     state.toolCallHeadEmitted = new Set();
   }
 
+  // Per-turn observability: record every output-item kind the upstream sends,
+  // even ones this translator has no mapping for — a tool call arriving as an
+  // unknown item type must show up in the turn summary, not vanish silently.
+  if ((eventType === "response.output_item.added" || eventType === "response.output_item.done") && data.item?.type) {
+    if (!(state.responsesItemKinds instanceof Set)) state.responsesItemKinds = new Set();
+    state.responsesItemKinds.add(String(data.item.type));
+  }
+
   // Text content delta
   if (eventType === "response.output_text.delta") {
     const delta = data.delta || "";
     if (!delta) return null;
+    state.responsesTextChars = (state.responsesTextChars || 0) + delta.length;
     return {
       id: state.chatId,
       object: "chat.completion.chunk",
@@ -905,44 +990,19 @@ function openaiResponsesToOpenAIResponseStream(chunk, state) {
   // Response completed
   if (eventType === "response.completed") {
     // Extract usage from response.completed event
-    const responseUsage = data.response?.usage;
-    if (responseUsage && typeof responseUsage === "object") {
-      const inputTokens = responseUsage.input_tokens || responseUsage.prompt_tokens || 0;
-      const outputTokens = responseUsage.output_tokens || responseUsage.completion_tokens || 0;
-      const cacheReadTokens = responseUsage.cache_read_input_tokens || responseUsage.input_tokens_details?.cached_tokens || responseUsage.prompt_tokens_details?.cached_tokens || 0;
-      const cacheCreationTokens = responseUsage.cache_creation_input_tokens || 0;
-      const reasoningTokens = responseUsage.output_tokens_details?.reasoning_tokens || responseUsage.completion_tokens_details?.reasoning_tokens || responseUsage.reasoning_tokens || 0;
-
-      // prompt_tokens = input_tokens + cache_read + cache_creation (all prompt-side tokens)
-      const promptTokens = inputTokens + cacheReadTokens + cacheCreationTokens;
-      state.usage = {
-        prompt_tokens: promptTokens,
-        completion_tokens: outputTokens,
-        total_tokens: promptTokens + outputTokens
-      };
-
-      // Add prompt_tokens_details if cache tokens exist
-      if (cacheReadTokens > 0 || cacheCreationTokens > 0) {
-        state.usage.prompt_tokens_details = {};
-        if (cacheReadTokens > 0) {
-          state.usage.prompt_tokens_details.cached_tokens = cacheReadTokens;
-        }
-        if (cacheCreationTokens > 0) {
-          state.usage.prompt_tokens_details.cache_creation_tokens = cacheCreationTokens;
-        }
-      }
-
-      // Add completion_tokens_details if reasoning tokens exist
-      if (reasoningTokens > 0) {
-        state.usage.completion_tokens_details = {
-          reasoning_tokens: reasoningTokens
-        };
-      }
+    const extracted = extractResponsesUsage(data.response?.usage);
+    if (extracted) {
+      state.usage = extracted;
     }
     if (!state.finishReasonSent) {
       state.finishReasonSent = true;
-      const reason = computeFinishReason(state);
+      // A completed envelope carrying an incomplete status means the turn was
+      // cut short (e.g. max_output_tokens hit) — report `length`, not `stop`.
+      const reason = isIncompleteResponsesStatus(data) ? "length" : computeFinishReason(state);
+      state.responsesTerminalSeen = true;
+      state.responsesTerminalReason = reason;
       state.finishReason = reason; // Mark for usage injection in stream.js
+      logResponsesTurnSummary(state, data.response?.status || "completed");
 
       const finalChunk = {
         id: state.chatId,
@@ -964,7 +1024,44 @@ function openaiResponsesToOpenAIResponseStream(chunk, state) {
     }
     return null;
   }
+  // Response incomplete — upstream cut the turn short (typically
+  // `incomplete_details.reason: "max_output_tokens"`). Report Chat
+  // `finish_reason: "length"` so clients (opencode AI SDK mapping
+  // `length ↔ length`) see a truncation instead of a clean `stop`.
+  // Note: opencode keeps looping when tool parts are present regardless of
+  // the finish value, so emitting `length` never drops a completed tool call.
+  if (eventType === "response.incomplete") {
+    const extracted = extractResponsesUsage(data.response?.usage);
+    if (extracted) {
+      state.usage = extracted;
+    }
+    if (!state.finishReasonSent) {
+      state.finishReasonSent = true;
+      state.responsesTerminalSeen = true;
+      state.responsesTerminalReason = "length";
+      state.finishReason = "length"; // Mark for usage injection in stream.js
+      logResponsesTurnSummary(state, "incomplete");
+      const finalChunk = {
+        id: state.chatId,
+        object: "chat.completion.chunk",
+        created: state.created,
+        model: state.model || "gpt-4",
+        choices: [{
+          index: 0,
+          delta: {},
+          finish_reason: "length"
+        }]
+      };
+      if (state.usage && typeof state.usage === "object") {
+        finalChunk.usage = state.usage;
+      }
+      return finalChunk;
+    }
+    return null;
+  }
   if (eventType === "response.failed" || eventType === "error") {
+    state.responsesTerminalSeen = true;
+    state.responsesTerminalReason = "error";
     state.upstreamError = normalizeUpstreamFailure(data);
     state.finishReasonSent = true;
     return null;
@@ -974,6 +1071,7 @@ function openaiResponsesToOpenAIResponseStream(chunk, state) {
   if (eventType === "response.reasoning_content_text.delta" || eventType === "response.reasoning_text.delta") {
     const reasoningDelta = data.delta || "";
     if (!reasoningDelta) return null;
+    state.responsesSawReasoning = true;
     markResponsesReasoningDeltaEmitted(state, data.item_id);
     return {
       id: state.chatId,
@@ -999,6 +1097,7 @@ function openaiResponsesToOpenAIResponseStream(chunk, state) {
   if (eventType === "response.reasoning_summary_text.delta") {
     const reasoningDelta = data.delta || "";
     if (!reasoningDelta) return null;
+    state.responsesSawReasoning = true;
     markResponsesReasoningDeltaEmitted(state, data.item_id);
     return buildResponsesReasoningDeltaChunk(state, reasoningDelta);
   }
@@ -1019,6 +1118,7 @@ function openaiResponsesToOpenAIResponseStream(chunk, state) {
     if (emittedForItem || emittedWithoutItemId) return null;
     const summaryText = extractResponsesReasoningSummaryText(item);
     if (!summaryText) return null;
+    state.responsesSawReasoning = true;
     return buildResponsesReasoningDeltaChunk(state, summaryText);
   }
 

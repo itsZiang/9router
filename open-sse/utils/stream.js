@@ -2069,7 +2069,18 @@ export function createSSEStream(options = {}) {
         }
         if (hasValidUsage(state?.usage)) {
           const latencyMs = Date.now() - streamStartedAt;
-          logUsage(state.provider || targetFormat, state.usage, model, connectionId, apiKeyInfo, latencyMs, "ok", true);
+          // Terminal diagnostics for the USAGE line: surface how the turn ended
+          // (Responses translators record responsesTerminalReason; others set
+          // finishReason) and how many tool calls went out, so early-stop turns
+          // are visible in logs instead of looking like clean completions.
+          const terminalFinish = state?.responsesTerminalReason ?? state?.finishReason ?? null;
+          const terminalTools = typeof state?.toolCallIndex === "number" && state.toolCallIndex > 0
+            ? state.toolCallIndex
+            : (state?.toolCalls?.size || 0);
+          logUsage(state.provider || targetFormat, state.usage, model, connectionId, apiKeyInfo, latencyMs, "ok", true, {
+            finishReason: terminalFinish,
+            toolCalls: terminalTools
+          });
         } else {
           appendRequestLog({
             model,
