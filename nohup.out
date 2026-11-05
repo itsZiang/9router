@@ -1,0 +1,10 @@
+[33m⚠ Network-exposed: reachable at http://10.1.42.42:20128 (bound 0.0.0.0). Use --host 127.0.0.1 for local-only.[0m
+
+🚀 9router v0.5.59
+Server: http://localhost:20128
+
+💡 Router is now running in system tray. Close this terminal if you want.
+   Right-click tray icon to open dashboard or quit.
+
+
+Exiting...

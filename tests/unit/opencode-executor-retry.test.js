@@ -3,7 +3,7 @@
 // throws (incl. undici `terminated`) with backoff, rotating across accounts,
 // instead of surfacing the raw error immediately.
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { OpencodeExecutor } from "../../open-sse/executors/opencode.js";
+import { OpencodeExecutor, isZenFreeTierModel, ensureGateTools } from "../../open-sse/executors/opencode.js";
 import { BaseExecutor } from "../../open-sse/executors/base.js";
 import { applyOpencodeFakeFingerprint, forwardOpencodeClientHeaders, stableSessionId } from "../../open-sse/utils/opencodeHeaders.js";
 
@@ -157,7 +157,8 @@ describe("opencode sticky session headers", () => {
   it("stableSessionId is deterministic per seed", () => {
     expect(stableSessionId("keyA:m")).toBe(stableSessionId("keyA:m"));
     expect(stableSessionId("keyA:m")).not.toBe(stableSessionId("keyB:m"));
-    expect(stableSessionId("keyA:m")).toMatch(/^ses_[0-9a-f]{24}$/);
+    // Console gate format (2026-09-19): ses_ + 12 hex + 14 base62.
+    expect(stableSessionId("keyA:m")).toMatch(/^ses_[0-9a-f]{12}[0-9A-Za-z]{14}$/);
   });
 
   it("derives a stable session per credential+model, keeps msg_* per-request", () => {
@@ -202,6 +203,117 @@ describe("opencode sticky session headers", () => {
     expect(alice1["x-opencode-session"]).not.toBe(bob["x-opencode-session"]);
     // Raw downstream keys never leak upstream in cleartext.
     expect(JSON.stringify(alice1)).not.toContain("alice-9router-key");
+  });
+});
+
+describe("opencode free-tier gate compliance (403 fix)", () => {
+  it("emits gateway-valid session/request ids (ses_/msg_ + 12hex + 14base62)", () => {
+    const h = applyOpencodeFakeFingerprint({}, {}, "KEY123:muse-spark-1.3-contributor-free");
+    expect(h["x-opencode-session"]).toMatch(/^ses_[0-9a-f]{12}[0-9A-Za-z]{14}$/);
+    expect(h["x-opencode-request"]).toMatch(/^msg_[0-9a-f]{12}[0-9A-Za-z]{14}$/);
+    const r = applyOpencodeFakeFingerprint({}, {});
+    expect(r["x-opencode-session"]).toMatch(/^ses_[0-9a-f]{12}[0-9A-Za-z]{14}$/);
+    expect(r["x-opencode-request"]).toMatch(/^msg_[0-9a-f]{12}[0-9A-Za-z]{14}$/);
+  });
+
+  it("detects free-tier models, leaves paid models alone", () => {
+    expect(isZenFreeTierModel("muse-spark-1.3-contributor-free")).toBe(true);
+    expect(isZenFreeTierModel("oc/muse-spark-1.2-contributor-free")).toBe(true);
+    expect(isZenFreeTierModel("big-pickle")).toBe(true);
+    expect(isZenFreeTierModel("deepseek-v4-flash-free")).toBe(true);
+    expect(isZenFreeTierModel("gpt-5-nano")).toBe(false);
+    expect(isZenFreeTierModel("claude-opus-4-6")).toBe(false);
+    expect(isZenFreeTierModel(null)).toBe(false);
+  });
+
+  it("injects shell+read tools per format when missing, keeps client tools", () => {
+    const chat = ensureGateTools({ model: "m", messages: [] }, "openai");
+    expect(chat.tools.map(t => t.function.name).sort()).toEqual(["read", "shell"]);
+    const resp = ensureGateTools({ model: "m", input: [] }, "openai-responses");
+    expect(resp.tools.map(t => t.name).sort()).toEqual(["read", "shell"]);
+    const claude = ensureGateTools({ model: "m", messages: [] }, "claude");
+    expect(claude.tools.map(t => t.name).sort()).toEqual(["read", "shell"]);
+    // Literal `shell`+`read` present → untouched.
+    const kept = ensureGateTools({ tools: [{ type: "function", function: { name: "shell", description: "x", parameters: {} } }, { type: "function", function: { name: "read", description: "x", parameters: {} } }] }, "openai");
+    expect(kept.tools).toHaveLength(2);
+    // Live 2026-09-25: the gate ignores `bash` (only literal `shell` counts),
+    // so a bash+read body still receives the `shell` placeholder.
+    const bashOnly = ensureGateTools({ tools: [{ type: "function", function: { name: "bash", description: "x", parameters: {} } }, { type: "function", function: { name: "read", description: "x", parameters: {} } }] }, "openai");
+    expect(bashOnly.tools.map(t => t.function.name).sort()).toEqual(["bash", "read", "shell"]);
+    // Live 2026-09-25: the gate name match is case-SENSITIVE — client `Bash` /
+    // `Read` (Claude Code casing) do not satisfy it, so exact-lowercase
+    // placeholders are still prepended.
+    const capped = ensureGateTools({ tools: [{ type: "function", name: "Bash", description: "x", parameters: {} }, { type: "function", name: "Read", description: "x", parameters: {} }] }, "openai-responses");
+    expect(capped.tools.map(t => t.name)).toEqual(["shell", "read", "Bash", "Read"]);
+    // Client custom tools survive alongside injected placeholders.
+    const merged = ensureGateTools({ tools: [{ type: "function", function: { name: "my_tool", description: "x", parameters: {} } }] }, "openai");
+    expect(merged.tools.map(t => t.function.name).sort()).toEqual(["my_tool", "read", "shell"]);
+    // Unknown formats untouched.
+    const gemini = ensureGateTools({ model: "m" }, "gemini");
+    expect(gemini.tools).toBeUndefined();
+  });
+
+  it("transformRequest forces stream:true + tools on free models only", () => {
+    const executor = new OpencodeExecutor("opencode-zen");
+    executor._requestFormat = "openai";
+    const free = executor.transformRequest("mimo-v2.5-free", { model: "mimo-v2.5-free", messages: [{ role: "user", content: "hi" }], stream: false }, false, {});
+    expect(free.stream).toBe(true);
+    expect(free.tools.map(t => t.function.name).sort()).toEqual(["read", "shell"]);
+    const paid = executor.transformRequest("gpt-5-nano", { model: "gpt-5-nano", messages: [{ role: "user", content: "hi" }], stream: false }, false, {});
+    expect(paid.stream).toBe(false);
+    expect(paid.tools).toBeUndefined();
+  });
+
+  it("execute() upgrades non-streaming free-tier calls to upstream SSE", async () => {
+    let seenStream = null;
+    stub.mockImplementation(async (input) => {
+      calls++;
+      seenStream = input.stream;
+      return okResponse(200);
+    });
+    const executor = new OpencodeExecutor("opencode-zen");
+    await executor.execute(inputFor({ stream: false }));
+    expect(seenStream).toBe(true);
+    expect(calls).toBe(1);
+  });
+
+  it("ignores foreign-shaped affinity sessions, adopts gateway-valid ones", () => {
+    // UUID-style affinity (another harness) must NOT become x-opencode-session.
+    const foreign = {};
+    forwardOpencodeClientHeaders(foreign, { "x-session-id": "123e4567-e89b-12d3-a456-426614174000" }, { synthesizeRequestId: true });
+    expect(foreign["x-opencode-session"]).toBeUndefined();
+    expect(foreign["x-opencode-request"]).toBeUndefined();
+    // A real ses_26 id is adopted, with a gate-format request id synthesized.
+    const validSes = stableSessionId("client-session-1");
+    const adopted = {};
+    forwardOpencodeClientHeaders(adopted, { "x-session-id": validSes }, { synthesizeRequestId: true });
+    expect(adopted["x-opencode-session"]).toBe(validSes);
+    expect(adopted["x-opencode-request"]).toMatch(/^msg_[0-9a-f]{12}[0-9A-Za-z]{14}$/);
+  });
+
+  it("seeds the session from x-api-key for Anthropic-style harnesses", () => {
+    const executor = new OpencodeExecutor("opencode-zen");
+    executor._requestFormat = "openai-responses";
+    const creds = {};
+    const a = executor.buildHeaders(creds, true, { "x-api-key": "sk-claude-code-user-1" }, MODEL);
+    const b = executor.buildHeaders(creds, true, { "x-api-key": "sk-claude-code-user-1" }, MODEL);
+    const c = executor.buildHeaders(creds, true, { "x-api-key": "sk-claude-code-user-2" }, MODEL);
+    expect(a["x-opencode-session"]).toBe(b["x-opencode-session"]);
+    expect(a["x-opencode-session"]).not.toBe(c["x-opencode-session"]);
+    expect(JSON.stringify(a)).not.toContain("sk-claude-code-user-1");
+  });
+
+  it("execute() leaves paid-model stream flag untouched", async () => {
+    let seenStream = null;
+    stub.mockImplementation(async (input) => {
+      calls++;
+      seenStream = input.stream;
+      return okResponse(200);
+    });
+    const executor = new OpencodeExecutor("opencode-zen");
+    await executor.execute(inputFor({ model: "gpt-5-nano", body: { model: "gpt-5-nano", messages: [] }, stream: false }));
+    expect(seenStream).toBe(false);
+    expect(calls).toBe(1);
   });
 });
 

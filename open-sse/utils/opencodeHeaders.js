@@ -1,4 +1,4 @@
-import { createHash, randomUUID } from "crypto";
+import { createHash, randomBytes } from "crypto";
 import { setUserAgentHeader } from "../executors/base";
 
 /**
@@ -19,12 +19,22 @@ const OPENCODE_HEADER_KEYS = ["x-opencode-session", "x-opencode-request", "x-ope
  * Verified behavior (pi#2824, dsh-zen-proxy, opencode#42500):
  * - `x-opencode-*` alone is NOT enough — the gateway validates `User-Agent` content.
  * - Only `User-Agent: opencode/<version>...` unlocks the official-client quota.
+ * - Since 2026-09-19 the Console gateway enforces a 3-part gate on free models
+ *   (`*-free`, `big-pickle`, `muse-spark-*`, `nemotron-*`, ...), ALL required
+ *   (verified live 2026-09-25 — any miss → 403 "can only be used from within OpenCode"):
+ *   1. `stream: true` in the request body (non-streaming → instant 403).
+ *   2. Agent tool declarations: a `shell` (or `bash`) + `read` function tool
+ *      must be present in `tools` (tool-less requests read as non-agent traffic).
+ *   3. Client identity: `User-Agent: opencode/<version>...` (≥1.18.0, older →
+ *      426 UpgradeRequired), `x-opencode-client: cli`, and `x-opencode-session`
+ *      matching `^ses_[0-9a-f]{12}[0-9A-Za-z]{14}$` (26 chars; the old 24-hex
+ *      form is rejected with the same 403).
  * - Official CLI sends:
- *     User-Agent: opencode/1.15.5 ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.14
+ *     User-Agent: opencode/1.18.31 ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.14
  *     x-opencode-client: cli
  *     x-opencode-project: global
- *     x-opencode-session: ses_<random> (per request)
- *     x-opencode-request: msg_<random> (per request)
+ *     x-opencode-session: ses_<12hex><14base62> (per session)
+ *     x-opencode-request: msg_<12hex><14base62> (per request)
  *
  * 9router clients typically arrive via `@ai-sdk/openai-compatible` (UA like
  * `ai-sdk/...` or `OpenAI/JS ...`), so without spoofing every proxied free-tier
@@ -32,7 +42,7 @@ const OPENCODE_HEADER_KEYS = ["x-opencode-session", "x-opencode-request", "x-ope
  */
 export const OPENCODE_FAKE_USER_AGENT =
   process.env.OMNIROUTE_OPENCODE_USER_AGENT?.trim() ||
-  "opencode/1.18.27 ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.14";
+  "opencode/1.18.31 ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.14";
 export const OPENCODE_FAKE_CLIENT = process.env.OMNIROUTE_OPENCODE_CLIENT?.trim() || "cli";
 export const OPENCODE_FAKE_PROJECT = process.env.OMNIROUTE_OPENCODE_PROJECT?.trim() || "global";
 
@@ -45,8 +55,33 @@ function isOpencodeUA(ua) {
   return typeof ua === "string" && ua.trim().toLowerCase().startsWith("opencode/");
 }
 
+// Console free-tier gate validates `ses_*` as `ses_` + 12 lowercase hex +
+// 14 base62 chars (verified live 2026-09-25: 24-hex ids → 403). Both the
+// stable (per-user/per-model) and random (per-request) generators below emit
+// that exact shape; `msg_*` request ids use the same shape (gateway accepts
+// any value there today, but uniformity is future-proof).
+const BASE62_ALPHABET = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+
+/** Gateway-valid session id shape: `ses_` + 12 lowercase hex + 14 base62. */
+export const OPENCODE_SESSION_RE = /^ses_[0-9a-f]{12}[0-9A-Za-z]{14}$/;
+
+function base62FromBytes(bytes, length) {
+  let out = "";
+  for (let i = 0; out.length < length; i++) {
+    const b = bytes[i % bytes.length];
+    out += BASE62_ALPHABET[(b + i * 31) % 62];
+  }
+  return out;
+}
+
+function opencodeId(prefix, seedBytes) {
+  const hex12 = Buffer.from(seedBytes.subarray(0, 6)).toString("hex");
+  const b62 = base62FromBytes(seedBytes.subarray(6), 14);
+  return `${prefix}_${hex12}${b62}`;
+}
+
 function randomId(prefix) {
-  return `${prefix}_${randomUUID().replace(/-/g, "").slice(0, 24)}`;
+  return opencodeId(prefix, randomBytes(20));
 }
 
 /**
@@ -60,8 +95,8 @@ function randomId(prefix) {
  * key never leaves this function in recoverable form.
  */
 export function stableSessionId(seed) {
-  const digest = createHash("sha256").update(String(seed ?? "")).digest("hex").slice(0, 24);
-  return `ses_${digest}`;
+  const digest = createHash("sha256").update(String(seed ?? "")).digest();
+  return opencodeId("ses", digest);
 }
 function findHeader(headers, name) {
   return Object.entries(headers).find(([key]) => key.toLowerCase() === name.toLowerCase())?.[1];
@@ -76,7 +111,10 @@ function findHeader(headers, name) {
 export function extractCallerSeed(clientHeaders) {
   if (!clientHeaders || typeof clientHeaders !== "object") return null;
   try {
-    const auth = findHeader(clientHeaders, "authorization");
+    // `authorization` covers Bearer clients; `x-api-key` covers Anthropic-style
+    // harnesses (e.g. Claude Code) so each downstream caller still gets an
+    // isolated session instead of sharing one global seed.
+    const auth = findHeader(clientHeaders, "authorization") || findHeader(clientHeaders, "x-api-key");
     if (typeof auth === "string" && auth.trim() !== "") return auth.trim();
   } catch {
     // Malformed headers object — no per-caller seed.
@@ -96,7 +134,9 @@ export function extractCallerSeed(clientHeaders) {
  * @param clientHeaders - The client-provided headers to forward from
  * @param options.synthesizeRequestId - When true (OpencodeExecutor only), maps
  *   x-session-affinity / x-session-id to x-opencode-session when the latter is
- *   missing, and synthesizes a UUID for x-opencode-request if also missing.
+ *   missing (only when the value already matches the gateway-valid `ses_*`
+ *   shape), and synthesizes a gate-format id for x-opencode-request if also
+ *   missing.
  */
 export function forwardOpencodeClientHeaders(headers, clientHeaders, options) {
   // 1. Forward User-Agent
@@ -113,13 +153,17 @@ export function forwardOpencodeClientHeaders(headers, clientHeaders, options) {
     }
   }
 
-  // 3. OpencodeExecutor-only: synthesize session/request id from fallback headers
+  // 3. OpencodeExecutor-only: synthesize session/request id from fallback headers.
+  // Only adopt the affinity value when it already looks like a gateway-valid
+  // `ses_*` id — a foreign shape (e.g. a UUID from another harness) would be
+  // rejected by the Console gate with 403, so fall through to the generated
+  // fingerprint below instead.
   if (options?.synthesizeRequestId && !headers["x-opencode-session"]) {
     const sessionAffinity = findHeader(clientHeaders, "x-session-affinity") || findHeader(clientHeaders, "x-session-id");
-    if (sessionAffinity) {
+    if (sessionAffinity && OPENCODE_SESSION_RE.test(sessionAffinity)) {
       headers["x-opencode-session"] = sessionAffinity;
       if (!headers["x-opencode-request"]) {
-        headers["x-opencode-request"] = randomUUID();
+        headers["x-opencode-request"] = randomId("msg");
       }
     }
   }

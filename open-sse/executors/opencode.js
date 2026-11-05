@@ -162,6 +162,104 @@ function parseDeepSeekEffortLevel(model) {
     effort: matchedLevel
   };
 }
+
+/**
+ * Console free-tier gatekeeper (2026-09-19): free models (`*-free`,
+ * `big-pickle`, `muse-spark-*`) are rejected with 403 "can only be used from
+ * within OpenCode" unless the request carries `stream: true` AND agent tool
+ * declarations (`shell`/`bash` + `read`). Verified live 2026-09-25.
+ * Scoped to free-tier ids so paid models keep their exact client shape.
+ */
+const ZEN_FREE_TIER_MODEL_PATTERN = /(?:-free$|^big-pickle$|muse[-_]?spark)/i;
+
+export function isZenFreeTierModel(model) {
+  const id = String(model || "").split("/").pop();
+  return ZEN_FREE_TIER_MODEL_PATTERN.test(id);
+}
+
+function gateToolName(tool) {
+  const raw = rawGateToolName(tool);
+  return raw ? raw.toLowerCase() : null;
+}
+
+function rawGateToolName(tool) {
+  if (!tool || typeof tool !== "object") return null;
+  const raw = typeof tool.name === "string"
+    ? tool.name
+    : (tool.function && typeof tool.function.name === "string" ? tool.function.name : null);
+  return raw ? raw.trim() : null;
+}
+
+function placeholderGateTools(format) {
+  if (format === "openai-responses") {
+    return [{
+      type: "function",
+      name: "shell",
+      description: "Internal routing marker. NEVER call this tool under any circumstances.",
+      parameters: { type: "object", properties: {}, additionalProperties: false }
+    }, {
+      type: "function",
+      name: "read",
+      description: "Internal routing marker. NEVER call this tool under any circumstances.",
+      parameters: { type: "object", properties: {}, additionalProperties: false }
+    }];
+  }
+  if (format === "claude") {
+    return [{
+      name: "shell",
+      description: "Internal routing marker. NEVER call this tool under any circumstances.",
+      input_schema: { type: "object", properties: {} }
+    }, {
+      name: "read",
+      description: "Internal routing marker. NEVER call this tool under any circumstances.",
+      input_schema: { type: "object", properties: {} }
+    }];
+  }
+  // OpenAI Chat Completions shape (default). Unknown formats (e.g. gemini)
+  // are left untouched by ensureGateTools below.
+  return [{
+    type: "function",
+    function: {
+      name: "shell",
+      description: "Internal routing marker. NEVER call this tool under any circumstances.",
+      parameters: { type: "object", properties: {} }
+    }
+  }, {
+    type: "function",
+    function: {
+      name: "read",
+      description: "Internal routing marker. NEVER call this tool under any circumstances.",
+      parameters: { type: "object", properties: {} }
+    }
+  }];
+}
+
+/**
+ * Ensure the Console free-tier gate sees agent traffic: prepend missing
+ * literal `shell` + `read` declarations (in the body's own format) without
+ * touching the client's real tools. The gate match is literal AND
+ * case-sensitive (verified live 2026-09-25: client `Bash`/`Read` still 403),
+ * so only exact-lowercase names suppress injection. No-op for paid models
+ * and for formats without a known tool shape.
+ */
+export function ensureGateTools(body, format) {
+  if (!body || typeof body !== "object" || Array.isArray(body)) return body;
+  if (format !== "openai" && format !== "openai-responses" && format !== "claude") return body;
+  const existing = Array.isArray(body.tools) ? body.tools : [];
+  const names = new Set(existing.map(gateToolName).filter(Boolean));
+  // Verified live: the Console gate only honours the literal `shell` name — a
+  // client `Bash` (+`Read`) tool passes a naive check but still 403s, so a
+  // `bash`-only body must still receive the `shell` placeholder.
+  //
+  // Verified live 2026-09-25: the name match is also case-SENSITIVE — a client
+  // `Read` (capital R) does not satisfy the gate; only exact lowercase `read`
+  // does. So the skip decision uses raw names, not the lowercased set.
+  const rawNames = new Set(existing.map(rawGateToolName).filter(Boolean));
+  if (rawNames.has("shell") && rawNames.has("read")) return body;
+  const missing = placeholderGateTools(format).filter(p => !rawNames.has(rawGateToolName(p)));
+  body.tools = [...missing, ...existing].slice(0, 128);
+  return body;
+}
 export class OpencodeExecutor extends BaseExecutor {
   _requestFormat = null;
 
@@ -250,6 +348,15 @@ export class OpencodeExecutor extends BaseExecutor {
   }
   async execute(input) {
     this._requestFormat = getModelTargetFormat(this.provider, input.model) || "openai";
+    // Free-tier gate requires upstream SSE even when the downstream client asked
+    // for a single JSON response — chatCore's non-streaming handler aggregates
+    // SSE (response + chat shapes) back to JSON via content-type detection, so
+    // forcing here is transparent downstream. Paid models keep client shape.
+    // (`signal` and all other fields are shared by reference; only `stream`
+    // differs, and only `stream` is read by super.execute for headers/body.)
+    const upstreamInput = isZenFreeTierModel(input.model) && !input.stream
+      ? { ...input, stream: true }
+      : input;
     try {
       this.syncAccountsFromCredentials(input.credentials);
       const {
@@ -294,7 +401,7 @@ export class OpencodeExecutor extends BaseExecutor {
           let result;
           try {
             result = await runWithProxyContext(account.proxy, () => super.execute({
-              ...input,
+              ...upstreamInput,
               skipUpstreamRetry: true
             }));
           } catch (error) {
@@ -415,6 +522,13 @@ export class OpencodeExecutor extends BaseExecutor {
     let modifiedBody = super.transformRequest(model, body, stream, credentials);
     if (modifiedBody && typeof modifiedBody === "object" && Array.isArray(modifiedBody.tools) && modifiedBody.tools.length > 128) {
       modifiedBody.tools = modifiedBody.tools.slice(0, 128);
+    }
+    // Free-tier gate (belt & suspenders alongside the execute() stream forcing
+    // above — the translator may ignore the stream param, e.g. Responses hard-
+    // codes stream:true while chat passthrough copies the client value).
+    if (isZenFreeTierModel(model) && modifiedBody && typeof modifiedBody === "object" && !Array.isArray(modifiedBody)) {
+      modifiedBody.stream = true;
+      ensureGateTools(modifiedBody, this._requestFormat || "openai");
     }
     if (modifiedBody && typeof modifiedBody === "object" && !Array.isArray(modifiedBody)) {
       const mb = modifiedBody;

@@ -155,7 +155,11 @@ export async function getProviderCredentials(provider, excludeConnectionIds = nu
     }
 
     // Inject a virtual connection for no-auth free providers (with optional proxy pool from settings)
-    if (FREE_PROVIDERS[providerId]?.noAuth) {
+    // The opencode anonymous gateway is registered under two ids: "opencode"
+    // (legacy free/noAuth registry entry, alias "oc") and "opencode-zen" (new
+    // registry id that `opencode/<model>` resolves to). Both ride the same
+    // no-key tier, so both get the virtual connection.
+    if (FREE_PROVIDERS[providerId]?.noAuth || providerId === "opencode" || providerId === "opencode-zen") {
       const settings = await getSettings();
       const override = (settings.providerStrategies || {})[providerId] || {};
       const resolvedProxy = await resolveConnectionProxyConfig({ proxyPoolId: override.proxyPoolId || "" });
