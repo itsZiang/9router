@@ -183,13 +183,6 @@ export function resolveProxyForRequest(targetUrl) {
     target = null;
   }
 
-  // Always bypass proxy for local/LAN addresses
-  if (target && isLocalAddress(target.hostname.toLowerCase())) {
-    return {
-      source: "direct",
-      proxyUrl: null
-    };
-  }
   const contextProxy = proxyContext.getStore();
   if (contextProxy) {
     if (contextProxy.__noProxy && noProxyMatch(targetUrl, contextProxy.__noProxy)) {
@@ -198,6 +191,14 @@ export function resolveProxyForRequest(targetUrl) {
     return {
       source: "context",
       proxyUrl: contextProxy.__relayUrl || contextProxy.__proxyUrl || proxyConfigToUrl(contextProxy)
+    };
+  }
+
+  // Always bypass proxy for local/LAN addresses when no explicit context proxy is configured
+  if (target && isLocalAddress(target.hostname.toLowerCase())) {
+    return {
+      source: "direct",
+      proxyUrl: null
     };
   }
   const envProxyUrl = resolveEnvProxyUrl(targetUrl);
